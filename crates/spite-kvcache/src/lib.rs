@@ -23,49 +23,62 @@ use thiserror::Error;
 
 /// Precision level for one side (K or V) of the KV cache.
 ///
-/// These map to the "classic" GGML quant types — no Turbo kernels required.
-/// `F16` is the default; it imposes no quality cost and works everywhere.
-/// Move to `Q8` first (imperceptible loss, 50% savings), then `Q4` only when
-/// VRAM is genuinely tight (some quality degradation at long context).
+/// Classic GGML quant types only — no Turbo FWHT/PolarQuant/TCQ kernels.
+/// `F16` is the default; move down the ladder when VRAM is tight.
+///
+/// Degradation ladder (high → low quality):
+///   F16 (2.0 bpe) → Q8 (1.06 bpe) → Q5_1 (0.75 bpe) → Q4 (0.56 bpe)
+///
+/// The engine degrades automatically at runtime when the KV budget fills —
+/// you just set the tier you want to start at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KvQuant {
-    /// Full precision — reference / debug only.
+    /// Full precision — reference / debug only.  (4 bytes/element)
     F32,
-    /// 16-bit float — default, no quality cost. (2 bytes/element)
+    /// 16-bit float — default, no quality cost.  (2 bytes/element)
     F16,
-    /// 8-bit uniform (q8_0) — 50% savings vs F16, imperceptible quality loss.
+    /// 8-bit uniform (q8_0) — imperceptible quality loss.  (~1.06 bytes/element)
     Q8,
-    /// 4-bit uniform (q4_0) — 75% savings vs F16, mild loss at long context.
+    /// 5-bit with scale+bias (q5_1) — good quality/size balance.  (0.75 bytes/element)
+    Q5_1,
+    /// 4-bit uniform (q4_0) — mild loss at long context.  (~0.56 bytes/element)
     Q4,
 }
 
 impl KvQuant {
-    /// Storage bytes per element.
+    /// Storage bytes per element (GGML block sizes, 32-element blocks).
     pub fn bytes_per_elem(self) -> f32 {
         match self {
-            Self::F32 => 4.0,
-            Self::F16 => 2.0,
-            Self::Q8  => 1.0,
-            Self::Q4  => 0.5,
+            // Exact GGML block footprints:
+            // q8_0:  { f16 delta, i8[32] }    = 34 bytes / 32 elems = 1.0625
+            // q5_1:  { f16 d, f16 m, u32 qh, u8[16] } = 24 bytes / 32 elems = 0.75
+            // q4_0:  { f16 delta, u8[16] }    = 18 bytes / 32 elems = 0.5625
+            Self::F32  => 4.0,
+            Self::F16  => 2.0,
+            Self::Q8   => 1.0625,
+            Self::Q5_1 => 0.75,
+            Self::Q4   => 0.5625,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::F32 => "f32",
-            Self::F16 => "f16",
-            Self::Q8  => "q8_0",
-            Self::Q4  => "q4_0",
+            Self::F32  => "f32",
+            Self::F16  => "f16",
+            Self::Q8   => "q8_0",
+            Self::Q5_1 => "q5_1",
+            Self::Q4   => "q4_0",
         }
     }
 
-    /// The next tier down the degradation ladder (`None` if already at floor).
+    /// Next tier down the degradation ladder (`None` if already at floor).
     pub fn degrade(self) -> Option<Self> {
         match self {
-            Self::F32 => Some(Self::F16),
-            Self::F16 => Some(Self::Q8),
-            Self::Q8  => Some(Self::Q4),
-            Self::Q4  => None,
+            Self::F32  => Some(Self::F16),
+            Self::F16  => Some(Self::Q8),
+            Self::Q8   => Some(Self::Q5_1),
+            Self::Q5_1 => Some(Self::Q4),
+            Self::Q4   => None,
         }
     }
 }
@@ -80,71 +93,60 @@ impl std::str::FromStr for KvQuant {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "f32"            => Ok(Self::F32),
-            "f16" | "fp16"   => Ok(Self::F16),
-            "q8" | "q8_0"    => Ok(Self::Q8),
-            "q4" | "q4_0"    => Ok(Self::Q4),
-            other => Err(format!("unknown KV quant type '{other}'; use f16, q8, or q4")),
+            "f32"                => Ok(Self::F32),
+            "f16" | "fp16"       => Ok(Self::F16),
+            "q8" | "q8_0"        => Ok(Self::Q8),
+            "q5_1" | "q5"        => Ok(Self::Q5_1),
+            "q4" | "q4_0"        => Ok(Self::Q4),
+            other => Err(format!(
+                "unknown KV quant '{other}'; use f16, q8, q5_1, or q4"
+            )),
         }
     }
 }
 
 /// Quantization policy for the KV cache.
 ///
-/// The VBR (variable bit-rate) design: K and V can use different quant types,
-/// and `dynamic` mode degrades them automatically as VRAM pressure mounts.
+/// K and V are independently settable (K is more attention-sensitive than V,
+/// so a common configuration is K=q8, V=q5_1 or K=q8, V=q4).
+///
+/// The engine degrades both sides automatically when the KV VRAM budget fills.
+/// You set the preferred starting tier; no separate "auto" flag is needed.
 ///
 /// # How to choose
 ///
-/// | Scenario                          | Setting                       |
-/// |-----------------------------------|-------------------------------|
-/// | Plenty of VRAM (default)          | `KvQuantConfig::default()`    |
-/// | Tight VRAM, care about quality    | key=Q8, val=Q8                |
-/// | Very tight VRAM                   | key=Q8, val=Q4 (K is sensitive in attention) |
-/// | Let the engine decide at runtime  | `dynamic = true`              |
+/// | Scenario                         | Setting              |
+/// |----------------------------------|----------------------|
+/// | Plenty of VRAM (default)         | `KvQuantConfig::default()` — f16 |
+/// | Tight VRAM, quality first        | key=Q8, val=Q8       |
+/// | Tight VRAM, balanced             | key=Q8, val=Q5_1     |
+/// | Very tight VRAM                  | key=Q8, val=Q4       |
 #[derive(Debug, Clone)]
 pub struct KvQuantConfig {
     /// Quantization for key tensors.  Default: F16.
     pub key: KvQuant,
     /// Quantization for value tensors.  Default: F16.
     pub val: KvQuant,
-    /// VBR dynamic mode: automatically degrade K and V tiers as the context
-    /// window fills and KV VRAM pressure grows.
-    /// Ladder: F16 → Q8 → Q4 (never below `floor`).
-    pub dynamic: bool,
-    /// Lowest permitted tier when `dynamic = true`.  Default: Q4.
-    pub floor: KvQuant,
-    /// Explicit KV VRAM budget in bytes.  0 = auto (infer from free VRAM).
-    pub vram_budget_bytes: u64,
 }
 
 impl Default for KvQuantConfig {
     fn default() -> Self {
-        Self {
-            key:               KvQuant::F16,
-            val:               KvQuant::F16,
-            dynamic:           false,
-            floor:             KvQuant::Q4,
-            vram_budget_bytes: 0,
-        }
+        Self { key: KvQuant::F16, val: KvQuant::F16 }
     }
 }
 
 impl KvQuantConfig {
     /// Parse from a CLI string:
-    ///   "f16"      → both K and V at f16
-    ///   "q8"       → both K and V at q8_0
-    ///   "q8,q4"    → K at q8_0, V at q4_0 (K is more sensitive)
-    ///   "auto"     → dynamic VBR degradation (starts at f16)
+    ///   "f16"       → both K and V at f16
+    ///   "q8"        → both K and V at q8_0
+    ///   "q5_1"      → both at q5_1
+    ///   "q8,q4"     → K at q8_0, V at q4_0  (K is more attention-sensitive)
+    ///   "q8,q5_1"   → K at q8_0, V at q5_1
     pub fn from_str(s: &str) -> Result<Self, String> {
-        let s = s.trim();
-        if s.eq_ignore_ascii_case("auto") {
-            return Ok(Self { dynamic: true, ..Default::default() });
-        }
-        let parts: Vec<&str> = s.splitn(2, ',').collect();
+        let parts: Vec<&str> = s.trim().splitn(2, ',').collect();
         let key: KvQuant = parts[0].parse()?;
         let val: KvQuant = parts.get(1).map(|p| p.parse()).transpose()?.unwrap_or(key);
-        Ok(Self { key, val, ..Default::default() })
+        Ok(Self { key, val })
     }
 
     /// Estimated VRAM bytes for the KV cache given model dimensions.
@@ -155,15 +157,14 @@ impl KvQuantConfig {
         head_dim:   usize,
         max_ctx:    usize,
     ) -> u64 {
-        let k_bytes = (n_layers * max_ctx * n_kv_heads * head_dim) as f64
-            * self.key.bytes_per_elem() as f64;
-        let v_bytes = (n_layers * max_ctx * n_kv_heads * head_dim) as f64
-            * self.val.bytes_per_elem() as f64;
+        let elems = (n_layers * max_ctx * n_kv_heads * head_dim) as f64;
+        let k_bytes = elems * self.key.bytes_per_elem() as f64;
+        let v_bytes = elems * self.val.bytes_per_elem() as f64;
         (k_bytes + v_bytes) as u64
     }
 
     pub fn is_default(&self) -> bool {
-        self.key == KvQuant::F16 && self.val == KvQuant::F16 && !self.dynamic
+        self.key == KvQuant::F16 && self.val == KvQuant::F16
     }
 }
 
@@ -351,7 +352,6 @@ mod tests {
         let cfg = KvQuantConfig::from_str("q8").unwrap();
         assert_eq!(cfg.key, KvQuant::Q8);
         assert_eq!(cfg.val, KvQuant::Q8);
-        assert!(!cfg.dynamic);
     }
 
     #[test]
@@ -362,9 +362,17 @@ mod tests {
     }
 
     #[test]
-    fn kv_quant_parse_auto() {
-        let cfg = KvQuantConfig::from_str("auto").unwrap();
-        assert!(cfg.dynamic);
+    fn kv_quant_parse_q5_1() {
+        let cfg = KvQuantConfig::from_str("q5_1").unwrap();
+        assert_eq!(cfg.key, KvQuant::Q5_1);
+        assert_eq!(cfg.val, KvQuant::Q5_1);
+    }
+
+    #[test]
+    fn kv_quant_parse_asymmetric_with_q5() {
+        let cfg = KvQuantConfig::from_str("q8,q5_1").unwrap();
+        assert_eq!(cfg.key, KvQuant::Q8);
+        assert_eq!(cfg.val, KvQuant::Q5_1);
     }
 
     #[test]
@@ -375,16 +383,18 @@ mod tests {
 
     #[test]
     fn kv_quant_degrade_ladder() {
-        assert_eq!(KvQuant::F16.degrade(), Some(KvQuant::Q8));
-        assert_eq!(KvQuant::Q8.degrade(),  Some(KvQuant::Q4));
-        assert_eq!(KvQuant::Q4.degrade(),  None);
+        assert_eq!(KvQuant::F16.degrade(),  Some(KvQuant::Q8));
+        assert_eq!(KvQuant::Q8.degrade(),   Some(KvQuant::Q5_1));
+        assert_eq!(KvQuant::Q5_1.degrade(), Some(KvQuant::Q4));
+        assert_eq!(KvQuant::Q4.degrade(),   None);
     }
 
     #[test]
     fn kv_quant_bytes_per_elem() {
-        assert_eq!(KvQuant::F16.bytes_per_elem(), 2.0);
-        assert_eq!(KvQuant::Q8.bytes_per_elem(),  1.0);
-        assert_eq!(KvQuant::Q4.bytes_per_elem(),  0.5);
+        assert_eq!(KvQuant::F16.bytes_per_elem(),  2.0);
+        assert_eq!(KvQuant::Q8.bytes_per_elem(),   1.0625);
+        assert_eq!(KvQuant::Q5_1.bytes_per_elem(), 0.75);
+        assert_eq!(KvQuant::Q4.bytes_per_elem(),   0.5625);
     }
 
     #[test]
@@ -407,10 +417,10 @@ mod tests {
         // K+V both at q8: 4 * 128 * 8 * 64 * 1.0 * 2 = 524_288 bytes (50% smaller)
 
         let asym_cfg = CacheConfig {
-            quant: KvQuantConfig::from_str("q8,q4").unwrap(),
+            quant: KvQuantConfig::from_str("q8,q5_1").unwrap(),
             ..base_cfg
         };
         let _asym_cache = RingCache::new(asym_cfg).unwrap();
-        // K at q8 (1 bpe) + V at q4 (0.5 bpe): 4 * 128 * 8 * 64 * 1.5 = 393_216 bytes
+        // K at q8 (1.0625 bpe) + V at q5_1 (0.75 bpe)
     }
 }

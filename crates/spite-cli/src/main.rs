@@ -66,15 +66,19 @@ struct HardwareArgs {
     #[arg(long = "offload-disk", env = "SPITE_OFFLOAD_DISK")]
     offload_disk: bool,
 
-    /// KV cache quantization.  Default: f16 (full quality, no change needed).
+    /// KV cache quantization.  Default: f16 — no change needed unless VRAM is tight.
     ///
-    /// Fixed tier  : f16 | q8 | q4
-    ///   q8 = 50% VRAM savings, imperceptible quality loss
-    ///   q4 = 75% VRAM savings, mild loss at very long context
+    /// Tiers (high → low quality):
+    ///   f16    2.0 bpe   full quality (default)
+    ///   q8     1.1 bpe   imperceptible quality loss
+    ///   q5_1   0.75 bpe  good balance
+    ///   q4     0.56 bpe  mild loss at long context
     ///
-    /// Asymmetric  : q8,q4   (K at q8, V at q4 — K is more attention-sensitive)
+    /// Asymmetric K,V (K is more attention-sensitive):
+    ///   --kv-quant q8,q5_1   K at q8, V at q5_1
+    ///   --kv-quant q8,q4     K at q8, V at q4
     ///
-    /// VBR auto    : auto    (starts at f16, degrades to q8 → q4 as context fills)
+    /// The engine degrades automatically when the KV budget fills.
     #[arg(
         long = "kv-quant",
         env  = "SPITE_KV_QUANT",
@@ -520,9 +524,7 @@ fn resolve_kv_quant(hw: &HardwareArgs) -> KvQuantConfig {
 
 fn print_kv_quant_summary(cfg: &KvQuantConfig) {
     if cfg.is_default() { return; }
-    if cfg.dynamic {
-        println!("kv cache     : VBR auto  (f16 → q8 → q4 as context fills)");
-    } else if cfg.key == cfg.val {
+    if cfg.key == cfg.val {
         println!("kv cache     : {}  (K+V)", cfg.key);
     } else {
         println!("kv cache     : K={}  V={}  (asymmetric)", cfg.key, cfg.val);
