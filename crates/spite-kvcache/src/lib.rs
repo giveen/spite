@@ -19,6 +19,34 @@ pub mod paged;
 use spite_abi::{SpiteKvCache, SpiteTensor};
 use thiserror::Error;
 
+// ── Cache trait ───────────────────────────────────────────────────────────
+
+/// The pluggable KV cache interface.
+///
+/// Implement this to swap the cache strategy (ring, prefix, paged, disk-
+/// backed, quantized, …) for a specific model or deployment context,
+/// without touching the executor or scheduler.
+///
+/// Register implementations in a `Registry<dyn Cache>`.
+pub trait Cache: Send + Sync {
+    /// Allocate cache space for `seq_id` to hold `n_tokens` positions.
+    /// Called before the prefill pass.
+    fn prepare(&mut self, seq_id: u64, n_tokens: usize) -> Result<(), CacheError>;
+
+    /// Commit the most recently written position to `seq_id`.
+    /// Called after each decode step.
+    fn commit(&mut self, seq_id: u64);
+
+    /// Release all cache pages held by `seq_id`.
+    fn free(&mut self, seq_id: u64);
+
+    /// Return the K and V tensors for `(seq_id, layer)` if available.
+    fn kv_view(&self, seq_id: u64, layer: usize) -> Option<(&SpiteTensor, &SpiteTensor)>;
+
+    /// Current number of cached tokens for `seq_id`.
+    fn len(&self, seq_id: u64) -> usize;
+}
+
 #[derive(Debug, Error)]
 pub enum CacheError {
     #[error("context length {requested} exceeds cache capacity {capacity}")]

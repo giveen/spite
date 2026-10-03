@@ -18,6 +18,30 @@
 
 use thiserror::Error;
 
+// ── Schedule trait ────────────────────────────────────────────────────────
+
+/// The pluggable scheduling interface.
+///
+/// Implement this to replace the batching and prioritization strategy
+/// for a specific deployment (e.g. priority queues, fair-share, deadline-
+/// aware scheduling) without touching the executor or server.
+///
+/// Register implementations in a `Registry<dyn Schedule>`.
+pub trait Schedule: Send + Sync {
+    /// Submit a new request. Returns the assigned request id.
+    fn submit(&mut self, request: BatchRequest) -> Result<u64, SchedulerError>;
+
+    /// Advance all active requests by one step (one token per decode slot).
+    /// Returns outputs for all requests that produced a token this step.
+    fn step(&mut self) -> Vec<BatchOutput>;
+
+    /// Cancel an in-flight request. Returns `true` if it was found.
+    fn cancel(&mut self, request_id: u64) -> bool;
+
+    /// Number of active (non-free) slots.
+    fn active_count(&self) -> usize;
+}
+
 #[derive(Debug, Error)]
 pub enum SchedulerError {
     #[error("no free slot — all {0} slots are occupied")]

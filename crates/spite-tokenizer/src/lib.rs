@@ -13,6 +13,30 @@ pub mod sentencepiece;
 
 use thiserror::Error;
 
+// ── Tokenize trait ────────────────────────────────────────────────────────
+
+/// The pluggable tokenizer interface.
+///
+/// Implement this to replace the tokenizer for a specific model or task
+/// without touching any other part of the engine.
+///
+/// Register implementations in a `Registry<dyn Tokenize>` so overrides
+/// apply only where they're needed.
+pub trait Tokenize: Send + Sync {
+    /// Encode `text` to token ids. Prepends BOS if `add_bos` is true.
+    fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>, TokenizerError>;
+
+    /// Decode token ids to UTF-8 text.
+    fn decode(&self, ids: &[u32], skip_special: bool) -> String;
+
+    /// Decode a single token — used for streaming output.
+    fn decode_one(&self, id: u32) -> &str;
+
+    fn vocab_size(&self) -> usize;
+    fn bos_id(&self) -> u32;
+    fn eos_id(&self) -> u32;
+}
+
 #[derive(Debug, Error)]
 pub enum TokenizerError {
     #[error("GGUF has no tokenizer metadata")]

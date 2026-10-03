@@ -14,6 +14,55 @@ pub mod xtc;
 
 use thiserror::Error;
 
+// ── Sampler trait ─────────────────────────────────────────────────────────
+
+/// The pluggable sampling interface.
+///
+/// Implement this to replace the entire sampling pipeline for a specific
+/// model, task, or user configuration — without touching anything else.
+///
+/// Register implementations in a `Registry<dyn Sampler>` keyed by
+/// `PluginKey` so overrides apply only where they're needed.
+///
+/// The default implementation runs the standard pipeline:
+/// Temperature → RepetitionPenalty → TopK → TopP → Multinomial/Greedy.
+pub trait Sampler: Send + Sync {
+    /// Apply all logit processors and draw one token id.
+    ///
+    /// `logits`:  raw pre-softmax logits, length = vocab_size, modified in-place.
+    /// `context`: recently generated token ids (for repetition / frequency penalty).
+    /// `cfg`:     sampler hyperparameters for this call.
+    fn sample(
+        &mut self,
+        logits:  &mut [f32],
+        context: &[u32],
+        cfg:     &SamplerConfig,
+    ) -> Result<u32, SamplingError>;
+}
+
+/// The standard sampler — runs the full pipeline defined by `SamplerConfig`.
+/// Registered as the default in the engine's sampler registry.
+pub struct DefaultSampler {
+    pub rng: u64,
+}
+
+impl DefaultSampler {
+    pub fn new(seed: u64) -> Self { Self { rng: seed.wrapping_add(1) } }
+}
+
+impl Sampler for DefaultSampler {
+    fn sample(
+        &mut self,
+        logits:  &mut [f32],
+        context: &[u32],
+        cfg:     &SamplerConfig,
+    ) -> Result<u32, SamplingError> {
+        if logits.is_empty() { return Err(SamplingError::EmptyLogits); }
+        let mut v: Vec<f32> = logits.to_vec();
+        sample(&mut v, context, cfg, &mut self.rng)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SamplingError {
     #[error("empty logit vector")]

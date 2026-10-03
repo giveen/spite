@@ -17,7 +17,44 @@
 //!   }
 
 use spite_abi::SpiteCtx;
+use spite_plugin::PluginKey;
+use spite_sampling::Sampler;
+use spite_kvcache::Cache;
 use thiserror::Error;
+
+// ── Per-request overrides ─────────────────────────────────────────────────
+
+/// Per-inference-call override bundle.
+///
+/// Every field is optional: `None` means "use the engine's registered
+/// default for this request's `PluginKey`".  Populate only the fields
+/// you actually want to replace — nothing else is affected.
+///
+/// # Example
+///
+/// ```text
+/// // Use a custom greedy sampler for this one request:
+/// let overrides = InferenceOverrides {
+///     key:     PluginKey::for_task("summarize"),
+///     sampler: Some(Box::new(GreedySampler)),
+///     ..Default::default()
+/// };
+/// executor.prefill(&tokens, &ctx, &overrides)?;
+/// ```
+#[derive(Default)]
+pub struct InferenceOverrides {
+    /// Resolution key used when looking up registry defaults.
+    /// Set `model_arch`, `gpu_arch`, or `task` to narrow the match.
+    pub key: PluginKey,
+
+    /// Replace the entire sampling pipeline for this call.
+    /// Overrides any registry registration for `key`.
+    pub sampler: Option<Box<dyn Sampler>>,
+
+    /// Replace the KV cache backend for this call.
+    /// Useful for memory-constrained scenarios or custom eviction policies.
+    pub cache: Option<Box<dyn Cache>>,
+}
 
 #[derive(Debug, Error)]
 pub enum ExecutorError {

@@ -735,6 +735,7 @@ dependencies = [
  "spite-gpu",
  "spite-kvcache",
  "spite-models",
+ "spite-plugin",
  "spite-rope",
  "spite-sampling",
  "thiserror",
@@ -819,6 +820,10 @@ dependencies = [
  "spite-loader",
  "thiserror",
 ]
+
+[[package]]
+name = "spite-plugin"
+version = "0.1.0"
 
 [[package]]
 name = "spite-quantize"
