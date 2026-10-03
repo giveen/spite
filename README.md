@@ -18,21 +18,28 @@ faster kernel for their specific card without touching anything else.
 
 ## Build
 
+Two separate build steps: Rust host first, then C++ kernels.
+
 ```bash
+# 1. Rust host + CLI
+cargo build --release
+
+# 2. C++23 kernels (only your GPU × your models)
 cmake -B build \
-  -DSPITE_MODELS="llama3"        \
-  -DSPITE_GPU_ARCHS="sm_89"      \
-  -DSPITE_QUANT_TYPES="q4_k,q8_0"
+  -DSPITE_MODELS="llama3"      \
+  -DSPITE_GPU_ARCHS="sm_89"    \
+  -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-Only the kernels matching your selections are compiled.
+Kernels land in `build/kernels/<model>/<arch>/`. The CLI finds them at runtime.
 
 ## Run
 
 ```bash
-./build/spite run \
+./target/release/spite run \
   --model path/to/model.gguf \
+  --kernels-dir build/kernels \
   --prompt "Hello, world"
 ```
 

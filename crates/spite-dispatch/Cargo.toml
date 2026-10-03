@@ -1,0 +1,12 @@
+[package]
+name        = "spite-dispatch"
+description = "Runtime kernel selection and fallback chain"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi  = { workspace = true }
+libloading = { workspace = true }
+thiserror  = { workspace = true }

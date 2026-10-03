@@ -1,160 +1,188 @@
-/*
- * spite kernel — llama3 / sm_89 (RTX 4070, 4080, 4090, RTX 4000 Ada)
- *
- * HOW TO USE THIS FILE
- * ────────────────────
- * 1. Copy this file to kernels/<model>/<your_gpu_arch>/<op_name>.cu
- * 2. Fill in the ops you want to optimize. Leave the rest returning -1
- *    (the dispatcher will fall back to the generic implementation).
- * 3. Run:  spite verify kernels/<model>/<arch>/your_file.cu
- * 4. Run:  spite bench   kernels/<model>/<arch>/your_file.cu
- * 5. Include your bench output in the PR description.
- *
- * GPU ARCHITECTURE NOTES — sm_89 (Ada Lovelace)
- * ───────────────────────────────────────────────
- * - Tensor cores: FP8, FP16, BF16, INT8, INT4
- *   mma shape: m16n8k16 (FP16), m16n8k32 (INT8), m16n8k32 (FP8)
- * - L2 cache: 72 MB (4090) — large enough to cache Q/K/V projections
- * - Shared memory per SM: 100 KB
- * - Register file: 65536 x 32-bit per SM
- * - Warp size: 32 threads
- * - Max threads per block: 1024
- * - Good for: fused attention (FlashAttention-style), Q4_K matmul
- *
- * Q4_K BLOCK LAYOUT REMINDER (see core/quant.h)
- * ──────────────────────────────────────────────
- * Each block_q4_K covers 256 values:
- *   d, dmin  — two fp16 super-scales
- *   scales[] — 12 bytes encoding 8 x 6-bit sub-block scales + mins
- *   qs[]     — 128 bytes of packed 4-bit quants (2 per byte)
- *
- * To dequantize value i within a block:
- *   sub_block = i / 32
- *   scale = decode_scale(block.scales, sub_block)   // 6-bit
- *   min   = decode_min  (block.scales, sub_block)
- *   q     = (qs[i/2] >> (4*(i%2))) & 0xF
- *   val   = float(d) * (scale * q - min * float(dmin))
- */
+// spite kernel — llama3 / sm_89 (RTX 4070, 4080, 4090, RTX 4000 Ada)
+// C++23 · CUDA 12.3+
+//
+// HOW TO USE THIS FILE
+// ────────────────────
+// 1. cp kernels/llama3/sm_89/KERNEL_TEMPLATE.cu \
+//       kernels/llama3/<your_gpu>/<op_name>.cu
+// 2. Change gpu_arch in KERNEL_INFO at the bottom.
+// 3. Implement one op. Leave the rest returning -1 — the dispatcher
+//    uses the fallback for those.
+// 4. spite verify kernels/llama3/<arch>/your_file.cu
+// 5. spite bench   kernels/llama3/<arch>/your_file.cu
+// 6. Paste bench output in your PR description.
+//
+// GPU ARCHITECTURE NOTES — sm_89 (Ada Lovelace)
+// ───────────────────────────────────────────────
+//  Tensor cores  FP8, FP16, BF16, INT8, INT4
+//  MMA shape     m16n8k16 (FP16)  m16n8k32 (INT8 / FP8)
+//  Shared mem    100 KB / SM (stay ≤ 50 KB for 2-block occupancy)
+//  L2 cache      72 MB (4090)  36 MB (4070)
+//  Registers     65536 × 32-bit / SM
+//  Bandwidth     1008 GB/s (4090)  504 GB/s (4070)
+//
+// Q4_K BLOCK LAYOUT (see core/quant.h)
+// ──────────────────────────────────────
+//  block_q4_K covers 256 values:
+//    d, dmin    — two fp16 super-scales
+//    scales[12] — 6-bit sub-block scales + mins, packed
+//    qs[128]    — packed 4-bit quants (2 per byte)
+//
+//  To dequantize value i:
+//    sb    = i / 32                           // sub-block index (0..7)
+//    scale = decode_scale(block.scales, sb)   // 6-bit
+//    min   = decode_min  (block.scales, sb)
+//    q     = (qs[i/2] >> (4*(i%2))) & 0xF
+//    val   = float(d) * (scale * q - min * float(dmin))
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cuda/std/span>
+#include <cuda/std/expected>
+#include <cuda/std/cstdint>
 #include "../../../core/abi.h"
 #include "../../../core/quant.h"
 
-/* ── Helper: decode 6-bit sub-block scale from block_q4_K.scales[] ──── */
-static __device__ __forceinline__
-float decode_scale(const uint8_t *scales, int sub_block) {
-    /* TODO: implement — see GGUF spec or core/quant.h comments */
-    (void)scales; (void)sub_block;
+// ── C++23 / libcudacxx conveniences ───────────────────────────────────────
+
+using cuda::std::span;
+using cuda::std::expected;
+using cuda::std::unexpected;
+
+// Immutable view over a tensor's raw bytes — no ownership, no copy.
+template<typename T>
+using TensorView = span<const T>;
+
+// ── Q4_K decode helpers ───────────────────────────────────────────────────
+
+// Extract the 6-bit scale for sub-block `sb` from block_q4_K.scales[].
+// See GGUF spec §3.4 for the exact bit packing.
+[[nodiscard]] static __device__ __forceinline__
+float decode_scale(const uint8_t* scales, int sb) {
+    // TODO: implement — two possible bit positions depending on sb parity
+    (void)scales; (void)sb;
     return 1.0f;
 }
 
-/* ── RMS Norm ──────────────────────────────────────────────────────────
- *
- * out[i] = x[i] / rms(x) * weight[i]
- * rms(x) = sqrt( mean(x^2) + eps )
- *
- * One block per row. Threads in a warp reduce over the hidden dim.
- * Typical hidden dim for llama3-8b: 4096.
- */
+[[nodiscard]] static __device__ __forceinline__
+float decode_min(const uint8_t* scales, int sb) {
+    (void)scales; (void)sb;
+    return 0.0f;
+}
+
+// ── RMS Norm ──────────────────────────────────────────────────────────────
+//
+// out[i] = x[i] / sqrt(mean(x²) + eps) * weight[i]
+//
+// Launch: one block per row, 128 threads.
+// Each thread handles hidden_dim/128 elements.
+// Warp-level reduction via __shfl_xor_sync (no shared mem needed).
+//
+// Llama3-8b: hidden_dim = 4096  →  32 elements per thread at 128 threads.
+
 static __global__ void rms_norm_kernel(
-    float        *out,
-    const float  *x,
-    const float  *weight,
-    int           hidden_dim,
-    float         eps
+    float* __restrict__       out,
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    int   hidden_dim,
+    float eps
 ) {
-    /* TODO: implement — this is a good first kernel to write */
+    // TODO: implement
     (void)out; (void)x; (void)weight; (void)hidden_dim; (void)eps;
 }
 
 static int rms_norm(
-    spite_tensor_t       *out,
-    const spite_tensor_t *x,
-    const spite_tensor_t *weight,
-    float                 eps,
-    const spite_ctx_t    *ctx
+    SpiteTensor*       out,
+    const SpiteTensor* x,
+    const SpiteTensor* weight,
+    float              eps,
+    const SpiteCtx*    ctx
 ) {
-    /* TODO: launch rms_norm_kernel */
+    // TODO: launch rms_norm_kernel
     (void)out; (void)x; (void)weight; (void)eps; (void)ctx;
-    return -1; /* -1 = not implemented, dispatcher uses fallback */
+    return -1; // -1 → not implemented, dispatcher falls back
 }
 
-/* ── FFN: gate/up/down with SiLU ───────────────────────────────────────
- *
- * out = down( silu(gate(x)) * up(x) )
- *
- * For Q4_K weights on sm_89, the inner loop is:
- *   1. Load a tile of x into shared memory (FP16 or FP32)
- *   2. Dequantize a tile of the weight matrix from Q4_K blocks
- *   3. Accumulate with tensor cores (INT8 or FP16 path)
- *
- * Llama3-8b dimensions:
- *   hidden_dim  = 4096
- *   ffn_dim     = 14336  (intermediate)
- */
+// ── FFN: gate/up projections + SiLU + down projection ────────────────────
+//
+//  out = down_proj( silu(gate_proj(x)) ⊙ up_proj(x) )
+//
+//  For Q4_K weights on sm_89:
+//    1. Load tile of x into shared memory (FP16)
+//    2. Dequantize weight tile from Q4_K blocks → INT8 or FP16
+//    3. Accumulate with m16n8k32 (INT8) tensor cores
+//
+//  Llama3-8b dims:
+//    hidden_dim = 4096
+//    ffn_dim    = 14336
+
 static int ffn(
-    spite_tensor_t       *out,
-    const spite_tensor_t *x,
-    const spite_tensor_t *w_gate,
-    const spite_tensor_t *w_up,
-    const spite_tensor_t *w_down,
-    const spite_ctx_t    *ctx
+    SpiteTensor*       out,
+    const SpiteTensor* x,
+    const SpiteTensor* w_gate,
+    const SpiteTensor* w_up,
+    const SpiteTensor* w_down,
+    const SpiteCtx*    ctx
 ) {
-    /* TODO: implement Q4_K matmul + SiLU fusion */
+    // TODO: implement Q4_K matmul + SiLU fusion
     (void)out; (void)x; (void)w_gate; (void)w_up; (void)w_down; (void)ctx;
     return -1;
 }
 
-/* ── Attention ─────────────────────────────────────────────────────────
- *
- * Llama3-8b:
- *   n_heads    = 32, n_kv_heads = 8  (grouped query attention)
- *   head_dim   = 128
- *   rope_theta = 500000
- *
- * A FlashAttention-2 style kernel is ideal here:
- *   - Tiled Q/K/V computation, never materializes full attention matrix
- *   - sm_89 L2 is large enough to keep K/V tiles hot across queries
- *
- * For a first contribution, a naive but correct implementation is fine.
- */
+// ── Attention ─────────────────────────────────────────────────────────────
+//
+//  Grouped query attention (GQA):
+//    n_heads    = 32,  n_kv_heads = 8,  head_dim = 128
+//    rope_theta = 500000  (Llama3 uses higher base than Llama2)
+//
+//  Recommended approach: FlashAttention-2 style tiled kernel.
+//  The 72 MB L2 on the 4090 fits all K/V for 4k context at FP16 —
+//  structure your tile sizes to exploit that.
+//
+//  A correct-but-naive implementation is fine for a first contribution.
+
 static int attention(
-    spite_tensor_t       *out,
-    const spite_tensor_t *x,
-    const spite_tensor_t *wq,
-    const spite_tensor_t *wk,
-    const spite_tensor_t *wv,
-    const spite_tensor_t *wo,
-    spite_kvcache_t      *kvcache,
-    int                   pos,
-    float                 rope_freq_base,
-    const spite_ctx_t    *ctx
+    SpiteTensor*       out,
+    const SpiteTensor* x,
+    const SpiteTensor* wq,
+    const SpiteTensor* wk,
+    const SpiteTensor* wv,
+    const SpiteTensor* wo,
+    SpiteKvCache*      kvcache,
+    int                pos,
+    float              rope_freq_base,
+    const SpiteCtx*    ctx
 ) {
-    /* TODO: implement */
+    // TODO: implement
     (void)out; (void)x; (void)wq; (void)wk; (void)wv; (void)wo;
     (void)kvcache; (void)pos; (void)rope_freq_base; (void)ctx;
     return -1;
 }
 
-/* ── Kernel descriptor ─────────────────────────────────────────────────
- *
- * Edit author, supported_quants. Leave ops NULL if not implemented.
- */
-static const spite_kernel_info_t kernel_info = {
+// ── Kernel descriptor ─────────────────────────────────────────────────────
+//
+// Edit: author, gpu_arch if porting to another card, supported_quants.
+// Set op pointers to the function once you've implemented them.
+
+static constexpr SpiteKernelInfo KERNEL_INFO {
     .abi_version      = SPITE_ABI_VERSION,
     .model_arch       = "llama3",
     .gpu_arch         = "sm_89",
     .author           = "your name / handle here",
 
-    .supported_quants = { SPITE_TYPE_Q4_K, SPITE_TYPE_Q8_0, 0 },
+    .supported_quants = {
+        static_cast<uint32_t>(SPITE_TYPE_Q4_K),
+        static_cast<uint32_t>(SPITE_TYPE_Q8_0),
+        0
+    },
 
-    .rms_norm         = NULL,    /* set to rms_norm once implemented */
-    .attention        = NULL,
-    .ffn              = NULL,
-    .layer            = NULL,    /* optional: fuse all ops into one kernel */
+    .rms_norm         = nullptr,   // set to rms_norm once implemented
+    .attention        = nullptr,
+    .ffn              = nullptr,
+    .layer            = nullptr,   // optional: fuse the whole layer
 };
 
-const spite_kernel_info_t *spite_kernel_info(void) {
-    return &kernel_info;
+extern "C" [[nodiscard]]
+const SpiteKernelInfo* spite_kernel_info() {
+    return &KERNEL_INFO;
 }

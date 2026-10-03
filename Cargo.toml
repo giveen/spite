@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/spite-abi",
+    "crates/spite-loader",
+    "crates/spite-dispatch",
+    "crates/spite-cli",
+]
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+repository  = "https://github.com/giveen/spite"
+
+[workspace.dependencies]
+spite-abi      = { path = "crates/spite-abi" }
+spite-loader   = { path = "crates/spite-loader" }
+spite-dispatch = { path = "crates/spite-dispatch" }
+
+memmap2     = "0.9"
+libloading  = "0.8"
+clap        = { version = "4", features = ["derive"] }
+thiserror   = "2"
+anyhow      = "1"

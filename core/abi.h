@@ -1,22 +1,28 @@
 /*
- * spite/core/abi.h  —  the contract every kernel must implement
+ * spite/core/abi.h  —  stable C ABI contract for kernels
  *
- * Every file under kernels/<model>/<gpu>/ implements these functions.
- * The signatures here are frozen. Adding a parameter here breaks every
- * downstream kernel. Think carefully before touching this file.
+ * C++23 / C11 compatible. Kernel .cu files include this directly.
+ * The Rust host mirrors every type in crates/spite-abi/src/lib.rs.
+ * Both sides must be updated together; ABI_VERSION is the enforcement.
  *
- * Version history is tracked in ABI_VERSION below. Kernels declare
- * which version they were written against; the dispatcher rejects
- * mismatches and falls back to the generic kernel.
+ * Rule: never change existing structs. Add new ones and bump ABI_VERSION.
  */
 
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+#  define SPITE_NORETURN  [[noreturn]]
+#  define SPITE_NODISCARD [[nodiscard]]
+#else
+#  define SPITE_NORETURN  _Noreturn
+#  define SPITE_NODISCARD
+#endif
+
 #define SPITE_ABI_VERSION 1
 
-/* ── Tensor ───────────────────────────────────────────────────────────── */
+/* ── Quant type tag ───────────────────────────────────────────────────── */
 
 typedef enum {
     SPITE_TYPE_F32   = 0,
@@ -24,106 +30,97 @@ typedef enum {
     SPITE_TYPE_BF16  = 2,
     SPITE_TYPE_Q8_0  = 8,
     SPITE_TYPE_Q4_0  = 10,
-    SPITE_TYPE_Q4_K  = 12,   /* covers Q4_K_S and Q4_K_M */
+    SPITE_TYPE_Q4_K  = 12,
     SPITE_TYPE_Q5_K  = 13,
     SPITE_TYPE_Q6_K  = 14,
-} spite_type_t;
+} SpiteType;
+
+/* ── Tensor ───────────────────────────────────────────────────────────── */
 
 typedef struct {
-    void       *data;        /* pointer into mmap'd GGUF buffer */
-    uint32_t    ne[4];       /* dimensions: ne[0]=cols, ne[1]=rows, ... */
-    spite_type_t type;
-} spite_tensor_t;
+    void*    data;      /* pointer into mmap'd GGUF buffer — do not free */
+    uint32_t ne[4];     /* ne[0]=cols, ne[1]=rows, ... */
+    SpiteType kind;
+} SpiteTensor;
 
-/* ── Context passed to every kernel op ───────────────────────────────── */
+/* ── Inference context ────────────────────────────────────────────────── */
 
 typedef struct {
-    int     n_ctx;           /* current context length */
-    int     n_batch;         /* tokens in this forward pass */
-    int     n_threads;       /* CPU threads available (ignored by GPU kernels) */
-    void   *gpu_stream;      /* CUDA stream / HIP stream / Metal command buffer */
-    void   *scratchpad;      /* pre-allocated GPU scratch memory */
+    int     n_ctx;
+    int     n_batch;
+    int     n_threads;
+    void*   gpu_stream;       /* CUDA stream / HIP stream / MTLCommandBuffer */
+    void*   scratchpad;
     size_t  scratchpad_bytes;
-} spite_ctx_t;
+} SpiteCtx;
 
-/* ── KV cache layout ─────────────────────────────────────────────────── */
-
-typedef struct {
-    spite_tensor_t k;        /* [n_layers, n_ctx, n_kv_heads, head_dim] */
-    spite_tensor_t v;
-    int            layer;    /* which layer this cache entry is for */
-} spite_kvcache_t;
-
-/* ── Ops every kernel file must export ───────────────────────────────── */
-/*
- * All functions return 0 on success, negative on error.
- * Kernels that don't support an op leave the symbol absent;
- * the dispatcher falls back to the generic implementation.
- */
-
-/* required: single-token or batched RMS norm */
-typedef int (*spite_rms_norm_fn)(
-    spite_tensor_t       *out,
-    const spite_tensor_t *x,
-    const spite_tensor_t *weight,
-    float                 eps,
-    const spite_ctx_t    *ctx
-);
-
-/* required: QKV projection + rope + attention + output projection */
-typedef int (*spite_attention_fn)(
-    spite_tensor_t       *out,
-    const spite_tensor_t *x,
-    const spite_tensor_t *wq,
-    const spite_tensor_t *wk,
-    const spite_tensor_t *wv,
-    const spite_tensor_t *wo,
-    spite_kvcache_t      *kvcache,
-    int                   pos,      /* current token position */
-    float                 rope_freq_base,
-    const spite_ctx_t    *ctx
-);
-
-/* required: gate + up projection, SiLU activation, down projection */
-typedef int (*spite_ffn_fn)(
-    spite_tensor_t       *out,
-    const spite_tensor_t *x,
-    const spite_tensor_t *w_gate,
-    const spite_tensor_t *w_up,
-    const spite_tensor_t *w_down,
-    const spite_ctx_t    *ctx
-);
-
-/* optional: fused rms_norm + attention + ffn for a single layer */
-typedef int (*spite_layer_fn)(
-    spite_tensor_t       *out,
-    const spite_tensor_t *x,
-    int                   layer_idx,
-    spite_kvcache_t      *kvcache,
-    int                   pos,
-    const spite_ctx_t    *ctx
-);
-
-/* ── Kernel descriptor — returned by spite_kernel_info() ─────────────── */
+/* ── KV cache ─────────────────────────────────────────────────────────── */
 
 typedef struct {
-    uint32_t    abi_version;    /* must equal SPITE_ABI_VERSION */
-    const char *model_arch;     /* e.g. "llama3", "mistral" */
-    const char *gpu_arch;       /* e.g. "sm_89", "rdna3", "metal" */
-    const char *author;         /* optional, for credit */
+    SpiteTensor k;
+    SpiteTensor v;
+    int         layer;
+} SpiteKvCache;
 
-    /* which quant types this kernel handles (0-terminated list) */
-    spite_type_t supported_quants[8];
+/* ── Op signatures ────────────────────────────────────────────────────── */
+/* Return 0 on success, -1 if not implemented (dispatcher uses fallback). */
 
-    /* function pointers — NULL means "not implemented, use fallback" */
-    spite_rms_norm_fn  rms_norm;
-    spite_attention_fn attention;
-    spite_ffn_fn       ffn;
-    spite_layer_fn     layer;   /* NULL unless the kernel fuses the full layer */
-} spite_kernel_info_t;
+typedef int (*SpiteRmsNormFn)(
+    SpiteTensor*       out,
+    const SpiteTensor* x,
+    const SpiteTensor* weight,
+    float              eps,
+    const SpiteCtx*    ctx
+);
 
-/*
- * Every kernel shared library must export this function.
- * The dispatcher calls it to validate the kernel before use.
- */
-typedef const spite_kernel_info_t *(*spite_kernel_info_fn)(void);
+typedef int (*SpiteAttentionFn)(
+    SpiteTensor*       out,
+    const SpiteTensor* x,
+    const SpiteTensor* wq,
+    const SpiteTensor* wk,
+    const SpiteTensor* wv,
+    const SpiteTensor* wo,
+    SpiteKvCache*      kvcache,
+    int                pos,
+    float              rope_freq_base,
+    const SpiteCtx*    ctx
+);
+
+typedef int (*SpiteFfnFn)(
+    SpiteTensor*       out,
+    const SpiteTensor* x,
+    const SpiteTensor* w_gate,
+    const SpiteTensor* w_up,
+    const SpiteTensor* w_down,
+    const SpiteCtx*    ctx
+);
+
+/* Optional: fuse rms_norm + attention + ffn for one full layer. */
+typedef int (*SpiteLayerFn)(
+    SpiteTensor*       out,
+    const SpiteTensor* x,
+    int                layer_idx,
+    SpiteKvCache*      kvcache,
+    int                pos,
+    const SpiteCtx*    ctx
+);
+
+/* ── Kernel descriptor ────────────────────────────────────────────────── */
+
+typedef struct {
+    uint32_t    abi_version;
+    const char* model_arch;       /* e.g. "llama3" */
+    const char* gpu_arch;         /* e.g. "sm_89"  */
+    const char* author;           /* optional credit */
+
+    uint32_t supported_quants[8]; /* 0-terminated list of SpiteType values */
+
+    /* NULL = not implemented; dispatcher uses fallback. */
+    SpiteRmsNormFn  rms_norm;
+    SpiteAttentionFn attention;
+    SpiteFfnFn      ffn;
+    SpiteLayerFn    layer;
+} SpiteKernelInfo;
+
+/* Every kernel .so must export this symbol. */
+typedef const SpiteKernelInfo* (*SpiteKernelInfoFn)(void);

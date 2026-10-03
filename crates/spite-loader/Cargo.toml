@@ -1,0 +1,12 @@
+[package]
+name        = "spite-loader"
+description = "GGUF file loader — mmap-based, zero-copy"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi  = { workspace = true }
+memmap2    = { workspace = true }
+thiserror  = { workspace = true }

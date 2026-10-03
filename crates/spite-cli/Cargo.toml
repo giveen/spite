@@ -1,0 +1,18 @@
+[package]
+name        = "spite"
+description = "spite — hyper-modular LLM inference engine"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "spite"
+path = "src/main.rs"
+
+[dependencies]
+spite-abi      = { workspace = true }
+spite-loader   = { workspace = true }
+spite-dispatch = { workspace = true }
+clap           = { workspace = true }
+anyhow         = { workspace = true }
