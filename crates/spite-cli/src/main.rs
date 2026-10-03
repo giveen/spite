@@ -570,7 +570,7 @@ fn maybe_print_offload_plan(hw: &HardwareArgs, vram_gib: u32, model_bytes: u64, 
         ram_budget_bytes:    ram_budget,
         ..Default::default()
     };
-    match TieredPlacement::plan(vram_gib as u64 * GIB, ram_bytes, bytes_per_layer, n_layers, &cfg) {
+    match TieredPlacement::plan(vram_gib as u64 * GIB, ram_bytes, bytes_per_layer, n_layers, &cfg, None) {
         Ok(plan)  => { println!(); plan.print_summary(vram_gib, bytes_per_layer); }
         Err(e)    => eprintln!("offload plan error: {e}"),
     }
