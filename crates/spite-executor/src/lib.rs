@@ -20,7 +20,7 @@ use spite_abi::SpiteCtx;
 use spite_plugin::{PluginKey, Registry};
 use spite_sampling::{Sampler, DefaultSampler};
 use spite_tokenizer::Tokenize;
-use spite_kvcache::Cache;
+use spite_kvcache::{Cache, KvQuantConfig};
 use spite_offload::OffloadConfig;
 use thiserror::Error;
 
@@ -130,6 +130,8 @@ pub struct ExecutorConfig {
     /// Weight offload policy (VRAM → RAM → disk).
     /// `None` means keep everything in VRAM; overflow panics if VRAM is insufficient.
     pub offload:      Option<OffloadConfig>,
+    /// KV cache quantization.  Default: both K and V at f16.
+    pub kv_quant:     KvQuantConfig,
 }
 
 impl Default for ExecutorConfig {
@@ -142,6 +144,7 @@ impl Default for ExecutorConfig {
             mlock:       false,
             madvise_seq: true,
             offload:     None,
+            kv_quant:    KvQuantConfig::default(),
         }
     }
 }

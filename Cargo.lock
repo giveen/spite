@@ -682,6 +682,7 @@ dependencies = [
  "clap",
  "spite-abi",
  "spite-dispatch",
+ "spite-kvcache",
  "spite-loader",
  "spite-offload",
  "tracing",

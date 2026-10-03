@@ -68,6 +68,7 @@ spite-abi          = { workspace = true }
 spite-loader       = { workspace = true }
 spite-dispatch     = { workspace = true }
 spite-offload      = { workspace = true }
+spite-kvcache      = { workspace = true }
 clap               = { workspace = true }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
