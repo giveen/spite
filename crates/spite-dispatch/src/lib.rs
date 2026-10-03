@@ -1,16 +1,20 @@
 //! Runtime kernel selection.
 //!
-//! Given a model arch ("llama3") and the detected GPU arch ("sm_89"), walks
-//! the kernels/ directory and builds a dispatch table by trying candidates in
-//! priority order. Every slot falls back to the generic kernel — the table
-//! always succeeds.
+//! `DispatchBuilder` takes a `KernelSpec` (family + model + arch + card + quant)
+//! and builds a `DispatchTable` by walking two priority chains:
 //!
-//! Fallback chain per op:
-//!   kernels/<model>/<exact_gpu>/
-//!   kernels/<model>/generic_cuda/   (NVIDIA only)
-//!   kernels/<model>/generic/
-//!   kernels/generic/<exact_gpu>/
-//!   kernels/generic/generic/        ← always present
+//! **Model ops** (rms_norm, attention, ffn, layer) use `resolve::model_candidates`:
+//!   kernels/<family>/<model>/<arch>/<card>/<quant>/   ← card + quant specialist
+//!   kernels/<family>/<model>/<arch>/<card>/           ← card specialist
+//!   kernels/<family>/<model>/<arch>/<quant>/          ← quant specialist
+//!   kernels/<family>/<model>/<arch>/                  ← arch baseline
+//!   kernels/generic/<arch>/
+//!   kernels/generic/generic/                          ← always present
+//!
+//! **Engine ops** (speculative, prefill, kv_quant) use `resolve::engine_candidates`:
+//!   kernels/_engine/<feature>/<arch>/<card>/          ← card specialist
+//!   kernels/_engine/<feature>/<arch>/                 ← arch baseline
+//!   kernels/_engine/<feature>/generic/                ← always present
 
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
@@ -24,6 +28,9 @@ use spite_abi::{
 };
 
 pub mod fallback;
+pub mod resolve;
+
+pub use resolve::{KernelSpec, detect_card_id};
 
 #[derive(Debug, Error)]
 pub enum DispatchError {
@@ -78,11 +85,14 @@ pub struct OpSource {
 }
 
 pub struct DispatchTable {
-    pub rms_norm:          (Option<RmsNormFn>,   OpSource),
-    pub attention:         (Option<AttentionFn>,  OpSource),
-    pub ffn:               (Option<FfnFn>,        OpSource),
-    pub layer:             (Option<LayerFn>,       OpSource),
+    // ── Model-specific ops ────────────────────────────────────────────────
+    pub rms_norm:  (Option<RmsNormFn>,   OpSource),
+    pub attention: (Option<AttentionFn>, OpSource),
+    pub ffn:       (Option<FfnFn>,       OpSource),
+    pub layer:     (Option<LayerFn>,     OpSource),
+    // ── Engine-level ops (cross-model, card/arch/generic chain) ──────────
     pub speculative_verify: (Option<SpecVerifyFn>, OpSource),
+    pub prefill:            (Option<LayerFn>,      OpSource), // chunked prefill
     // Keep libraries alive.
     _libs: Vec<LoadedKernel>,
 }
@@ -91,11 +101,12 @@ impl DispatchTable {
     /// Print which kernel won each slot (for --verbose).
     pub fn print_sources(&self) {
         let rows = [
-            ("rms_norm",   &self.rms_norm.1),
-            ("attention",  &self.attention.1),
-            ("ffn",        &self.ffn.1),
-            ("layer",      &self.layer.1),
-            ("spec_verify",&self.speculative_verify.1),
+            ("rms_norm",    &self.rms_norm.1),
+            ("attention",   &self.attention.1),
+            ("ffn",         &self.ffn.1),
+            ("layer",       &self.layer.1),
+            ("spec_verify", &self.speculative_verify.1),
+            ("prefill",     &self.prefill.1),
         ];
         for (op, src) in rows {
             println!("  {op:<14} → {}/{}", src.gpu_arch, src.path.display());
@@ -107,55 +118,53 @@ impl DispatchTable {
 
 pub struct DispatchBuilder {
     kernels_dir: PathBuf,
-    model_arch:  String,
-    gpu_arch:    String,
+    spec:        KernelSpec,
 }
 
 impl DispatchBuilder {
-    pub fn new(kernels_dir: impl AsRef<Path>, model_arch: &str, gpu_arch: &str) -> Self {
-        Self {
-            kernels_dir: kernels_dir.as_ref().to_owned(),
-            model_arch:  model_arch.to_owned(),
-            gpu_arch:    gpu_arch.to_owned(),
-        }
+    /// Construct with a fully-populated `KernelSpec`.
+    /// Use `resolve::detect_card_id` to fill `spec.card_id` from the GPU name.
+    pub fn new(kernels_dir: impl AsRef<Path>, spec: KernelSpec) -> Self {
+        Self { kernels_dir: kernels_dir.as_ref().to_owned(), spec }
     }
 
     pub fn build(self) -> Result<DispatchTable, DispatchError> {
-        // Candidate directories in priority order.
-        let vendor_generic = if self.gpu_arch.starts_with("sm_") {
-            Some("generic_cuda")
-        } else if self.gpu_arch.starts_with("rdna") || self.gpu_arch.starts_with("rx") {
-            Some("generic_rocm")
-        } else {
-            None
-        };
+        let kdir = &self.kernels_dir;
 
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        candidates.push(self.kernels_dir.join(&self.model_arch).join(&self.gpu_arch));
-        if let Some(vg) = vendor_generic {
-            candidates.push(self.kernels_dir.join(&self.model_arch).join(vg));
+        // ── Model-specific candidates ──────────────────────────────────────
+        let model_cands = self.spec.model_candidates(kdir);
+        let mut model_libs: Vec<LoadedKernel> = Vec::new();
+        for dir in &model_cands {
+            if let Some(k) = try_load_dir(dir) { model_libs.push(k); }
         }
-        candidates.push(self.kernels_dir.join(&self.model_arch).join("generic"));
-        candidates.push(self.kernels_dir.join("generic").join(&self.gpu_arch));
-        candidates.push(self.kernels_dir.join("generic").join("generic"));
 
-        let mut libs: Vec<LoadedKernel> = Vec::new();
-        for dir in &candidates {
-            if let Some(k) = try_load_dir(dir) {
-                libs.push(k);
-            }
-        }
+        // ── Engine-level candidates (one set per feature) ──────────────────
+        let spec_cands    = self.spec.engine_candidates("speculative", kdir);
+        let prefill_cands = self.spec.engine_candidates("prefill",     kdir);
+
+        let mut spec_libs:    Vec<LoadedKernel> = Vec::new();
+        let mut prefill_libs: Vec<LoadedKernel> = Vec::new();
+        for dir in &spec_cands    { if let Some(k) = try_load_dir(dir) { spec_libs.push(k); } }
+        for dir in &prefill_cands { if let Some(k) = try_load_dir(dir) { prefill_libs.push(k); } }
 
         let generic_src = OpSource {
             gpu_arch: "generic".into(),
-            path:     self.kernels_dir.join("generic").join("generic"),
+            path:     kdir.join("generic").join("generic"),
         };
 
-        let rms_norm           = find_op(&libs, |k| k.info.rms_norm,           &candidates, generic_src.clone());
-        let attention          = find_op(&libs, |k| k.info.attention,          &candidates, generic_src.clone());
-        let ffn                = find_op(&libs, |k| k.info.ffn,                &candidates, generic_src.clone());
-        let layer              = find_op(&libs, |k| k.info.layer,              &candidates, generic_src.clone());
-        let speculative_verify = find_op(&libs, |k| k.info.speculative_verify, &candidates, generic_src.clone());
+        // Model ops resolved from model candidate chain
+        let rms_norm  = find_op(&model_libs, |k| k.info.rms_norm,  &model_cands, generic_src.clone());
+        let attention = find_op(&model_libs, |k| k.info.attention,  &model_cands, generic_src.clone());
+        let ffn       = find_op(&model_libs, |k| k.info.ffn,        &model_cands, generic_src.clone());
+        let layer     = find_op(&model_libs, |k| k.info.layer,      &model_cands, generic_src.clone());
+
+        // Engine ops resolved from their own candidate chains
+        let speculative_verify = find_op(&spec_libs,    |k| k.info.speculative_verify, &spec_cands,    generic_src.clone());
+        let prefill            = find_op(&prefill_libs, |k| k.info.layer,              &prefill_cands, generic_src.clone());
+
+        let mut all_libs = model_libs;
+        all_libs.extend(spec_libs);
+        all_libs.extend(prefill_libs);
 
         Ok(DispatchTable {
             rms_norm,
@@ -163,7 +172,8 @@ impl DispatchBuilder {
             ffn,
             layer,
             speculative_verify,
-            _libs: libs,
+            prefill,
+            _libs: all_libs,
         })
     }
 }
