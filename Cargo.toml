@@ -10,10 +10,11 @@ members = [
 ]
 
 [workspace.package]
-version     = "0.1.0"
-edition     = "2021"
-license     = "MIT OR Apache-2.0"
-repository  = "https://github.com/giveen/spite"
+version       = "0.1.0"
+edition       = "2024"
+rust-version  = "1.97"
+license       = "MIT OR Apache-2.0"
+repository    = "https://github.com/giveen/spite"
 
 [workspace.dependencies]
 spite-abi      = { path = "crates/spite-abi" }
