@@ -1,19 +1,41 @@
 //! Model architecture implementations.
 //!
-//! Each architecture is a separate module with its own weight-name mapping,
-//! layer ordering, and hyperparameter interpretation. The host forward-pass
-//! loop lives here; GPU kernels live under kernels/ and are called via
-//! spite-dispatch.
+//! Each architecture is a separate module inside its family directory.
+//! The host forward-pass loop lives here; GPU kernels live under kernels/
+//! and are called via spite-dispatch.
 //!
-//! Adding a new architecture
-//! -------------------------
-//! 1. Create `src/<arch>.rs` implementing `ModelArch`
-//! 2. Register it in `ArchRegistry::default()`
-//! 3. Add a `kernels/<arch>/` directory for GPU-specific ops
+//! # Directory layout
+//!
+//!   src/<family>/mod.rs      — exports all variants in that family
+//!   src/<family>/<model>.rs  — implements ModelArch for one variant
+//!   kernels/<family>/<model>/<gpu_arch>/  — kernel .so per GPU target
+//!
+//! # Adding a new architecture
+//!
+//!   1. Create src/<family>/<model>.rs implementing ModelArch
+//!   2. Add it to src/<family>/mod.rs
+//!   3. Register GGUF arch strings in ArchRegistry::default() below
+//!   4. Add kernel dirs: kernels/<family>/<model>/<gpu_arch>/
 
-pub mod llama3;
+// Existing families
+pub mod llama;
 pub mod mistral;
-pub mod phi3;
+pub mod phi;
+
+// 2025 model families
+pub mod qwen;
+pub mod deepseek;
+pub mod gemma;
+pub mod falcon;
+pub mod rwkv;
+pub mod mamba;
+pub mod glm;
+pub mod granite;
+pub mod nemotron;
+pub mod olmo;
+pub mod jamba;
+pub mod minimax;
+pub mod modern_bert;
 
 use spite_abi::SpiteCtx;
 use thiserror::Error;
@@ -72,10 +94,67 @@ impl Default for ArchRegistry {
     fn default() -> Self {
         Self {
             entries: vec![
-                ("llama",   |c| Box::new(llama3::Llama3::new(c))),
-                ("llama3",  |c| Box::new(llama3::Llama3::new(c))),
-                ("mistral", |c| Box::new(mistral::Mistral::new(c))),
-                ("phi3",    |c| Box::new(phi3::Phi3::new(c))),
+                // ── Llama family ─────────────────────────────────────────────
+                ("llama",        |c| Box::new(llama::Llama3::new(c))),
+                ("llama3",       |c| Box::new(llama::Llama3::new(c))),
+                ("llama4",       |c| Box::new(llama::Llama4::new(c))),
+
+                // ── Mistral family ───────────────────────────────────────────
+                ("mistral",      |c| Box::new(mistral::Mistral::new(c))),
+                ("mistral3",     |c| Box::new(mistral::Mistral3::new(c))),
+
+                // ── Phi family ───────────────────────────────────────────────
+                ("phi3",         |c| Box::new(phi::Phi3::new(c))),
+                ("phi4",         |c| Box::new(phi::Phi4::new(c))),
+
+                // ── Qwen family ──────────────────────────────────────────────
+                ("qwen3",        |c| Box::new(qwen::Qwen3::new(c))),
+                ("qwen3moe",     |c| Box::new(qwen::Qwen3Moe::new(c))),
+                ("qwen3next",    |c| Box::new(qwen::QwQ::new(c))),
+                ("qwq",          |c| Box::new(qwen::QwQ::new(c))),
+                ("qwen35",       |c| Box::new(qwen::Qwen3_5::new(c))),
+                ("qwen35moe",    |c| Box::new(qwen::Qwen3_5::new(c))),
+                ("qwen3vl",      |c| Box::new(qwen::Qwen3Vl::new(c))),
+
+                // ── DeepSeek family ──────────────────────────────────────────
+                ("deepseek2",    |c| Box::new(deepseek::DeepSeekV3::new(c))),
+                ("deepseek32",   |c| Box::new(deepseek::DeepSeekV3::new(c))),
+
+                // ── Gemma family ─────────────────────────────────────────────
+                ("gemma3",       |c| Box::new(gemma::Gemma3::new(c))),
+                ("gemma3n",      |c| Box::new(gemma::Gemma3n::new(c))),
+
+                // ── Falcon family ────────────────────────────────────────────
+                ("falcon-h1",    |c| Box::new(falcon::FalconH1::new(c))),
+
+                // ── RWKV family ──────────────────────────────────────────────
+                ("rwkv7",        |c| Box::new(rwkv::Rwkv7::new(c))),
+
+                // ── Mamba family ─────────────────────────────────────────────
+                ("mamba2",       |c| Box::new(mamba::Mamba2::new(c))),
+
+                // ── GLM family ───────────────────────────────────────────────
+                ("glm4",         |c| Box::new(glm::Glm4::new(c))),
+                ("glm4moe",      |c| Box::new(glm::Glm4::new(c))),
+
+                // ── Granite family ───────────────────────────────────────────
+                ("granitehybrid", |c| Box::new(granite::GraniteHybrid::new(c))),
+
+                // ── Nemotron family ──────────────────────────────────────────
+                ("nemotron",     |c| Box::new(nemotron::Nemotron::new(c))),
+                ("nemotron_h",   |c| Box::new(nemotron::NemotronH::new(c))),
+
+                // ── OLMo family ──────────────────────────────────────────────
+                ("olmo2",        |c| Box::new(olmo::OLMo2::new(c))),
+
+                // ── Jamba family ─────────────────────────────────────────────
+                ("jamba",        |c| Box::new(jamba::Jamba::new(c))),
+
+                // ── MiniMax family ───────────────────────────────────────────
+                ("minimax-01",   |c| Box::new(minimax::MinimaxText01::new(c))),
+
+                // ── Encoder / embedding models ───────────────────────────────
+                ("modern-bert",  |c| Box::new(modern_bert::ModernBert::new(c))),
             ],
         }
     }

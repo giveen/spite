@@ -13,6 +13,11 @@ pub mod hip;
 pub mod hip_unified;
 pub mod metal;
 pub mod vulkan;
+pub mod sycl;
+pub mod opencl;
+pub mod cann;
+pub mod musa;
+pub mod hexagon;
 
 use thiserror::Error;
 
@@ -32,34 +37,71 @@ pub enum GpuError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuBackend {
+    // ── NVIDIA ──────────────────────────────────────────────────────────────
     Cuda,
+
+    // ── AMD ─────────────────────────────────────────────────────────────────
     /// Discrete AMD GPU (dGPU) — separate VRAM, copies required.
     Hip,
-    /// AMD APU with unified memory (Strix Halo, Phoenix, Hawk Point, etc.).
+    /// AMD APU with unified memory (Strix Halo, Phoenix, Hawk Point).
     /// CPU and iGPU share one LPDDR pool; upload/download are zero-cost.
     HipUnified,
+
+    // ── Apple ────────────────────────────────────────────────────────────────
+    /// Metal (Apple Silicon and AMD eGPU on macOS). Unified memory on M-series.
     Metal,
+
+    // ── Cross-vendor ─────────────────────────────────────────────────────────
+    /// Vulkan 1.3 compute (GLSL shaders, SPIR-V). Fallback for any Vulkan GPU.
     Vulkan,
+    /// OpenCL 2.0+. Primary: Qualcomm Adreno (Android). Also AMD/Intel fallback.
+    OpenCl,
+
+    // ── Intel ────────────────────────────────────────────────────────────────
+    /// SYCL / oneAPI DPC++. Intel Arc, Intel Data Center GPU Flex/Max, Intel iGPU.
+    Sycl,
+
+    // ── Qualcomm ─────────────────────────────────────────────────────────────
+    /// Hexagon HTP/HTA (Snapdragon DSP/NPU). Distinct from Adreno (OpenCL).
+    Hexagon,
+
+    // ── Huawei ───────────────────────────────────────────────────────────────
+    /// CANN — Ascend NPU (Ascend 310P, 910B, 910C).
+    Cann,
+
+    // ── Moore Threads ────────────────────────────────────────────────────────
+    /// MUSA — Moore Threads MTT GPUs (CUDA-compatible API, domestic China).
+    Musa,
+
+    // ── CPU fallback ─────────────────────────────────────────────────────────
     Cpu,
 }
 
 impl GpuBackend {
     /// Detect which backend to use for the primary GPU.
     /// Falls back to `Cpu` when no GPU backend is compiled in.
+    ///
+    /// # TODO (detection order)
+    ///
+    /// 1. CUDA:    probe `libcuda.so` / `nvcuda.dll`
+    /// 2. HIP:     probe `libhip.so`; if device is APU → HipUnified
+    /// 3. Metal:   `cfg!(target_os = "macos")`
+    /// 4. SYCL:    probe Level Zero ICD or query Intel GPU device
+    /// 5. MUSA:    probe `libmusa.so` (Moore Threads)
+    /// 6. CANN:    probe `libascendcl.so`
+    /// 7. Hexagon: check `/dev/ion` or `libQnnHtp.so` presence (Android/Windows ARM)
+    /// 8. OpenCL:  probe ICD loader; prefer for Adreno devices
+    /// 9. Vulkan:  last GPU option before falling back to Cpu
     pub fn detect() -> Self {
-        // TODO: check for libcuda.so → Cuda
-        // TODO: check for libhip.so  → Hip or HipUnified (via hip_unified::is_unified())
-        // TODO: check for Metal (cfg(target_os = "macos")) → Metal
-        // TODO: check for Vulkan ICD → Vulkan
         if hip_unified::is_unified() {
             return GpuBackend::HipUnified;
         }
         GpuBackend::Cpu
     }
 
-    /// True when CPU and GPU share the same physical memory (no copy needed).
+    /// True when CPU and GPU share the same physical memory (no DMA copy needed).
     pub fn is_unified_memory(self) -> bool {
-        matches!(self, GpuBackend::HipUnified | GpuBackend::Metal)
+        matches!(self, GpuBackend::HipUnified | GpuBackend::Metal | GpuBackend::Hexagon)
     }
 }
 
@@ -83,6 +125,11 @@ impl DeviceBuffer {
             GpuBackend::HipUnified  => hip_unified::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
             GpuBackend::Metal       => metal::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
             GpuBackend::Vulkan      => vulkan::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
+            GpuBackend::Sycl        => sycl::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
+            GpuBackend::OpenCl      => opencl::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
+            GpuBackend::Cann        => cann::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
+            GpuBackend::Musa        => musa::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
+            GpuBackend::Hexagon     => hexagon::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
             GpuBackend::Cpu         => Ok(Self {
                 backend,
                 size,
@@ -97,7 +144,7 @@ impl DeviceBuffer {
     }
 
     /// Copy `src` (host) → this buffer (device).
-    /// On unified-memory backends (HipUnified, Metal) this is a no-op.
+    /// On unified-memory backends (HipUnified, Metal, Hexagon) this is a no-op.
     pub fn upload(&mut self, src: &[u8]) -> Result<(), GpuError> {
         assert!(src.len() <= self.size);
         match self.backend {
@@ -107,11 +154,16 @@ impl DeviceBuffer {
             GpuBackend::HipUnified  => hip_unified::upload(self.ptr, src),
             GpuBackend::Metal       => metal::upload(self.ptr, src),
             GpuBackend::Vulkan      => vulkan::upload(self.ptr, src),
+            GpuBackend::Sycl        => sycl::upload(self.ptr, src),
+            GpuBackend::OpenCl      => opencl::upload(self.ptr, src),
+            GpuBackend::Cann        => cann::upload(self.ptr, src),
+            GpuBackend::Musa        => musa::upload(self.ptr, src),
+            GpuBackend::Hexagon     => hexagon::upload(self.ptr, src),
         }
     }
 
     /// Copy this buffer (device) → `dst` (host).
-    /// On unified-memory backends (HipUnified, Metal) this is a no-op.
+    /// On unified-memory backends (HipUnified, Metal, Hexagon) this is a no-op.
     pub fn download(&self, dst: &mut [u8]) -> Result<(), GpuError> {
         assert!(dst.len() <= self.size);
         match self.backend {
@@ -121,6 +173,11 @@ impl DeviceBuffer {
             GpuBackend::HipUnified  => hip_unified::download(self.ptr, dst),
             GpuBackend::Metal       => metal::download(self.ptr, dst),
             GpuBackend::Vulkan      => vulkan::download(self.ptr, dst),
+            GpuBackend::Sycl        => sycl::download(self.ptr, dst),
+            GpuBackend::OpenCl      => opencl::download(self.ptr, dst),
+            GpuBackend::Cann        => cann::download(self.ptr, dst),
+            GpuBackend::Musa        => musa::download(self.ptr, dst),
+            GpuBackend::Hexagon     => hexagon::download(self.ptr, dst),
         }
     }
 
@@ -140,6 +197,11 @@ impl Drop for DeviceBuffer {
             GpuBackend::HipUnified  => hip_unified::free(self.ptr, self.size),
             GpuBackend::Metal       => metal::free(self.ptr),
             GpuBackend::Vulkan      => vulkan::free(self.ptr),
+            GpuBackend::Sycl        => sycl::free(self.ptr),
+            GpuBackend::OpenCl      => opencl::free(self.ptr),
+            GpuBackend::Cann        => cann::free(self.ptr),
+            GpuBackend::Musa        => musa::free(self.ptr),
+            GpuBackend::Hexagon     => hexagon::free(self.ptr),
             GpuBackend::Cpu         => {}
         }
     }
