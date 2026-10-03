@@ -8,6 +8,9 @@
 //!
 //! No separate tokenizer download or config file needed.
 
+pub mod bpe;
+pub mod sentencepiece;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

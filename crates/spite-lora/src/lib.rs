@@ -15,6 +15,8 @@
 //!   blk.0.attn_q.lora_a   [rank, d_model]
 //!   blk.0.attn_q.lora_b   [n_heads*head_dim, rank]
 
+pub mod merge;
+
 use std::path::Path;
 use thiserror::Error;
 

@@ -10,6 +10,9 @@
 //! ALiBi     — attention with linear biases (BLOOM, MPT); no rotation
 //! LongRoPE  — non-uniform per-dimension rescaling for very long contexts
 
+pub mod longrope;
+pub mod mrope;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]

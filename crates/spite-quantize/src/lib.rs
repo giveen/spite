@@ -12,6 +12,9 @@
 //!   Q5KM   — 5-bit K-quants mixed
 //!   Q6K    — 6-bit K-quants, near-lossless
 
+pub mod q8_0;
+pub mod q4k;
+
 use std::path::Path;
 use thiserror::Error;
 
@@ -85,13 +88,16 @@ impl Default for QuantizeConfig {
 ///
 /// `dst` must be pre-allocated to the correct block-packed byte size.
 pub fn quantize_f32(
-    _src:    &[f32],
-    _dst:    &mut [u8],
-    _kind:   QuantType,
-    _n_elem: usize,
+    src:    &[f32],
+    dst:    &mut [u8],
+    kind:   QuantType,
+    n_elem: usize,
 ) -> Result<(), QuantizeError> {
-    // TODO: dispatch to quantize_q8_0 / quantize_q4k / etc.
-    Err(QuantizeError::UnsupportedSource("quantization not yet implemented".into()))
+    match kind {
+        QuantType::Q8_0 => { q8_0::quantize(src, dst, n_elem); Ok(()) }
+        QuantType::Q4KM | QuantType::Q4KS => { q4k::quantize_q4k(src, dst, n_elem); Ok(()) }
+        _ => Err(QuantizeError::UnsupportedSource(format!("{} not yet implemented", kind.name()))),
+    }
 }
 
 /// Read `src_path` (F32 GGUF), quantize tensors per `cfg`, write `dst_path`.
