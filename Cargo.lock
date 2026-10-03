@@ -683,6 +683,7 @@ dependencies = [
  "spite-abi",
  "spite-dispatch",
  "spite-loader",
+ "spite-offload",
  "tracing",
  "tracing-subscriber",
 ]
@@ -735,6 +736,7 @@ dependencies = [
  "spite-gpu",
  "spite-kvcache",
  "spite-models",
+ "spite-offload",
  "spite-plugin",
  "spite-rope",
  "spite-sampling",
@@ -794,6 +796,13 @@ dependencies = [
  "spite-compute",
  "spite-dispatch",
  "spite-rope",
+ "thiserror",
+]
+
+[[package]]
+name = "spite-offload"
+version = "0.1.0"
+dependencies = [
  "thiserror",
 ]
 

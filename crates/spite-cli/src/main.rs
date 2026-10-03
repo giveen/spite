@@ -18,6 +18,7 @@ use spite_dispatch::{
     DispatchBuilder, KernelSpec, MultiGpuSpec, detect_gpu_arch,
 };
 use spite_loader::GgufModel;
+use spite_offload::{OffloadConfig, TieredPlacement};
 
 // ── Shared flag groups ─────────────────────────────────────────────────────
 
@@ -62,6 +63,27 @@ struct HardwareArgs {
         value_name = "DIR",
     )]
     kernels_dir: PathBuf,
+
+    /// Enable weight offload: layers that don't fit in VRAM spill into system
+    /// RAM.  Requires sufficient free RAM; add --offload-disk to also allow
+    /// spilling to disk (via mmap).
+    #[arg(long = "offload-ram", env = "SPITE_OFFLOAD_RAM")]
+    offload_ram: bool,
+
+    /// Enable disk offload (implies --offload-ram): layers that don't fit in
+    /// VRAM or RAM are streamed from the .gguf file via mmap (~7 GB/s NVMe).
+    /// Lets you run any model on any GPU as long as you have the disk space.
+    #[arg(long = "offload-disk", env = "SPITE_OFFLOAD_DISK")]
+    offload_disk: bool,
+
+    /// Bytes to reserve in VRAM for KV cache and activations (default: 2 GiB).
+    #[arg(
+        long = "vram-reserve-gib",
+        env  = "SPITE_VRAM_RESERVE_GIB",
+        default_value_t = 2,
+        value_name = "GIB",
+    )]
+    vram_reserve_gib: u32,
 }
 
 /// Which model(s) to load.
@@ -302,6 +324,10 @@ fn cmd_run(
 
     print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
 
+    let vram_gib    = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
+    let model_bytes = std::fs::metadata(&target).map_or(0, |m| m.len());
+    maybe_print_offload_plan(hw, vram_gib, model_bytes, 0);
+
     println!("\nprompt       : {prompt}");
     println!("max tokens   : {max_tokens}");
     println!("temperature  : {temperature}");
@@ -330,6 +356,10 @@ fn cmd_serve(
 
     print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
 
+    let vram_gib    = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
+    let model_bytes = std::fs::metadata(&target).map_or(0, |m| m.len());
+    maybe_print_offload_plan(hw, vram_gib, model_bytes, 0);
+
     println!("\nlistening on : http://{host}:{port}");
     println!("(server loop not yet implemented — contribute it!)");
     Ok(())
@@ -344,6 +374,10 @@ fn cmd_dispatch(model_args: &ModelArgs, hw: &HardwareArgs) -> Result<()> {
 
     print_engine_header(&model_arch, &mgpu);
     print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
+
+    let vram_gib    = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
+    let model_bytes = std::fs::metadata(&target).map_or(0, |m| m.len());
+    maybe_print_offload_plan(hw, vram_gib, model_bytes, 0);
     Ok(())
 }
 
@@ -385,10 +419,51 @@ fn print_dispatch_tables(
         let table = result.context("kernel dispatch build failed")?;
         if mgpu.nodes.len() > 1 {
             println!("  [gpu {}] {}:", i, mgpu.nodes[i].card_id);
-            // indent the output
-            // (print_sources writes to stdout directly; prefix handled below)
         }
         table.print_sources();
     }
     Ok(())
+}
+
+/// If offload flags are set, plan the tier placement and print a summary.
+///
+/// `vram_gib` is from the primary GPU node (0 for unified memory).
+/// `model_bytes` is the total GGUF file size — a rough weight estimate.
+fn maybe_print_offload_plan(hw: &HardwareArgs, vram_gib: u32, model_bytes: u64, n_layers: usize) {
+    if !hw.offload_ram && !hw.offload_disk {
+        return;
+    }
+    const GIB: u64 = 1 << 30;
+
+    // Conservative RAM estimate: total installed memory from /proc/meminfo.
+    let ram_bytes = read_total_ram_bytes().unwrap_or(16 * GIB);
+
+    // Budget: if disk offload is disabled, cap RAM budget to ram_bytes so
+    // the planner won't place anything in the disk tier.
+    let ram_budget = if hw.offload_disk { u64::MAX } else { ram_bytes };
+
+    let bytes_per_layer = if n_layers > 0 { model_bytes / n_layers as u64 } else { model_bytes };
+    let cfg = OffloadConfig {
+        vram_reserved_bytes: hw.vram_reserve_gib as u64 * GIB,
+        ram_budget_bytes:    ram_budget,
+        ..Default::default()
+    };
+    match TieredPlacement::plan(vram_gib as u64 * GIB, ram_bytes, bytes_per_layer, n_layers, &cfg) {
+        Ok(plan) => {
+            println!();
+            plan.print_summary(vram_gib, bytes_per_layer);
+        }
+        Err(e) => eprintln!("offload plan error: {e}"),
+    }
+}
+
+fn read_total_ram_bytes() -> Option<u64> {
+    let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in content.lines() {
+        if line.starts_with("MemTotal:") {
+            let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }

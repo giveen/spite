@@ -18,4 +18,5 @@ spite-sampling   = { workspace = true }
 spite-rope       = { workspace = true }
 spite-plugin     = { workspace = true }
 spite-tokenizer  = { workspace = true }
+spite-offload    = { workspace = true }
 thiserror      = { workspace = true }

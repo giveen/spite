@@ -1,0 +1,11 @@
+[package]
+name        = "spite-offload"
+description = "Three-tier weight storage: VRAM → system RAM → disk (mmap)"
+version.workspace   = true
+edition.workspace   = true
+rust-version.workspace = true
+license.workspace   = true
+repository.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

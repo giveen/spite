@@ -21,6 +21,7 @@ use spite_plugin::{PluginKey, Registry};
 use spite_sampling::{Sampler, DefaultSampler};
 use spite_tokenizer::Tokenize;
 use spite_kvcache::Cache;
+use spite_offload::OffloadConfig;
 use thiserror::Error;
 
 // ── Per-request overrides ─────────────────────────────────────────────────
@@ -126,6 +127,9 @@ pub struct ExecutorConfig {
     pub mlock:        bool,
     /// Advise the OS that mmap'd weights will be accessed sequentially.
     pub madvise_seq:  bool,
+    /// Weight offload policy (VRAM → RAM → disk).
+    /// `None` means keep everything in VRAM; overflow panics if VRAM is insufficient.
+    pub offload:      Option<OffloadConfig>,
 }
 
 impl Default for ExecutorConfig {
@@ -137,6 +141,7 @@ impl Default for ExecutorConfig {
             batch_size:  512,
             mlock:       false,
             madvise_seq: true,
+            offload:     None,
         }
     }
 }

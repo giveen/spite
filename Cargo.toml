@@ -24,6 +24,7 @@ members = [
     "crates/spite-bench",
     "crates/spite-parallel",
     "crates/spite-plugin",
+    "crates/spite-offload",
     "xtask",
 ]
 
@@ -58,6 +59,7 @@ spite-vision      = { path = "crates/spite-vision" }
 spite-bench       = { path = "crates/spite-bench" }
 spite-parallel    = { path = "crates/spite-parallel" }
 spite-plugin      = { path = "crates/spite-plugin" }
+spite-offload     = { path = "crates/spite-offload" }
 
 memmap2     = "0.9"
 libloading  = "0.8"

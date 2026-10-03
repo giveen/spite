@@ -56,6 +56,7 @@ model-all = [
 spite-abi          = { workspace = true }
 spite-loader       = { workspace = true }
 spite-dispatch     = { workspace = true }
+spite-offload      = { workspace = true }
 clap               = { workspace = true }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
