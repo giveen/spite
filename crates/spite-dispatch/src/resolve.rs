@@ -141,7 +141,7 @@ pub fn detect_card_id(gpu_display_name: &str) -> String {
     normalize_card_name(gpu_display_name)
 }
 
-fn normalize_card_name(name: &str) -> String {
+pub fn normalize_card_name(name: &str) -> String {
     // Strip well-known vendor/product prefixes so we get the model designator.
     const PREFIXES: &[&str] = &[
         // Keep "RTX"/"GTX" in the output — strip only the branding before it.
