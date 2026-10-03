@@ -52,6 +52,17 @@ model-all = [
     "model-deepseek", "model-phi", "model-falcon", "model-gpt2",
 ]
 
+# ── Optional capabilities ─────────────────────────────────────────────────
+# Multi-Token Prediction: generate several tokens per step (DeepSeek-V3,
+# Medusa). Requires a model with MTP heads.
+feature-mtp     = []
+# FlashAttention: fused attention kernel (most cards supported).
+feature-dflash  = []
+# FlashAttention-2: Dao-AI-Lab v2 implementation (sm_80+ / cdna3 required).
+feature-dflash2 = ["feature-dflash"]
+# Vision encoder: multimodal image/video input (Gemma 3, LLaVA, Qwen-VL…).
+feature-vision  = []
+
 [dependencies]
 spite-abi          = { workspace = true }
 spite-loader       = { workspace = true }

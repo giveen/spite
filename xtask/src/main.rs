@@ -1,10 +1,12 @@
 //! spite build tool.
 //!
-//!   cargo xtask compile -m Qwen/Qwen3-27B,Google/gemma4 --card RTX_5090
+//!   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_5090
+//!   cargo xtask compile -m DeepSeek-V3    --card RTX_5090 --mtp --dflash2
+//!   cargo xtask compile -m Gemma3-27B     --card RTX_5090 --vision
 //!
-//! Translates model names and a card name into a `cargo build` invocation
-//! with the exact set of Cargo features needed — no dead code for models or
-//! GPU backends you didn't ask for.
+//! Translates model names, a card name, and optional feature flags into a
+//! `cargo build` invocation with the exact Cargo features needed — no dead
+//! code for models, GPU backends, or capabilities you didn't ask for.
 
 use std::process::{Command, ExitCode};
 
@@ -25,10 +27,15 @@ struct Cli {
 enum Cmd {
     /// Compile spite for a specific card (or cards) and model set.
     ///
-    /// Single GPU:
+    /// Basic:
     ///   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_5090
     ///   cargo xtask compile -m meta-llama/Llama-3-70B --card MI300X
     ///   cargo xtask compile -m meta-llama/Llama-3-8B --card M4_Max
+    ///
+    /// With capabilities:
+    ///   cargo xtask compile -m DeepSeek-V3 --card RTX_5090 --mtp --dflash2
+    ///   cargo xtask compile -m Gemma3-27B  --card RTX_5090 --vision
+    ///   cargo xtask compile -m Qwen3-27B   --card RTX_5090 --dflash
     ///
     /// Multiple GPUs (pipeline parallelism):
     ///   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_5070,RTX_3090
@@ -43,6 +50,27 @@ enum Cmd {
         /// Mixed vendors compile both GPU backends into the same binary.
         #[arg(long = "card", value_name = "CARD[,CARD…]", value_delimiter = ',')]
         cards: Vec<String>,
+
+        /// Enable Multi-Token Prediction (MTP heads: DeepSeek-V3, Medusa).
+        /// Requires a model that ships MTP heads.
+        #[arg(long)]
+        mtp: bool,
+
+        /// Enable FlashAttention fused kernel.
+        /// Supported on most cards; use --dflash2 for the faster v2 variant.
+        #[arg(long)]
+        dflash: bool,
+
+        /// Enable FlashAttention-2 (Dao-AI-Lab).
+        /// Requires sm_80+ (A100 / H100 / RTX 30xx+) or cdna3 (MI300X).
+        /// Automatically enables --dflash as well.
+        #[arg(long)]
+        dflash2: bool,
+
+        /// Enable vision encoder for multimodal models.
+        /// Required for Gemma 3, LLaVA, Qwen-VL, and similar vision models.
+        #[arg(long)]
+        vision: bool,
 
         /// Build profile: release (default) or dev.
         #[arg(long, default_value = "release")]
@@ -76,8 +104,8 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Compile { model, cards, profile, extra_features, dry_run } => {
-            cmd_compile(&model, &cards, &profile, extra_features.as_deref(), dry_run)
+        Cmd::Compile { model, cards, mtp, dflash, dflash2, vision, profile, extra_features, dry_run } => {
+            cmd_compile(&model, &cards, mtp, dflash, dflash2, vision, &profile, extra_features.as_deref(), dry_run)
         }
         Cmd::Cards  => cmd_cards(),
         Cmd::Models => cmd_models(),
@@ -89,6 +117,10 @@ fn run(cli: Cli) -> Result<()> {
 fn cmd_compile(
     model_spec:     &str,
     cards_raw:      &[String],
+    mtp:            bool,
+    dflash:         bool,
+    dflash2:        bool,
+    vision:         bool,
     profile:        &str,
     extra_features: Option<&str>,
     dry_run:        bool,
@@ -139,6 +171,11 @@ fn cmd_compile(
     let mut features: Vec<&str> = Vec::new();
     features.extend_from_slice(&gpu_feats);
     features.extend_from_slice(&model_feats);
+    // Capability features
+    if mtp              { features.push("feature-mtp"); }
+    if dflash2          { features.push("feature-dflash2"); }
+    else if dflash      { features.push("feature-dflash"); }
+    if vision           { features.push("feature-vision"); }
     if let Some(extra) = extra_features {
         for f in extra.split(',') { features.push(f.trim()); }
     }
@@ -159,6 +196,15 @@ fn cmd_compile(
         if cross_vendor {
             println!("  ⚠  cross-vendor: activations transit host RAM between unlike GPUs");
         }
+    }
+
+    // Capability summary
+    let mut caps: Vec<&str> = Vec::new();
+    if mtp     { caps.push("mtp"); }
+    if dflash2 { caps.push("dflash2"); } else if dflash { caps.push("dflash"); }
+    if vision  { caps.push("vision"); }
+    if !caps.is_empty() {
+        println!("features : {}", caps.join(", "));
     }
 
     println!("models   :");
