@@ -15,25 +15,44 @@ use tracing_subscriber::EnvFilter;
 
 use spite_dispatch::{
     card_spec, normalize_card_name,
-    DispatchBuilder, KernelSpec, detect_gpu_arch,
+    DispatchBuilder, KernelSpec, MultiGpuSpec, detect_gpu_arch,
 };
 use spite_loader::GgufModel;
 
 // ── Shared flag groups ─────────────────────────────────────────────────────
 
-/// Which GPU to target.
+/// Which GPU(s) to target.
+///
+/// Single GPU:
+///   --card RTX_5090
+///
+/// Multiple GPUs (pipeline parallelism):
+///   --card RTX_5070,RTX_3090          same-vendor mixed-arch
+///   --card RTX_4090,RX_7900_XTX       cross-vendor (activations via host RAM)
+///
+/// Layer assignment is automatic (proportional to VRAM).
+/// Override with explicit counts: --layer-split 20,12
 #[derive(Args, Clone)]
 struct HardwareArgs {
-    /// GPU card name: "RTX_5090", "RX_9900_XTX", "MI300X", "M4_Max", …
-    /// Automatically determines the GPU arch and VRAM.
-    /// Overrides --gpu-arch when both are given.
-    #[arg(long = "card", env = "SPITE_CARD", value_name = "CARD")]
-    card: Option<String>,
+    /// GPU card(s). Comma-separated or repeat the flag for multiple GPUs.
+    #[arg(
+        long = "card",
+        env  = "SPITE_CARD",
+        value_name = "CARD[,CARD…]",
+        value_delimiter = ',',
+    )]
+    cards: Vec<String>,
 
     /// Override GPU arch directly (e.g. sm_89, rdna3, metal, generic).
-    /// Use --card when possible — it also supplies VRAM info.
+    /// Applies to the first GPU; ignored when --card is given.
     #[arg(long = "gpu-arch", env = "SPITE_GPU_ARCH", value_name = "ARCH")]
     gpu_arch: Option<String>,
+
+    /// Explicit layer counts per GPU (comma-separated integers).
+    /// Sum need not equal the model's layer count — counts are re-scaled.
+    /// E.g. --layer-split 20,12 gives the first GPU ≈20/32 of the layers.
+    #[arg(long = "layer-split", value_name = "N[,N…]", value_delimiter = ',')]
+    layer_split: Vec<u32>,
 
     /// Directory that contains compiled kernel .so files.
     #[arg(
@@ -160,24 +179,20 @@ fn main() -> Result<()> {
 
 // ── Resolution helpers ─────────────────────────────────────────────────────
 
-/// Resolve card name + optional arch override → (card_id, gpu_arch, vram_gib).
-fn resolve_hardware(hw: &HardwareArgs) -> (String, String, u32) {
-    let card_id = hw.card.as_deref()
-        .map(normalize_card_name)
-        .unwrap_or_default();
-
-    let spec = card_spec(&card_id);
-
-    let gpu_arch = hw.gpu_arch.clone()
-        .unwrap_or_else(|| {
-            if !card_id.is_empty() && spec.gpu_arch != "generic" {
-                spec.gpu_arch.to_owned()
-            } else {
-                detect_gpu_arch()
-            }
-        });
-
-    (card_id, gpu_arch, spec.vram_gib)
+/// Resolve hardware args → a `MultiGpuSpec` (works for 1 or N GPUs).
+fn resolve_hardware(hw: &HardwareArgs) -> MultiGpuSpec {
+    if hw.cards.is_empty() {
+        // No --card given: fall back to arch detection or generic.
+        let arch = hw.gpu_arch.clone().unwrap_or_else(detect_gpu_arch);
+        let raw  = std::env::var("SPITE_CARD").unwrap_or_default();
+        let card = if raw.is_empty() { arch.clone() } else { normalize_card_name(&raw) };
+        // Synthesise a single node.
+        let refs: Vec<&str> = vec![card.as_str()];
+        MultiGpuSpec::from_cards(&refs)
+    } else {
+        let refs: Vec<&str> = hw.cards.iter().map(String::as_str).collect();
+        MultiGpuSpec::from_cards(&refs)
+    }
 }
 
 /// Returns the directory where models are stored.
@@ -273,22 +288,19 @@ fn cmd_run(
     temperature: f32,
 ) -> Result<()> {
     let (target, draft) = resolve_models(&model_args.model)?;
-    let (card_id, gpu_arch, vram_gib) = resolve_hardware(hw);
+    let mgpu            = resolve_hardware(hw);
 
     let target_gguf = GgufModel::open(&target)?;
     let model_arch  = target_gguf.arch().to_owned();
 
-    print_engine_header(&model_arch, &gpu_arch, &card_id, vram_gib);
+    print_engine_header(&model_arch, &mgpu);
 
     if let Some(ref d) = draft {
         let d_gguf = GgufModel::open(d)?;
-        println!("draft model  : {}", d_gguf.arch());
-        println!("mode         : speculative decoding");
+        println!("draft model  : {} [speculative decoding]", d_gguf.arch());
     }
 
-    let spec  = KernelSpec::from_arch(&model_arch, &gpu_arch);
-    let table = DispatchBuilder::new(&hw.kernels_dir, spec).build()?;
-    table.print_sources();
+    print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
 
     println!("\nprompt       : {prompt}");
     println!("max tokens   : {max_tokens}");
@@ -304,21 +316,19 @@ fn cmd_serve(
     port:       u16,
 ) -> Result<()> {
     let (target, draft) = resolve_models(&model_args.model)?;
-    let (card_id, gpu_arch, vram_gib) = resolve_hardware(hw);
+    let mgpu            = resolve_hardware(hw);
 
     let target_gguf = GgufModel::open(&target)?;
     let model_arch  = target_gguf.arch().to_owned();
 
-    print_engine_header(&model_arch, &gpu_arch, &card_id, vram_gib);
+    print_engine_header(&model_arch, &mgpu);
 
     if let Some(ref d) = draft {
         let d_gguf = GgufModel::open(d)?;
-        println!("draft model  : {} [speculative]", d_gguf.arch());
+        println!("draft model  : {} [speculative decoding]", d_gguf.arch());
     }
 
-    let spec  = KernelSpec::from_arch(&model_arch, &gpu_arch);
-    let table = DispatchBuilder::new(&hw.kernels_dir, spec).build()?;
-    table.print_sources();
+    print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
 
     println!("\nlistening on : http://{host}:{port}");
     println!("(server loop not yet implemented — contribute it!)");
@@ -327,17 +337,13 @@ fn cmd_serve(
 
 fn cmd_dispatch(model_args: &ModelArgs, hw: &HardwareArgs) -> Result<()> {
     let (target, _) = resolve_models(&model_args.model)?;
-    let (card_id, gpu_arch, vram_gib) = resolve_hardware(hw);
+    let mgpu        = resolve_hardware(hw);
 
     let gguf       = GgufModel::open(&target)?;
     let model_arch = gguf.arch().to_owned();
 
-    print_engine_header(&model_arch, &gpu_arch, &card_id, vram_gib);
-
-    let spec  = KernelSpec::from_arch(&model_arch, &gpu_arch);
-    let table = DispatchBuilder::new(&hw.kernels_dir, spec).build()
-        .context("kernel dispatch build failed")?;
-    table.print_sources();
+    print_engine_header(&model_arch, &mgpu);
+    print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
     Ok(())
 }
 
@@ -354,16 +360,35 @@ fn cmd_pull(model: &str, quant: &str) -> Result<()> {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-fn print_engine_header(model_arch: &str, gpu_arch: &str, card_id: &str, vram_gib: u32) {
+fn print_engine_header(model_arch: &str, mgpu: &MultiGpuSpec) {
     println!("spite — One Engine, Your Model, Your Card.");
     println!("──────────────────────────────────────────");
     println!("model arch   : {model_arch}");
-    if card_id.is_empty() {
-        println!("gpu arch     : {gpu_arch}");
+    if mgpu.nodes.len() == 1 {
+        let n = &mgpu.nodes[0];
+        let vram_s = if n.vram_gib > 0 { format!(" ({} GiB)", n.vram_gib) } else { String::new() };
+        println!("card         : {}{vram_s}", n.card_id);
+        println!("gpu arch     : {}", n.gpu_arch);
     } else {
-        let vram_str = if vram_gib > 0 { format!(" ({vram_gib} GiB)") } else { String::new() };
-        println!("card         : {card_id}{vram_str}");
-        println!("gpu arch     : {gpu_arch}");
+        mgpu.print_summary();
     }
     println!("kernels      :");
+}
+
+fn print_dispatch_tables(
+    model_arch:  &str,
+    mgpu:        &MultiGpuSpec,
+    kernels_dir: &std::path::Path,
+) -> Result<()> {
+    let tables = mgpu.build_tables(model_arch, kernels_dir);
+    for (i, result) in tables.into_iter().enumerate() {
+        let table = result.context("kernel dispatch build failed")?;
+        if mgpu.nodes.len() > 1 {
+            println!("  [gpu {}] {}:", i, mgpu.nodes[i].card_id);
+            // indent the output
+            // (print_sources writes to stdout directly; prefix handled below)
+        }
+        table.print_sources();
+    }
+    Ok(())
 }

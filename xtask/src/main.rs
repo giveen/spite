@@ -23,22 +23,26 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Compile spite for a specific card and model set.
+    /// Compile spite for a specific card (or cards) and model set.
     ///
-    /// Examples:
+    /// Single GPU:
     ///   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_5090
-    ///   cargo xtask compile -m Qwen/Qwen3-27B,Google/gemma4 --card RTX_5090
     ///   cargo xtask compile -m meta-llama/Llama-3-70B --card MI300X
     ///   cargo xtask compile -m meta-llama/Llama-3-8B --card M4_Max
+    ///
+    /// Multiple GPUs (pipeline parallelism):
+    ///   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_5070,RTX_3090
+    ///   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_4090,RX_7900_XTX
     Compile {
         /// Model(s) to include. One name or "target,draft" for speculative.
         /// Format: "Org/Name" (HuggingFace style) or just "Name".
         #[arg(short = 'm', long = "model", value_name = "MODEL[,DRAFT]")]
         model: String,
 
-        /// GPU card: "RTX_5090", "RX_9900_XTX", "MI300X", "M4_Max", …
-        #[arg(long = "card", value_name = "CARD")]
-        card: String,
+        /// GPU card(s). Comma-separated for multi-GPU pipeline parallelism.
+        /// Mixed vendors compile both GPU backends into the same binary.
+        #[arg(long = "card", value_name = "CARD[,CARD…]", value_delimiter = ',')]
+        cards: Vec<String>,
 
         /// Build profile: release (default) or dev.
         #[arg(long, default_value = "release")]
@@ -72,8 +76,8 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Compile { model, card, profile, extra_features, dry_run } => {
-            cmd_compile(&model, &card, &profile, extra_features.as_deref(), dry_run)
+        Cmd::Compile { model, cards, profile, extra_features, dry_run } => {
+            cmd_compile(&model, &cards, &profile, extra_features.as_deref(), dry_run)
         }
         Cmd::Cards  => cmd_cards(),
         Cmd::Models => cmd_models(),
@@ -84,15 +88,42 @@ fn run(cli: Cli) -> Result<()> {
 
 fn cmd_compile(
     model_spec:     &str,
-    card_raw:       &str,
+    cards_raw:      &[String],
     profile:        &str,
     extra_features: Option<&str>,
     dry_run:        bool,
 ) -> Result<()> {
-    // ── Resolve card ─────────────────────────────────────────────────────
-    let card_id  = normalize_card_name(card_raw);
-    let spec     = card_spec(&card_id);
-    let gpu_feat = gpu_arch_to_feature(spec.gpu_arch);
+    if cards_raw.is_empty() {
+        bail!("--card is required");
+    }
+
+    // ── Resolve cards ────────────────────────────────────────────────────
+    let mut gpu_feats: Vec<&'static str> = Vec::new();
+    let mut card_rows: Vec<(String, String, String)> = Vec::new(); // (card_id, arch, label)
+
+    for raw in cards_raw {
+        let card_id  = normalize_card_name(raw);
+        let spec     = card_spec(&card_id);
+        let gpu_feat = gpu_arch_to_feature(spec.gpu_arch);
+        let vram_str = if spec.vram_gib > 0 {
+            format!("{} GiB VRAM", spec.vram_gib)
+        } else {
+            "shared VRAM".into()
+        };
+        let label = format!("{} ({}{})",
+            spec.gpu_arch,
+            backend_label(spec.gpu_arch),
+            if spec.vram_gib > 0 { format!(" · {vram_str}") } else { String::new() }
+        );
+        if !gpu_feat.is_empty() && !gpu_feats.contains(&gpu_feat) {
+            gpu_feats.push(gpu_feat);
+        }
+        card_rows.push((card_id, spec.gpu_arch.to_owned(), label));
+    }
+
+    // Detect cross-vendor pair
+    let vendors: Vec<&str> = card_rows.iter().map(|(_, arch, _)| vendor_label(arch)).collect();
+    let cross_vendor = vendors.windows(2).any(|w| w[0] != w[1]);
 
     // ── Resolve models ───────────────────────────────────────────────────
     let model_names: Vec<&str> = model_spec.split(',').map(str::trim).collect();
@@ -106,7 +137,7 @@ fn cmd_compile(
 
     // ── Build feature string ─────────────────────────────────────────────
     let mut features: Vec<&str> = Vec::new();
-    if !gpu_feat.is_empty() { features.push(gpu_feat); }
+    features.extend_from_slice(&gpu_feats);
     features.extend_from_slice(&model_feats);
     if let Some(extra) = extra_features {
         for f in extra.split(',') { features.push(f.trim()); }
@@ -117,13 +148,18 @@ fn cmd_compile(
     println!("spite — compile for your card and your models");
     println!("─────────────────────────────────────────────");
 
-    let vram_str = if spec.vram_gib > 0 {
-        format!(" · {} GiB VRAM", spec.vram_gib)
+    if card_rows.len() == 1 {
+        let (id, _, label) = &card_rows[0];
+        println!("card     : {id}  →  {label}");
     } else {
-        String::new()
-    };
-    println!("card     : {card_id}  →  {} ({}{})",
-        spec.gpu_arch, backend_label(spec.gpu_arch), vram_str);
+        println!("cards    : (pipeline parallelism — {} GPUs)", card_rows.len());
+        for (i, (id, _, label)) in card_rows.iter().enumerate() {
+            println!("  [{i}] {id:<20} → {label}");
+        }
+        if cross_vendor {
+            println!("  ⚠  cross-vendor: activations transit host RAM between unlike GPUs");
+        }
+    }
 
     println!("models   :");
     for (name, feat) in model_names.iter().zip(model_feats.iter()) {
@@ -236,6 +272,14 @@ fn backend_label(gpu_arch: &str) -> &'static str {
     if gpu_arch == "metal"           { return "Apple Metal"; }
     if gpu_arch.starts_with("xe")   { return "Intel oneAPI"; }
     "generic / CPU scalar"
+}
+
+fn vendor_label(gpu_arch: &str) -> &'static str {
+    if gpu_arch.starts_with("sm_")                                   { return "nvidia"; }
+    if gpu_arch.starts_with("rdna") || gpu_arch.starts_with("cdna") { return "amd"; }
+    if gpu_arch == "metal"                                           { return "apple"; }
+    if gpu_arch.starts_with("xe")                                    { return "intel"; }
+    "generic"
 }
 
 // ── Static info tables ─────────────────────────────────────────────────────
