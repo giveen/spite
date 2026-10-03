@@ -29,6 +29,7 @@ use spite_dispatch::{
     MultiGpuSpec, detect_gpu_arch,
 };
 use spite_loader::GgufModel;
+use spite_kvcache::KvQuantConfig;
 use spite_offload::{OffloadConfig, TieredPlacement};
 
 // ── Hardware args ──────────────────────────────────────────────────────────
@@ -64,6 +65,26 @@ struct HardwareArgs {
     /// Implies --offload-ram.  Works with any NVMe/SSD/HDD (~7 GB/s).
     #[arg(long = "offload-disk", env = "SPITE_OFFLOAD_DISK")]
     offload_disk: bool,
+
+    /// Override the KV cache quantization starting tier.
+    ///
+    /// Default: the engine starts at f16 and degrades automatically as VRAM fills
+    /// (f16 → q8 → q5_1 → q4).  You only need this flag to pin a lower starting
+    /// tier — for example to leave more VRAM headroom at very long context.
+    ///
+    ///   f16    2.0 bpe   full precision (default start)
+    ///   q8     1.1 bpe   imperceptible quality loss
+    ///   q5_1   0.75 bpe  good balance
+    ///   q4     0.56 bpe  mild loss at long context
+    ///
+    /// Asymmetric (K is more sensitive than V):
+    ///   --kv-quant q8,q5_1   K at q8, V at q5_1
+    #[arg(
+        long = "kv-quant",
+        env  = "SPITE_KV_QUANT",
+        value_name = "TYPE[,TYPE]",
+    )]
+    kv_quant: Option<String>,
 
     // ── Advanced (hidden from --help; still usable) ────────────────────────
 
@@ -380,8 +401,11 @@ fn cmd_run(
     let target_gguf     = GgufModel::open(&target)?;
     let model_arch      = target_gguf.arch().to_owned();
 
+    let kv_cfg = resolve_kv_quant(hw);
+
     print_engine_header(&model_arch, &mgpu);
     print_feature_summary(feat);
+    print_kv_quant_summary(&kv_cfg);
 
     if let Some(ref d) = draft {
         let d_gguf = GgufModel::open(d)?;
@@ -416,8 +440,11 @@ fn cmd_serve(
     let mgpu            = resolve_hardware(hw);
     let target_gguf     = GgufModel::open(&target)?;
     let model_arch      = target_gguf.arch().to_owned();
+    let kv_cfg = resolve_kv_quant(hw);
+
     print_engine_header(&model_arch, &mgpu);
     print_feature_summary(feat);
+    print_kv_quant_summary(&kv_cfg);
 
     if let Some(ref d) = draft {
         let d_gguf = GgufModel::open(d)?;
@@ -443,8 +470,11 @@ fn cmd_dispatch(model_args: &ModelArgs, hw: &HardwareArgs, feat: &FeatureArgs) -
     let mgpu        = resolve_hardware(hw);
     let gguf        = GgufModel::open(&target)?;
     let model_arch  = gguf.arch().to_owned();
+    let kv_cfg = resolve_kv_quant(hw);
+
     print_engine_header(&model_arch, &mgpu);
     print_feature_summary(feat);
+    print_kv_quant_summary(&kv_cfg);
     print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
 
     let vram_gib    = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
@@ -479,6 +509,25 @@ fn print_engine_header(model_arch: &str, mgpu: &MultiGpuSpec) {
         mgpu.print_summary();
     }
     println!("kernels      :");
+}
+
+fn resolve_kv_quant(hw: &HardwareArgs) -> KvQuantConfig {
+    let Some(ref s) = hw.kv_quant else {
+        return KvQuantConfig::default();
+    };
+    match KvQuantConfig::from_str(s) {
+        Ok(cfg) => cfg,
+        Err(e)  => { eprintln!("warning: {e} — using f16 default"); KvQuantConfig::default() }
+    }
+}
+
+fn print_kv_quant_summary(cfg: &KvQuantConfig) {
+    if cfg.is_default() { return; }
+    if cfg.key == cfg.val {
+        println!("kv cache     : {} start  (auto-VBR)", cfg.key);
+    } else {
+        println!("kv cache     : K={} V={} start  (auto-VBR)", cfg.key, cfg.val);
+    }
 }
 
 fn print_feature_summary(feat: &FeatureArgs) {
