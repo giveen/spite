@@ -1,0 +1,15 @@
+[package]
+name        = "spite-speculative"
+description = "Speculative decoding — draft, verify, per-card kernels"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi      = { workspace = true }
+spite-dispatch = { workspace = true }
+spite-kvcache  = { workspace = true }
+spite-sampling = { workspace = true }
+thiserror      = { workspace = true }

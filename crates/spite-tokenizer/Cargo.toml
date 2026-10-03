@@ -1,0 +1,13 @@
+[package]
+name        = "spite-tokenizer"
+description = "Tokenizer — reads vocabulary directly from GGUF metadata"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi    = { workspace = true }
+spite-loader = { workspace = true }
+thiserror    = { workspace = true }

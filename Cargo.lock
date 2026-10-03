@@ -699,6 +699,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spite-kvcache"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "thiserror",
+]
+
+[[package]]
 name = "spite-loader"
 version = "0.1.0"
 dependencies = [
@@ -722,6 +730,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "spite-sampling"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "thiserror",
+]
+
+[[package]]
 name = "spite-server"
 version = "0.1.0"
 dependencies = [
@@ -740,6 +756,26 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "spite-speculative"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "spite-dispatch",
+ "spite-kvcache",
+ "spite-sampling",
+ "thiserror",
+]
+
+[[package]]
+name = "spite-tokenizer"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "spite-loader",
+ "thiserror",
 ]
 
 [[package]]

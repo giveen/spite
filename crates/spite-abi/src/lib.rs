@@ -122,25 +122,72 @@ pub type LayerFn = unsafe extern "C" fn(
     ctx:       *const SpiteCtx,
 ) -> c_int;
 
+/// Verify N draft tokens against main-model logits.
+/// Returns accept mask; first rejection zeroes all subsequent positions.
+/// Returning -1 falls back to the generic scalar implementation.
+pub type SpecVerifyFn = unsafe extern "C" fn(
+    accept_mask:  *mut bool,
+    draft_logits: *const SpiteTensor,
+    main_logits:  *const SpiteTensor,
+    temperature:  f32,
+    n_draft:      u32,
+    ctx:          *const SpiteCtx,
+) -> c_int;
+
+// ── Model capability declaration ───────────────────────────────────────────
+
+/// What a model supports — derived from GGUF metadata by the runtime.
+/// Kernel authors do not fill this; it is populated by spite-loader.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct SpiteModelCaps {
+    /// Model can act as the speculative verifier.
+    pub can_verify: bool,
+    /// Model can act as the speculative draft.
+    pub can_draft: bool,
+    /// 0 = speculative decoding not supported for this model.
+    pub max_draft_tokens: u32,
+    /// Null-terminated array of compatible draft architecture name pointers.
+    /// e.g. `["llama3-68m\0", "llama3-1b\0", null]`
+    pub draft_archs: *const *const c_char,
+}
+
+unsafe impl Send for SpiteModelCaps {}
+unsafe impl Sync for SpiteModelCaps {}
+
+impl SpiteModelCaps {
+    /// A model that cannot participate in speculative decoding at all.
+    pub const fn unsupported() -> Self {
+        Self {
+            can_verify:       false,
+            can_draft:        false,
+            max_draft_tokens: 0,
+            draft_archs:      core::ptr::null(),
+        }
+    }
+
+    pub fn supports_speculative(&self) -> bool {
+        self.max_draft_tokens > 0
+    }
+}
+
 // ── Kernel descriptor ──────────────────────────────────────────────────────
 
 /// Returned by `spite_kernel_info()` — the one symbol every kernel exports.
 #[repr(C)]
 pub struct SpiteKernelInfo {
     pub abi_version: u32,
-    /// e.g. b"llama3\0"
     pub model_arch:  *const c_char,
-    /// e.g. b"sm_89\0"
     pub gpu_arch:    *const c_char,
-    /// Optional credit string.
     pub author:      *const c_char,
-    /// Null-terminated list of quant types this kernel handles.
+    /// Null-terminated list of SpiteType values this kernel handles.
     pub supported_quants: [u32; 8],
-    /// Null means "not implemented; use fallback."
-    pub rms_norm:  Option<RmsNormFn>,
-    pub attention: Option<AttentionFn>,
-    pub ffn:       Option<FfnFn>,
-    pub layer:     Option<LayerFn>,
+    /// None = not implemented; dispatcher uses fallback.
+    pub rms_norm:          Option<RmsNormFn>,
+    pub attention:         Option<AttentionFn>,
+    pub ffn:               Option<FfnFn>,
+    pub layer:             Option<LayerFn>,
+    pub speculative_verify: Option<SpecVerifyFn>,
 }
 
 unsafe impl Send for SpiteKernelInfo {}

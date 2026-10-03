@@ -1,0 +1,12 @@
+[package]
+name        = "spite-kvcache"
+description = "KV cache management — ring buffer and prefix cache"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi  = { workspace = true }
+thiserror  = { workspace = true }

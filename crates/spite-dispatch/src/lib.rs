@@ -20,8 +20,10 @@ use thiserror::Error;
 
 use spite_abi::{
     ABI_VERSION, AttentionFn, FfnFn, KernelInfoFn, LayerFn, RmsNormFn,
-    SpiteKernelInfo, SpiteType, KERNEL_ENTRY_SYMBOL,
+    SpecVerifyFn, SpiteKernelInfo, SpiteType, KERNEL_ENTRY_SYMBOL,
 };
+
+pub mod fallback;
 
 #[derive(Debug, Error)]
 pub enum DispatchError {
@@ -76,10 +78,11 @@ pub struct OpSource {
 }
 
 pub struct DispatchTable {
-    pub rms_norm:  (Option<RmsNormFn>,  OpSource),
-    pub attention: (Option<AttentionFn>, OpSource),
-    pub ffn:       (Option<FfnFn>,       OpSource),
-    pub layer:     (Option<LayerFn>,     OpSource),
+    pub rms_norm:          (Option<RmsNormFn>,   OpSource),
+    pub attention:         (Option<AttentionFn>,  OpSource),
+    pub ffn:               (Option<FfnFn>,        OpSource),
+    pub layer:             (Option<LayerFn>,       OpSource),
+    pub speculative_verify: (Option<SpecVerifyFn>, OpSource),
     // Keep libraries alive.
     _libs: Vec<LoadedKernel>,
 }
@@ -88,13 +91,14 @@ impl DispatchTable {
     /// Print which kernel won each slot (for --verbose).
     pub fn print_sources(&self) {
         let rows = [
-            ("rms_norm",  &self.rms_norm.1),
-            ("attention", &self.attention.1),
-            ("ffn",       &self.ffn.1),
-            ("layer",     &self.layer.1),
+            ("rms_norm",   &self.rms_norm.1),
+            ("attention",  &self.attention.1),
+            ("ffn",        &self.ffn.1),
+            ("layer",      &self.layer.1),
+            ("spec_verify",&self.speculative_verify.1),
         ];
         for (op, src) in rows {
-            println!("  {op:<12} → {}/{}", src.gpu_arch, src.path.display());
+            println!("  {op:<14} → {}/{}", src.gpu_arch, src.path.display());
         }
     }
 }
@@ -147,16 +151,18 @@ impl DispatchBuilder {
             path:     self.kernels_dir.join("generic").join("generic"),
         };
 
-        let rms_norm  = find_op(&libs, |k| k.info.rms_norm,  &candidates, generic_src.clone());
-        let attention = find_op(&libs, |k| k.info.attention, &candidates, generic_src.clone());
-        let ffn       = find_op(&libs, |k| k.info.ffn,       &candidates, generic_src.clone());
-        let layer     = find_op(&libs, |k| k.info.layer,     &candidates, generic_src.clone());
+        let rms_norm           = find_op(&libs, |k| k.info.rms_norm,           &candidates, generic_src.clone());
+        let attention          = find_op(&libs, |k| k.info.attention,          &candidates, generic_src.clone());
+        let ffn                = find_op(&libs, |k| k.info.ffn,                &candidates, generic_src.clone());
+        let layer              = find_op(&libs, |k| k.info.layer,              &candidates, generic_src.clone());
+        let speculative_verify = find_op(&libs, |k| k.info.speculative_verify, &candidates, generic_src.clone());
 
         Ok(DispatchTable {
             rms_norm,
             attention,
             ffn,
             layer,
+            speculative_verify,
             _libs: libs,
         })
     }
