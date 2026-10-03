@@ -1,0 +1,19 @@
+[package]
+name        = "spite-executor"
+description = "Forward pass runner: hybrid CPU+GPU layer split, activation buffers"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi      = { workspace = true }
+spite-compute  = { workspace = true }
+spite-models   = { workspace = true }
+spite-gpu      = { workspace = true }
+spite-dispatch = { workspace = true }
+spite-kvcache  = { workspace = true }
+spite-sampling = { workspace = true }
+spite-rope     = { workspace = true }
+thiserror      = { workspace = true }

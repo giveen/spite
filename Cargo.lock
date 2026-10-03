@@ -690,11 +690,51 @@ name = "spite-abi"
 version = "0.1.0"
 
 [[package]]
+name = "spite-compute"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "thiserror",
+]
+
+[[package]]
 name = "spite-dispatch"
 version = "0.1.0"
 dependencies = [
  "libloading",
  "spite-abi",
+ "thiserror",
+]
+
+[[package]]
+name = "spite-executor"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "spite-compute",
+ "spite-dispatch",
+ "spite-gpu",
+ "spite-kvcache",
+ "spite-models",
+ "spite-rope",
+ "spite-sampling",
+ "thiserror",
+]
+
+[[package]]
+name = "spite-gpu"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "thiserror",
+]
+
+[[package]]
+name = "spite-grammar"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -716,6 +756,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "spite-lora"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "spite-compute",
+ "spite-loader",
+ "thiserror",
+]
+
+[[package]]
+name = "spite-models"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "spite-compute",
+ "spite-dispatch",
+ "spite-rope",
+ "thiserror",
+]
+
+[[package]]
 name = "spite-perplexity"
 version = "0.1.0"
 dependencies = [
@@ -730,11 +791,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "spite-quantize"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "spite-abi",
+ "spite-loader",
+ "thiserror",
+]
+
+[[package]]
+name = "spite-rope"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "thiserror",
+]
+
+[[package]]
 name = "spite-sampling"
 version = "0.1.0"
 dependencies = [
  "spite-abi",
  "thiserror",
+]
+
+[[package]]
+name = "spite-scheduler"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "spite-executor",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -775,6 +865,16 @@ version = "0.1.0"
 dependencies = [
  "spite-abi",
  "spite-loader",
+ "thiserror",
+]
+
+[[package]]
+name = "spite-vision"
+version = "0.1.0"
+dependencies = [
+ "spite-abi",
+ "spite-compute",
+ "spite-dispatch",
  "thiserror",
 ]
 

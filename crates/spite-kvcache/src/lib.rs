@@ -13,6 +13,8 @@
 //! forward pass skips those tokens entirely. Large win when many sessions
 //! share the same system prompt.
 
+pub mod persist;
+
 use spite_abi::{SpiteKvCache, SpiteTensor};
 use thiserror::Error;
 

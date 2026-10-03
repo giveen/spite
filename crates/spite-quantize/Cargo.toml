@@ -1,0 +1,19 @@
+[package]
+name        = "spite-quantize"
+description = "GGUF quantization tooling: F32/F16 → Q4_K_M, Q8_0 and more"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "spite-quantize"
+path = "src/main.rs"
+
+[dependencies]
+spite-abi    = { workspace = true }
+spite-loader = { workspace = true }
+thiserror    = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }

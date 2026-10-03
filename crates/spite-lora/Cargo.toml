@@ -1,0 +1,14 @@
+[package]
+name        = "spite-lora"
+description = "LoRA adapter loading and runtime application"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi     = { workspace = true }
+spite-loader  = { workspace = true }
+spite-compute = { workspace = true }
+thiserror     = { workspace = true }

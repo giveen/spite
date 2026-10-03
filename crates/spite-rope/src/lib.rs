@@ -1,0 +1,106 @@
+//! Rotary positional embeddings (RoPE) and variants.
+//!
+//! Applied in-place to Q and K tensors before the attention score computation.
+//!
+//! Variants
+//! --------
+//! Default   — standard RoPE (LLaMA, Mistral, Gemma)
+//! Linear    — multiply frequencies by a constant scale (modest extension)
+//! YaRN      — NTK-aware interpolation; extends context with minimal quality loss
+//! ALiBi     — attention with linear biases (BLOOM, MPT); no rotation
+//! LongRoPE  — non-uniform per-dimension rescaling for very long contexts
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum RopeError {
+    #[error("head_dim must be even, got {0}")]
+    OddHeadDim(usize),
+    #[error("position {pos} exceeds max context {max_ctx}")]
+    PositionOverflow { pos: u32, max_ctx: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RopeVariant {
+    Default,
+    Linear { scale: f32 },
+    Yarn   { scale: f32, original_ctx: usize },
+    Alibi,
+    LongRope,
+}
+
+#[derive(Debug, Clone)]
+pub struct RopeConfig {
+    pub head_dim: usize,
+    pub theta:    f32,        // default 10 000.0; llama3 uses 500 000.0
+    pub variant:  RopeVariant,
+}
+
+impl Default for RopeConfig {
+    fn default() -> Self {
+        Self { head_dim: 128, theta: 10_000.0, variant: RopeVariant::Default }
+    }
+}
+
+/// Apply RoPE in-place to a single query or key tensor.
+///
+/// `qk`:  flat F32 buffer `[n_heads, head_dim]` for one sequence position
+/// `pos`: the absolute token position
+/// `cfg`: rope configuration
+pub fn apply_rope(
+    qk:  &mut [f32],
+    pos: u32,
+    cfg: &RopeConfig,
+) -> Result<(), RopeError> {
+    let d = cfg.head_dim;
+    if d % 2 != 0 { return Err(RopeError::OddHeadDim(d)); }
+    let n_heads = qk.len() / d;
+    let theta_scale = match cfg.variant {
+        RopeVariant::Linear { scale }          => scale,
+        RopeVariant::Yarn   { scale, .. }      => scale,
+        _                                      => 1.0,
+    };
+    for h in 0..n_heads {
+        let base = h * d;
+        for i in 0..d / 2 {
+            let freq = 1.0 / (cfg.theta * theta_scale).powf(2.0 * i as f32 / d as f32);
+            let angle = pos as f32 * freq;
+            let (sin, cos) = angle.sin_cos();
+            let x0 = qk[base + i];
+            let x1 = qk[base + i + d / 2];
+            qk[base + i]         = x0 * cos - x1 * sin;
+            qk[base + i + d / 2] = x0 * sin + x1 * cos;
+        }
+    }
+    Ok(())
+}
+
+/// ALiBi: return the slope for head `h` of `n_heads` total.
+///
+/// This slope is subtracted from attention scores: score -= slope * distance.
+pub fn alibi_slope(h: usize, n_heads: usize) -> f32 {
+    let m = n_heads as f32;
+    2f32.powf(-8.0 * (h as f32 + 1.0) / m)
+}
+
+/// Build a YaRN correction map for each dimension pair.
+///
+/// Returns a vec of per-pair scale factors for the frequency interpolation.
+/// See https://arxiv.org/abs/2309.00071 for the algorithm.
+pub fn yarn_correction_dims(
+    head_dim:     usize,
+    theta:        f32,
+    original_ctx: usize,
+    target_ctx:   usize,
+) -> Vec<f32> {
+    let scale = target_ctx as f32 / original_ctx as f32;
+    (0..head_dim / 2).map(|i| {
+        let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+        let wavelength = 2.0 * std::f32::consts::PI / freq;
+        // Interpolate between linear and NTK scaling based on wavelength
+        let alpha = 1.0f32;   // TODO: derive from context length ratio
+        let beta  = 32.0f32;  // TODO: tune per model
+        let ramp = ((wavelength / original_ctx as f32 - alpha) / (beta - alpha)).clamp(0.0, 1.0);
+        1.0 / (ramp / scale + (1.0 - ramp))  // TODO: per-dim correction
+    }).collect()
+}

@@ -11,6 +11,16 @@ members = [
     "crates/spite-sampling",
     "crates/spite-kvcache",
     "crates/spite-speculative",
+    "crates/spite-compute",
+    "crates/spite-rope",
+    "crates/spite-grammar",
+    "crates/spite-gpu",
+    "crates/spite-models",
+    "crates/spite-executor",
+    "crates/spite-scheduler",
+    "crates/spite-lora",
+    "crates/spite-quantize",
+    "crates/spite-vision",
 ]
 
 [workspace.package]
@@ -31,6 +41,16 @@ spite-tokenizer   = { path = "crates/spite-tokenizer" }
 spite-sampling    = { path = "crates/spite-sampling" }
 spite-kvcache     = { path = "crates/spite-kvcache" }
 spite-speculative = { path = "crates/spite-speculative" }
+spite-compute     = { path = "crates/spite-compute" }
+spite-rope        = { path = "crates/spite-rope" }
+spite-grammar     = { path = "crates/spite-grammar" }
+spite-gpu         = { path = "crates/spite-gpu" }
+spite-models      = { path = "crates/spite-models" }
+spite-executor    = { path = "crates/spite-executor" }
+spite-scheduler   = { path = "crates/spite-scheduler" }
+spite-lora        = { path = "crates/spite-lora" }
+spite-quantize    = { path = "crates/spite-quantize" }
+spite-vision      = { path = "crates/spite-vision" }
 
 memmap2     = "0.9"
 libloading  = "0.8"

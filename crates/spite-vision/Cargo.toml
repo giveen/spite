@@ -1,0 +1,14 @@
+[package]
+name        = "spite-vision"
+description = "Multimodal vision encoder: CLIP ViT image encoder + LLaVA projection"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi      = { workspace = true }
+spite-compute  = { workspace = true }
+spite-dispatch = { workspace = true }
+thiserror      = { workspace = true }

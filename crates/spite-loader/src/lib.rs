@@ -4,6 +4,8 @@
 //! No allocations are made for weight data — `SpiteTensor::data` points
 //! directly into the mmap'd buffer for the lifetime of `GgufModel`.
 
+pub mod config;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -152,7 +154,7 @@ impl GgufModel {
 // ── GGUF parsing helpers ───────────────────────────────────────────────────
 
 #[derive(Debug)]
-enum MetaValue {
+pub enum MetaValue {
     U8(u8), I8(i8), U16(u16), I16(i16),
     U32(u32), I32(i32), U64(u64), I64(i64),
     F32(f32), F64(f64),

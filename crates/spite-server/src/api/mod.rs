@@ -9,6 +9,8 @@ use crate::AppState;
 pub mod chat;
 pub mod completions;
 pub mod models;
+pub mod embeddings;
+pub mod tools;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()

@@ -8,6 +8,9 @@
 //! Common pipeline for interactive use:
 //!   Temperature → RepetitionPenalty → TopK → TopP → Greedy/Multinomial
 
+pub mod mirostat;
+pub mod dry;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -133,4 +136,10 @@ pub fn sample(
     } else {
         multinomial(logits, rng)
     }
+}
+
+/// LCG fast RNG — shared by multinomial, mirostat, and DRY.
+pub(crate) fn lcg_f32(state: &mut u64) -> f32 {
+    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    ((*state >> 33) as f32) / (u32::MAX as f32)
 }

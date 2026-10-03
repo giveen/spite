@@ -1,0 +1,12 @@
+[package]
+name        = "spite-compute"
+description = "Low-level tensor ops: matmul, dequant, softmax, embedding lookup"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi  = { workspace = true }
+thiserror  = { workspace = true }

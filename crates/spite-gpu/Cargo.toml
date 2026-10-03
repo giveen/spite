@@ -1,0 +1,12 @@
+[package]
+name        = "spite-gpu"
+description = "GPU device abstraction: buffer alloc, H2D/D2H copy, stream management"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+[dependencies]
+spite-abi  = { workspace = true }
+thiserror  = { workspace = true }
