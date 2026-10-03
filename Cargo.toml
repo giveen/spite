@@ -24,6 +24,7 @@ members = [
     "crates/spite-bench",
     "crates/spite-parallel",
     "crates/spite-plugin",
+    "xtask",
 ]
 
 [workspace.package]

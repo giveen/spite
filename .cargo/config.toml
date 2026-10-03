@@ -1,0 +1,3 @@
+[alias]
+# cargo xtask compile -m Qwen/Qwen3-27B,Google/gemma4 --card RTX_5090
+xtask = "run --package xtask --"

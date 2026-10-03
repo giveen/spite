@@ -10,6 +10,48 @@ repository.workspace = true
 name = "spite"
 path = "src/main.rs"
 
+[features]
+default = []
+
+# ── GPU backends ──────────────────────────────────────────────────────────
+cuda   = []
+rocm   = []
+metal  = []
+vulkan = []
+
+# ── GPU arch tiers — each implies its backend ─────────────────────────────
+cuda-sm120 = ["cuda"]   # NVIDIA Blackwell
+cuda-sm100 = ["cuda"]   # NVIDIA Blackwell DC
+cuda-sm90  = ["cuda"]   # NVIDIA Hopper
+cuda-sm89  = ["cuda"]   # NVIDIA Ada Lovelace
+cuda-sm86  = ["cuda"]   # NVIDIA Ampere consumer
+cuda-sm80  = ["cuda"]   # NVIDIA Ampere data centre
+cuda-sm75  = ["cuda"]   # NVIDIA Turing
+cuda-sm70  = ["cuda"]   # NVIDIA Volta
+rocm-rdna4 = ["rocm"]   # AMD RDNA 4
+rocm-rdna3 = ["rocm"]   # AMD RDNA 3
+rocm-rdna2 = ["rocm"]   # AMD RDNA 2
+rocm-cdna3 = ["rocm"]   # AMD CDNA 3
+rocm-cdna2 = ["rocm"]   # AMD CDNA 2
+# metal and vulkan variants don't sub-divide further yet
+vulkan-xe2    = ["vulkan"]  # Intel Arc Battlemage
+vulkan-xe_hpg = ["vulkan"]  # Intel Arc Alchemist
+
+# ── Model architectures ───────────────────────────────────────────────────
+model-llama    = []
+model-gemma    = []
+model-qwen     = []
+model-mistral  = []
+model-deepseek = []
+model-phi      = []
+model-falcon   = []
+model-gpt2     = []
+# Convenience: all models (useful for development builds)
+model-all = [
+    "model-llama", "model-gemma", "model-qwen", "model-mistral",
+    "model-deepseek", "model-phi", "model-falcon", "model-gpt2",
+]
+
 [dependencies]
 spite-abi          = { workspace = true }
 spite-loader       = { workspace = true }
