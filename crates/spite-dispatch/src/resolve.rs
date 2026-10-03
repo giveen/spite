@@ -51,6 +51,22 @@ pub struct KernelSpec {
 }
 
 impl KernelSpec {
+    /// Convenience constructor for callers that only know the GGUF arch string
+    /// and GPU arch (no family/model split, no card/quant).
+    /// Suitable for the CLI and server when no richer spec is available.
+    pub fn from_arch(model_arch: &str, gpu_arch: &str) -> Self {
+        // Use the arch string as a stand-in for both family and model so that
+        // model-specific kernels under kernels/<family>/<model>/ are found if
+        // they exist; generic fallbacks still apply when they don't.
+        Self {
+            family:   model_arch.into(),
+            model:    model_arch.into(),
+            gpu_arch: gpu_arch.into(),
+            card_id:  String::new(),
+            quant:    String::new(),
+        }
+    }
+
     /// Candidate dirs for **model-specific** kernels, most-specific first.
     pub fn model_candidates(&self, kernels_dir: &Path) -> Vec<PathBuf> {
         let base = kernels_dir

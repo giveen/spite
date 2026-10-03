@@ -11,7 +11,7 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 // ── Tensor type tag ────────────────────────────────────────────────────────
 
@@ -183,11 +183,15 @@ pub struct SpiteKernelInfo {
     /// Null-terminated list of SpiteType values this kernel handles.
     pub supported_quants: [u32; 8],
     /// None = not implemented; dispatcher uses fallback.
-    pub rms_norm:          Option<RmsNormFn>,
-    pub attention:         Option<AttentionFn>,
-    pub ffn:               Option<FfnFn>,
-    pub layer:             Option<LayerFn>,
+    pub rms_norm:           Option<RmsNormFn>,
+    pub attention:          Option<AttentionFn>,
+    pub ffn:                Option<FfnFn>,
+    pub layer:              Option<LayerFn>,
     pub speculative_verify: Option<SpecVerifyFn>,
+    /// Chunked prefill: process a prompt in fixed-size chunks rather than all
+    /// at once, enabling interleaving with decode steps and bounding peak memory.
+    /// Reuses `LayerFn` signature; the caller passes `chunk_idx` via `pos`.
+    pub prefill:            Option<LayerFn>,
 }
 
 unsafe impl Send for SpiteKernelInfo {}

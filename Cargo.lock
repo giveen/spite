@@ -690,6 +690,23 @@ name = "spite-abi"
 version = "0.1.0"
 
 [[package]]
+name = "spite-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "spite-abi",
+ "spite-dispatch",
+ "spite-executor",
+ "spite-kvcache",
+ "spite-loader",
+ "spite-models",
+ "spite-sampling",
+]
+
+[[package]]
 name = "spite-compute"
 version = "0.1.0"
 dependencies = [
@@ -774,6 +791,17 @@ dependencies = [
  "spite-dispatch",
  "spite-rope",
  "thiserror",
+]
+
+[[package]]
+name = "spite-parallel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "spite-abi",
+ "spite-executor",
+ "spite-kvcache",
+ "spite-models",
 ]
 
 [[package]]

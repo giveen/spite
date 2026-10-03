@@ -16,6 +16,9 @@
 //!   mm_projector/fc2.weight             [d_text, d_proj]
 //!   mm_projector/fc2.bias               [d_text]
 
+pub mod preprocess;
+pub mod vit;
+
 use std::path::Path;
 use thiserror::Error;
 

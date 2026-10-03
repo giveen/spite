@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use spite_dispatch::{DispatchBuilder, detect_gpu_arch};
+use spite_dispatch::{DispatchBuilder, KernelSpec, detect_gpu_arch};
 use spite_loader::GgufModel;
 
 #[derive(Parser)]
@@ -93,7 +93,8 @@ fn cmd_run(
     println!("model arch : {}", model.arch());
     println!("gpu arch   : {gpu_arch}");
 
-    let table = DispatchBuilder::new(kernels_dir, model.arch(), gpu_arch).build()?;
+    let spec  = KernelSpec::from_arch(model.arch(), gpu_arch);
+    let table = DispatchBuilder::new(kernels_dir, spec).build()?;
     println!("dispatch   :");
     table.print_sources();
 
@@ -109,7 +110,8 @@ fn cmd_benchmark(
     kernels_dir: &std::path::Path,
 ) -> Result<()> {
     let model = GgufModel::open(model_path)?;
-    let table = DispatchBuilder::new(kernels_dir, model.arch(), gpu_arch).build()?;
+    let spec  = KernelSpec::from_arch(model.arch(), gpu_arch);
+    let table = DispatchBuilder::new(kernels_dir, spec).build()?;
 
     println!("[dispatch] model={} gpu={gpu_arch}", model.arch());
     table.print_sources();

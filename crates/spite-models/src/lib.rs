@@ -79,6 +79,57 @@ pub struct ModelConfig {
     pub max_seq_len:  usize,
     pub rope_theta:   f32,
     pub norm_eps:     f32,
+
+    // ── RoPE scaling (YaRN / linear / NTK) ───────────────────────────────
+    /// Multiplicative rope scale factor. 1.0 = no scaling (default).
+    /// Linear scaling: divide all frequencies by this factor.
+    pub rope_scale_factor: f32,
+    /// Original training context length, used by YaRN to compute the
+    /// interpolation factor. 0 means "use max_seq_len".
+    pub rope_original_ctx: usize,
+    /// YaRN β_fast: high-frequency threshold (dimensions above this get
+    /// no interpolation). Typical: 32.0.
+    pub yarn_beta_fast:    f32,
+    /// YaRN β_slow: low-frequency threshold (dimensions below this get
+    /// linear scaling). Typical: 1.0.
+    pub yarn_beta_slow:    f32,
+    /// YaRN attention factor (scales the attention output after YaRN).
+    /// 0.0 = compute from scale_factor automatically.
+    pub yarn_attn_factor:  f32,
+}
+
+impl ModelConfig {
+    /// Return the rope scaling factor, defaulting to 1.0 when unset.
+    pub fn effective_rope_scale(&self) -> f32 {
+        if self.rope_scale_factor <= 0.0 { 1.0 } else { self.rope_scale_factor }
+    }
+
+    /// True if any YaRN extension parameters are active.
+    pub fn uses_yarn(&self) -> bool {
+        self.rope_original_ctx > 0 && self.rope_scale_factor > 1.0
+    }
+}
+
+impl Default for ModelConfig {
+    fn default() -> Self {
+        Self {
+            arch:              String::new(),
+            n_layers:          0,
+            n_heads:           0,
+            n_kv_heads:        0,
+            d_model:           0,
+            d_ffn:             0,
+            vocab_size:        0,
+            max_seq_len:       4096,
+            rope_theta:        10000.0,
+            norm_eps:          1e-5,
+            rope_scale_factor: 1.0,
+            rope_original_ctx: 0,
+            yarn_beta_fast:    32.0,
+            yarn_beta_slow:    1.0,
+            yarn_attn_factor:  0.0,
+        }
+    }
 }
 
 /// Every model architecture must implement this trait.

@@ -14,6 +14,7 @@
 //! share the same system prompt.
 
 pub mod persist;
+pub mod paged;
 
 use spite_abi::{SpiteKvCache, SpiteTensor};
 use thiserror::Error;

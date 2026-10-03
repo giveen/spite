@@ -10,6 +10,7 @@
 
 pub mod mirostat;
 pub mod dry;
+pub mod xtc;
 
 use thiserror::Error;
 

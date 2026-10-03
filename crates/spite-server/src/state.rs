@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use tokio::sync::Semaphore;
 
-use spite_dispatch::{DispatchBuilder, DispatchTable};
+use spite_dispatch::{DispatchBuilder, DispatchTable, KernelSpec};
 use spite_loader::GgufModel;
 
 /// Shared server state, held behind Arc<AppState>.
@@ -23,7 +23,8 @@ impl AppState {
         max_concurrent: usize,
     ) -> Result<Self> {
         let model    = GgufModel::open(model_path)?;
-        let dispatch = DispatchBuilder::new(kernels_dir, model.arch(), gpu_arch).build()?;
+        let spec     = KernelSpec::from_arch(model.arch(), gpu_arch);
+        let dispatch = DispatchBuilder::new(kernels_dir, spec).build()?;
 
         Ok(Self {
             model,

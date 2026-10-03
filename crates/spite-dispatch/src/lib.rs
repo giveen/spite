@@ -29,6 +29,7 @@ use spite_abi::{
 
 pub mod fallback;
 pub mod resolve;
+pub mod hot_reload;
 
 pub use resolve::{KernelSpec, detect_card_id};
 
@@ -160,7 +161,7 @@ impl DispatchBuilder {
 
         // Engine ops resolved from their own candidate chains
         let speculative_verify = find_op(&spec_libs,    |k| k.info.speculative_verify, &spec_cands,    generic_src.clone());
-        let prefill            = find_op(&prefill_libs, |k| k.info.layer,              &prefill_cands, generic_src.clone());
+        let prefill            = find_op(&prefill_libs, |k| k.info.prefill,            &prefill_cands, generic_src.clone());
 
         let mut all_libs = model_libs;
         all_libs.extend(spec_libs);

@@ -1,0 +1,24 @@
+[package]
+name        = "spite-bench"
+description = "Throughput and latency benchmarking harness for spite kernels"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "spite-bench"
+path = "src/main.rs"
+
+[dependencies]
+spite-abi      = { workspace = true }
+spite-dispatch = { workspace = true }
+spite-models   = { workspace = true }
+spite-loader   = { workspace = true }
+spite-executor = { workspace = true }
+spite-sampling = { workspace = true }
+spite-kvcache  = { workspace = true }
+anyhow         = { workspace = true }
+clap           = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }

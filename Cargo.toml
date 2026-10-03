@@ -21,6 +21,8 @@ members = [
     "crates/spite-lora",
     "crates/spite-quantize",
     "crates/spite-vision",
+    "crates/spite-bench",
+    "crates/spite-parallel",
 ]
 
 [workspace.package]
@@ -51,6 +53,8 @@ spite-scheduler   = { path = "crates/spite-scheduler" }
 spite-lora        = { path = "crates/spite-lora" }
 spite-quantize    = { path = "crates/spite-quantize" }
 spite-vision      = { path = "crates/spite-vision" }
+spite-bench       = { path = "crates/spite-bench" }
+spite-parallel    = { path = "crates/spite-parallel" }
 
 memmap2     = "0.9"
 libloading  = "0.8"
