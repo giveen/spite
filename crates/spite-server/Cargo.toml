@@ -1,0 +1,29 @@
+[package]
+name        = "spite-server"
+description = "OpenAI-compatible HTTP inference server"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[[bin]]
+name = "spite-server"
+path = "src/main.rs"
+
+[dependencies]
+spite-abi      = { workspace = true }
+spite-loader   = { workspace = true }
+spite-dispatch = { workspace = true }
+
+tokio          = { workspace = true }
+axum           = { workspace = true }
+serde          = { workspace = true }
+serde_json     = { workspace = true }
+tower          = { workspace = true }
+tower-http     = { workspace = true }
+tracing        = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio-stream   = { workspace = true }
+anyhow         = { workspace = true }
+clap           = { workspace = true }
+thiserror      = { workspace = true }

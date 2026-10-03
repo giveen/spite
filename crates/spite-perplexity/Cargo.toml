@@ -1,0 +1,26 @@
+[package]
+name        = "spite-perplexity"
+description = "PPL and KL divergence tests — kernel quality gate"
+version.workspace    = true
+edition.workspace    = true
+license.workspace    = true
+repository.workspace = true
+
+[lib]
+name = "spite_perplexity"
+path = "src/lib.rs"
+
+[[bin]]
+name = "spite-perplexity"
+path = "src/main.rs"
+
+[dependencies]
+spite-abi      = { workspace = true }
+spite-loader   = { workspace = true }
+spite-dispatch = { workspace = true }
+
+anyhow   = { workspace = true }
+clap     = { workspace = true }
+serde    = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
