@@ -112,6 +112,21 @@ pub struct Tokenizer {
     // TODO: BPE merge table or SP model trie
 }
 
+impl Tokenize for Tokenizer {
+    fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>, TokenizerError> {
+        self.encode(text, add_bos)
+    }
+    fn decode(&self, ids: &[u32], skip_special: bool) -> String {
+        self.decode(ids, skip_special)
+    }
+    fn decode_one(&self, id: u32) -> &str {
+        self.decode_one(id)
+    }
+    fn vocab_size(&self) -> usize { self.vocab.vocab_size() }
+    fn bos_id(&self) -> u32      { self.vocab.bos_id }
+    fn eos_id(&self) -> u32      { self.vocab.eos_id }
+}
+
 impl Tokenizer {
     /// Build a Tokenizer from a loaded GGUF model's metadata.
     pub fn from_gguf(_model: &spite_loader::GgufModel) -> Result<Self, TokenizerError> {

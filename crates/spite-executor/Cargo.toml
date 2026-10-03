@@ -14,7 +14,8 @@ spite-models   = { workspace = true }
 spite-gpu      = { workspace = true }
 spite-dispatch = { workspace = true }
 spite-kvcache  = { workspace = true }
-spite-sampling = { workspace = true }
-spite-rope     = { workspace = true }
-spite-plugin   = { workspace = true }
+spite-sampling   = { workspace = true }
+spite-rope       = { workspace = true }
+spite-plugin     = { workspace = true }
+spite-tokenizer  = { workspace = true }
 thiserror      = { workspace = true }

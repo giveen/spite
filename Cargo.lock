@@ -738,6 +738,7 @@ dependencies = [
  "spite-plugin",
  "spite-rope",
  "spite-sampling",
+ "spite-tokenizer",
  "thiserror",
 ]
 

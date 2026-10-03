@@ -17,8 +17,9 @@
 //!   }
 
 use spite_abi::SpiteCtx;
-use spite_plugin::PluginKey;
-use spite_sampling::Sampler;
+use spite_plugin::{PluginKey, Registry};
+use spite_sampling::{Sampler, DefaultSampler};
+use spite_tokenizer::Tokenize;
 use spite_kvcache::Cache;
 use thiserror::Error;
 
@@ -50,6 +51,10 @@ pub struct InferenceOverrides {
     /// Replace the entire sampling pipeline for this call.
     /// Overrides any registry registration for `key`.
     pub sampler: Option<Box<dyn Sampler>>,
+
+    /// Replace the tokenizer for this call.
+    /// Useful for domain-specific vocabularies or custom special-token handling.
+    pub tokenizer: Option<Box<dyn Tokenize>>,
 
     /// Replace the KV cache backend for this call.
     /// Useful for memory-constrained scenarios or custom eviction policies.
@@ -170,4 +175,116 @@ impl Executor {
     }
 
     pub fn n_ctx_used(&self) -> usize { self.n_ctx_used }
+}
+
+// ── Engine-level plugin registries ────────────────────────────────────────
+
+/// All pluggable subsystem registries, held in one place.
+///
+/// Users fill these via `EngineBuilder`; the engine resolves the best match
+/// for each request using the same priority-chain semantics as the kernel
+/// dispatcher.
+pub struct EngineRegistries {
+    pub samplers:   Registry<dyn Sampler>,
+    pub tokenizers: Registry<dyn Tokenize>,
+    pub caches:     Registry<dyn Cache>,
+}
+
+impl EngineRegistries {
+    fn with_defaults() -> Self {
+        let mut r = Self {
+            samplers:   Registry::new(),
+            tokenizers: Registry::new(),
+            caches:     Registry::new(),
+        };
+        // Ship a working sampler out of the box; tokenizer/cache are
+        // model- and hardware-specific so they start empty.
+        r.samplers.set_default(Box::new(DefaultSampler::new(0)));
+        r
+    }
+}
+
+// ── EngineBuilder ─────────────────────────────────────────────────────────
+
+/// Builder for an [`Engine`] with custom subsystem overrides.
+///
+/// Start with `EngineBuilder::new()` (pre-populated with engine defaults),
+/// chain `with_*` calls for your model/card/task, then call `build`.
+///
+/// ```rust,ignore
+/// let engine = EngineBuilder::new()
+///     .with_sampler(PluginKey::for_model("llama3"), Box::new(MyGreedySampler))
+///     .with_cache(PluginKey::default(),             Box::new(PagedKvCache::new(vram)))
+///     .build(ExecutorConfig::default());
+/// ```
+///
+/// No fork required — register what you need and the engine resolves the
+/// best match for every request.
+pub struct EngineBuilder {
+    registries: EngineRegistries,
+}
+
+impl Default for EngineBuilder {
+    fn default() -> Self { Self::new() }
+}
+
+impl EngineBuilder {
+    /// Create a builder pre-populated with built-in defaults.
+    pub fn new() -> Self {
+        Self { registries: EngineRegistries::with_defaults() }
+    }
+
+    /// Register a custom sampler for `key`.
+    pub fn with_sampler(mut self, key: PluginKey, s: Box<dyn Sampler>) -> Self {
+        self.registries.samplers.register(key, s);
+        self
+    }
+
+    /// Register a custom tokenizer for `key`.
+    pub fn with_tokenizer(mut self, key: PluginKey, t: Box<dyn Tokenize>) -> Self {
+        self.registries.tokenizers.register(key, t);
+        self
+    }
+
+    /// Register a custom KV cache for `key`.
+    pub fn with_cache(mut self, key: PluginKey, c: Box<dyn Cache>) -> Self {
+        self.registries.caches.register(key, c);
+        self
+    }
+
+    /// Consume the builder and produce a ready-to-use [`Engine`].
+    pub fn build(self, cfg: ExecutorConfig) -> Engine {
+        Engine { executor: Executor::new(cfg), registries: self.registries }
+    }
+}
+
+// ── Engine ────────────────────────────────────────────────────────────────
+
+/// Top-level engine handle: forward-pass executor + all pluggable registries.
+///
+/// Resolve subsystems by calling the typed helpers with a [`PluginKey`]
+/// describing the current request's model arch, GPU arch, and task.
+/// The registry walks from most-specific to least-specific and returns the
+/// first match — the same priority chain as the kernel dispatcher.
+pub struct Engine {
+    pub executor:   Executor,
+    pub registries: EngineRegistries,
+}
+
+impl Engine {
+    /// Resolve the sampler that best matches `key`.
+    pub fn sampler(&self, key: &PluginKey) -> Option<&dyn Sampler> {
+        self.registries.samplers.resolve(key)
+    }
+
+    /// Resolve the tokenizer that best matches `key`.
+    pub fn tokenizer(&self, key: &PluginKey) -> Option<&dyn Tokenize> {
+        self.registries.tokenizers.resolve(key)
+    }
+
+    /// Resolve the KV cache that best matches `key`.
+    pub fn cache(&self, key: &PluginKey) -> Option<&dyn Cache> {
+        self.registries.caches.resolve(key)
+    }
+
 }
