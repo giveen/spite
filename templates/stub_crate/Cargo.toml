@@ -1,0 +1,43 @@
+# Copy this directory to crates/spite-<yourname>/ and replace every
+# occurrence of "stub" / "STUB" with your crate's actual name.
+#
+# Then add the crate to the workspace:
+#   1. Cargo.toml [workspace] members  → "crates/spite-<yourname>"
+#   2. Cargo.toml [workspace.dependencies] → spite-<yourname> = { path = "..." }
+#
+# Run `cargo check -p spite-<yourname>` to confirm it compiles before
+# writing any implementation.
+
+[package]
+name        = "spite-stub"
+description = "One sentence describing what this crate does"
+version.workspace    = true
+edition.workspace    = true
+rust-version.workspace = true
+license.workspace    = true
+repository.workspace = true
+
+# Add only the dependencies you actually need.
+# All entries are already declared in [workspace.dependencies].
+[dependencies]
+spite-abi  = { workspace = true }
+thiserror  = { workspace = true }
+
+# Uncomment as needed:
+# spite-compute  = { workspace = true }
+# spite-dispatch = { workspace = true }
+# spite-loader   = { workspace = true }
+# spite-rope     = { workspace = true }
+# spite-gpu      = { workspace = true }
+# spite-models   = { workspace = true }
+# spite-kvcache  = { workspace = true }
+# spite-sampling = { workspace = true }
+# anyhow         = { workspace = true }
+# serde          = { workspace = true }
+# serde_json     = { workspace = true }
+# tokio          = { workspace = true }
+
+# Uncomment if this crate ships a binary (e.g. spite-quantize):
+# [[bin]]
+# name = "spite-stub"
+# path = "src/main.rs"
