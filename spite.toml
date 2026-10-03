@@ -1,0 +1,57 @@
+# spite.toml — server configuration
+#
+# Copy this file to your working directory and edit it, or point the server
+# at it with: spite-server --config /path/to/spite.toml
+#
+# All values shown here are the defaults.
+
+[server]
+host        = "127.0.0.1"
+port        = 8080
+# Maximum concurrent inference requests.
+max_concurrent = 4
+
+[model]
+# Path to the GGUF model file.
+path        = "models/model.gguf"
+# Override GPU architecture detection (e.g. "sm_89", "rdna3", "metal").
+# Leave unset to auto-detect.
+# gpu_arch = "sm_89"
+
+[inference]
+# Default context length. 0 = use the model's maximum.
+n_ctx       = 0
+# Default batch size for prompt processing.
+n_batch     = 512
+# Number of CPU threads for the generic fallback kernel.
+n_threads   = 4
+# Maximum tokens to generate when the caller doesn't specify.
+max_tokens  = 512
+
+[kernels]
+# Path to the compiled kernels directory (output of cmake --build).
+# If relative, resolved from the directory containing this config file.
+dir         = "build/kernels"
+# Watch for kernel .so changes and hot-reload without restarting.
+hot_reload  = false
+# Poll interval for hot_reload (milliseconds).
+hot_reload_poll_ms = 500
+
+[sampling]
+# Defaults applied when the client does not override them.
+temperature = 1.0
+top_p       = 0.95
+top_k       = 40
+min_p       = 0.05
+repeat_penalty = 1.1
+
+[lora]
+# Optional LoRA adapter to load at startup.
+# adapter = "adapters/my_adapter.gguf"
+
+[logging]
+# Log level: error | warn | info | debug | trace
+# Can also be set via RUST_LOG environment variable.
+level = "info"
+# Log format: pretty | json | compact
+format = "pretty"

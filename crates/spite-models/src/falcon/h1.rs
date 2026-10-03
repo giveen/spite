@@ -8,7 +8,7 @@
 //! # Per-layer structure
 //!
 //! Each "hybrid block" computes both paths and sums them:
-//!   ```
+//!   ```text
 //!   mamba_out = mamba2_block(rms_norm(x))
 //!   attn_out  = attention_block(rms_norm(x))   // standard GQA
 //!   ffn_out   = swiglu_ffn(rms_norm(x + mamba_out + attn_out))

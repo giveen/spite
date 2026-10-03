@@ -11,8 +11,10 @@ name = "spite"
 path = "src/main.rs"
 
 [dependencies]
-spite-abi      = { workspace = true }
-spite-loader   = { workspace = true }
-spite-dispatch = { workspace = true }
-clap           = { workspace = true }
-anyhow         = { workspace = true }
+spite-abi          = { workspace = true }
+spite-loader       = { workspace = true }
+spite-dispatch     = { workspace = true }
+clap               = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

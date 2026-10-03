@@ -683,6 +683,8 @@ dependencies = [
  "spite-abi",
  "spite-dispatch",
  "spite-loader",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

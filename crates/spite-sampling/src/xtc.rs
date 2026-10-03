@@ -51,12 +51,13 @@ pub fn apply_xtc(
     idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
 
     // Walk sorted list; accumulate prob mass, exclude tokens above threshold.
+    // The token that pushes cumulative mass over `threshold` is also excluded.
     let mut cum = 0f32;
     let mut cut = 0usize; // how many top tokens to exclude
     for &i in &idx {
         cum += probs[i];
-        if cum >= threshold { break; }
         cut += 1;
+        if cum >= threshold { break; }
     }
 
     // Don't exclude if it would leave fewer than min_keep.

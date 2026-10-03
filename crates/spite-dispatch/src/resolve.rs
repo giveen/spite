@@ -144,11 +144,10 @@ pub fn detect_card_id(gpu_display_name: &str) -> String {
 fn normalize_card_name(name: &str) -> String {
     // Strip well-known vendor/product prefixes so we get the model designator.
     const PREFIXES: &[&str] = &[
-        "NVIDIA GeForce RTX ", "NVIDIA GeForce GTX ",
-        "NVIDIA GeForce ", "NVIDIA Quadro RTX ", "NVIDIA Quadro ",
-        "NVIDIA RTX ", "NVIDIA ",
-        "AMD Radeon RX ", "AMD Radeon Pro ", "AMD Radeon ",
-        "AMD Instinct ", "AMD ",
+        // Keep "RTX"/"GTX" in the output — strip only the branding before it.
+        "NVIDIA GeForce ", "NVIDIA Quadro ", "NVIDIA ",
+        // AMD: keep "RX" and "MI" designators; strip "Instinct" product line.
+        "AMD Radeon Pro ", "AMD Radeon ", "AMD Instinct ", "AMD ",
         "Intel Arc ", "Intel Data Center GPU ", "Intel ",
     ];
     let mut s = name;

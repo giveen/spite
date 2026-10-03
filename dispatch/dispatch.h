@@ -22,10 +22,11 @@ typedef struct {
 } spite_dispatch_config_t;
 
 typedef struct {
-    spite_rms_norm_fn  rms_norm;
-    spite_attention_fn attention;
-    spite_ffn_fn       ffn;
-    spite_layer_fn     layer;
+    SpiteRmsNormFn   rms_norm;
+    SpiteAttentionFn attention;
+    SpiteFfnFn       ffn;
+    SpiteLayerFn     layer;
+    SpiteLayerFn     prefill; /* chunked prefill; NULL if not implemented */
 } spite_dispatch_table_t;
 
 /*

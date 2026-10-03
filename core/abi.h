@@ -11,6 +11,7 @@
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 #  define SPITE_NORETURN  [[noreturn]]
@@ -20,7 +21,7 @@
 #  define SPITE_NODISCARD
 #endif
 
-#define SPITE_ABI_VERSION 1
+#define SPITE_ABI_VERSION 2
 
 /* ── Quant type tag ───────────────────────────────────────────────────── */
 
@@ -166,6 +167,8 @@ typedef struct {
     SpiteFfnFn       ffn;
     SpiteLayerFn     layer;
     SpiteSpecVerifyFn speculative_verify; /* NULL if no optimized impl */
+    /* Chunked prefill: process prompt in chunks; caller passes chunk_idx via pos. */
+    SpiteLayerFn     prefill;
 } SpiteKernelInfo;
 
 /* Every kernel .so must export this symbol. */

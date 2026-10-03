@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Rust workspace ──────────────────────────────────────────────────────
+  rust:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ── C kernel headers ────────────────────────────────────────────────────
+  c-headers:
+    name: C headers (clang)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: sudo apt-get install -y clang
+
+      - name: Check core/abi.h compiles as C11
+        run: |
+          echo '#include "core/abi.h"' | \
+            clang -std=c11 -Wall -Wextra -Wpedantic -fsyntax-only \
+              -x c - 2>&1
+
+      - name: Check core/quant.h compiles as C11
+        run: |
+          echo '#include "core/quant.h"' | \
+            clang -std=c11 -Wall -Wextra -Wpedantic -fsyntax-only \
+              -x c - 2>&1
+
+      - name: Check core/abi.h compiles as C++23
+        run: |
+          echo '#include "core/abi.h"' | \
+            clang++ -std=c++23 -Wall -Wextra -fsyntax-only \
+              -x c++ - 2>&1
+
+  # ── Generic fallback kernel build ───────────────────────────────────────
+  generic-kernel:
+    name: Generic C kernel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build generic fallback kernel
+        run: |
+          cc -std=c11 -Wall -Wextra -O2 -fPIC -shared \
+            -I. \
+            kernels/generic/generic/dequant.c \
+            kernels/generic/generic/ops.c \
+            kernels/generic/generic/kernel.c \
+            -lm -o /tmp/libkernel_generic.so
+
+      - name: Verify kernel exports spite_kernel_info
+        run: |
+          nm -D /tmp/libkernel_generic.so | grep spite_kernel_info
+
+  # ── ABI version sync check ───────────────────────────────────────────────
+  abi-sync:
+    name: ABI version sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check ABI_VERSION matches in C and Rust
+        run: |
+          C_VER=$(grep -oP '(?<=#define SPITE_ABI_VERSION )\d+' core/abi.h)
+          RUST_VER=$(grep -oP '(?<=ABI_VERSION: u32 = )\d+' crates/spite-abi/src/lib.rs)
+          echo "C ABI_VERSION   : $C_VER"
+          echo "Rust ABI_VERSION: $RUST_VER"
+          if [ "$C_VER" != "$RUST_VER" ]; then
+            echo "ERROR: ABI_VERSION mismatch — update both core/abi.h and crates/spite-abi/src/lib.rs"
+            exit 1
+          fi

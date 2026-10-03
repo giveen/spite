@@ -34,8 +34,10 @@ mod tests {
     #[test]
     fn uneven_split() {
         let r = stage_ranges(33, 4);
-        // 33 = 8+8+8+9 → extra=1, first stage gets +1
+        // 33 = 9+8+8+8 → extra=1, first stage gets +1
         assert_eq!(r[0], (0, 9));
-        assert_eq!(r[3], (24, 33));
+        assert_eq!(r[1], (9, 17));
+        assert_eq!(r[2], (17, 25));
+        assert_eq!(r[3], (25, 33));
     }
 }

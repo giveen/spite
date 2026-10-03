@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use tracing_subscriber::EnvFilter;
 
 use spite_dispatch::{DispatchBuilder, KernelSpec, detect_gpu_arch};
 use spite_loader::GgufModel;
@@ -59,6 +60,11 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .with_target(false)
+        .init();
+
     let cli = Cli::parse();
 
     let gpu_arch = cli.gpu_arch
