@@ -72,7 +72,7 @@ for full speed you'll want to compile the kernels for your GPU.
 # Build kernels for your card
 cmake -B build \
   -DSPITE_MODELS="llama/llama4"  \
-  -DSPITE_GPU_ARCHS="sm_89"      \
+  -DSPITE_GPU_ARCHS="RTX_4090"   \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 cmake --install build --prefix .
@@ -100,7 +100,7 @@ generic CPU path automatically — slower, but always correct.
 
 ### NVIDIA
 
-| Architecture | Build flag | Cards |
+| Architecture | GPU arch | Cards |
 |---|---|---|
 | Ada Lovelace | `sm_89` | RTX 4090, RTX 4080 Super / 4080, RTX 4070 Ti Super / 4070 Ti / 4070 Super / 4070, RTX 4060 Ti / 4060, RTX 4000 / 5000 / 6000 Ada |
 | Ampere | `sm_86` | RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060, RTX A2000–A6000 |
@@ -109,7 +109,7 @@ generic CPU path automatically — slower, but always correct.
 
 ### AMD
 
-| Architecture | Build flag | Cards |
+| Architecture | GPU arch | Cards |
 |---|---|---|
 | RDNA 4 *(planned)* | `rdna4` | RX 9070 XT / 9070 / 9060 XT |
 | RDNA 3 | `rdna3` | RX 7900 XTX / 7900 XT / 7900 GRE, RX 7800 XT, RX 7700 XT, RX 7600 XT / 7600 |
@@ -118,14 +118,14 @@ generic CPU path automatically — slower, but always correct.
 
 ### Intel
 
-| Architecture | Build flag | Cards |
+| Architecture | GPU arch | Cards |
 |---|---|---|
 | Arc Battlemage *(planned)* | `arc_battlemage` | Arc B580 / B570 |
 | Arc Alchemist | `arc_alchemist` | Arc A770 / A750 / A580 / A380 / A310 |
 
 ### Apple Silicon
 
-| Architecture | Build flag | Chips |
+| Architecture | GPU arch | Chips |
 |---|---|---|
 | Metal | `metal` | M1 / M1 Pro / Max / Ultra, M2 / M2 Pro / Max / Ultra, M3 / M3 Pro / Max, M4 / M4 Pro / Max |
 
@@ -276,7 +276,7 @@ cp kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu \
 # 3. Implement the op (the template has comments for each section)
 
 # 4. Build the kernels for your card
-cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="sm_120" \
+cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="RTX_5090" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
