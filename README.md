@@ -39,124 +39,6 @@ You only need to know your GPU — nothing else in the codebase changes.
 
 ---
 
-## Quick start
-
-```bash
-# Build
-cargo build --release
-
-# Run a model
-./target/release/spite run \
-  --model ~/models/qwen3.5-8b-instruct.Q4_K_M.gguf \
-  --prompt "What is the capital of France?"
-
-# Start an API server (OpenAI-compatible)
-./target/release/spite-server \
-  --model ~/models/qwen3.5-8b-instruct.Q4_K_M.gguf \
-  --port 8080
-```
-
-Then point any OpenAI-compatible app at `http://localhost:8080`.
-
----
-
-## Getting a model
-
-Models are distributed as `.gguf` files. The most common source is
-[Hugging Face](https://huggingface.co/models?library=gguf). Search for the
-model you want, filter by GGUF, and download a quantized version that fits
-your GPU's VRAM.
-
-| VRAM  | Recommended quant | Fits                                          | Size on disk |
-|-------|-------------------|-----------------------------------------------|--------------|
-| 4 GB  | Q4_K_M            | 7B — keep context short                       | 3.9 GB       |
-| 8 GB  | Q5_K_M            | 7B higher quality, or 13B at Q4_K_M           | 4.8 / 7.3 GB |
-| 12 GB | Q6_K              | 7B near-lossless, or 13B good quality         | 5.7 / 10.6 GB |
-| 16 GB | Q8_0              | 13B near-lossless, or 27B at Q3_K_M           | 13.8 / 11.8 GB |
-| 24 GB | Q5_K_M            | 27B (18.6 GB) or 34B at Q4_K_M (19.1 GB)     | 18.6 / 19.1 GB |
-| 32 GB | Q8_0              | 27B near-lossless (28.7 GB) or 70B at Q3_K_M (30.6 GB) | 28.7 / 30.6 GB |
-| 48 GB | Q4_K_M            | 70B (39.4 GB) with room for KV cache          | 39.4 GB      |
-| 80 GB+| Q8_0              | 70B near-lossless                             | 74.4 GB      |
-
-If you don't specify a quantization, spite uses your full GPU memory as
-efficiently as possible — automatically stepping down from f16 to Q8 to Q5
-to Q4 as it fills.
-
----
-
-## Building GPU kernels
-
-The Rust host runs without GPU kernels (using the generic CPU fallback), but
-for full speed you'll want to compile the kernels for your GPU.
-
-```bash
-# Find your GPU architecture first — `spite dispatch` shows it:
-./target/release/spite dispatch -m ~/models/your.gguf --card RTX_4090
-
-# Build kernels for your card
-cmake -B build \
-  -DSPITE_MODELS="llama/llama4"  \
-  -DSPITE_GPU_ARCHS="sm_89"      \
-  -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j$(nproc)
-cmake --install build --prefix .
-```
-
-The install step copies the compiled kernels into `./kernels/`, which spite
-checks automatically. After that, run normally — no extra flags:
-
-```bash
-./target/release/spite run \
-  --model ~/models/your.gguf \
-  --prompt "Hello"
-```
-
-**You don't need to build kernels for every model or every GPU.** Build only
-the combination you actually use. The fallback covers everything else.
-
----
-
-## Supported hardware
-
-Every card listed here runs today via the generic fallback. Tuned kernels exist
-where the community has contributed them; all other cards fall back to the
-generic CPU path automatically — slower, but always correct.
-
-### NVIDIA
-
-| Architecture | Build flag | Cards |
-|---|---|---|
-| Ada Lovelace | `sm_89` | RTX 4090, RTX 4080 Super / 4080, RTX 4070 Ti Super / 4070 Ti / 4070 Super / 4070, RTX 4060 Ti / 4060, RTX 4000 / 5000 / 6000 Ada |
-| Ampere | `sm_86` | RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060, RTX A2000–A6000 |
-| Turing | `sm_75` | RTX 2080 Ti / 2080 Super / 2080 / 2070 Super / 2070 / 2060 Super / 2060, GTX 1660 Ti / 1660 Super / 1660 |
-| Blackwell | `sm_120` | RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060 |
-
-### AMD
-
-| Architecture | Build flag | Cards |
-|---|---|---|
-| RDNA 4 *(planned)* | `rdna4` | RX 9070 XT / 9070 / 9060 XT |
-| RDNA 3 | `rdna3` | RX 7900 XTX / 7900 XT / 7900 GRE, RX 7800 XT, RX 7700 XT, RX 7600 XT / 7600 |
-| RDNA 2 | `rdna2` | RX 6950 XT / 6900 XT / 6800 XT / 6800, RX 6700 XT / 6650 XT / 6600 XT / 6600 |
-| RDNA 1 *(planned)* | `rdna1` | RX 5700 XT / 5700 / 5600 XT / 5500 XT |
-
-### Intel
-
-| Architecture | Build flag | Cards |
-|---|---|---|
-| Arc Battlemage *(planned)* | `arc_battlemage` | Arc B580 / B570 |
-| Arc Alchemist | `arc_alchemist` | Arc A770 / A750 / A580 / A380 / A310 |
-
-### Apple Silicon
-
-| Architecture | Build flag | Chips |
-|---|---|---|
-| Metal | `metal` | M1 / M1 Pro / Max / Ultra, M2 / M2 Pro / Max / Ultra, M3 / M3 Pro / Max, M4 / M4 Pro / Max |
-
-Not sure which architecture you have? Run `spite dispatch` — it detects and prints it.
-
----
-
 ## Modular by design
 
 spite is built on a single rule: **every layer is replaceable without touching any other layer.**
@@ -205,6 +87,100 @@ let engine = EngineBuilder::new()
 spite is a Rust workspace. You can use just the loader, just the scheduler,
 or just the ABI types for kernel development — without pulling in the full
 server stack. Build what you need from the pieces that fit.
+
+---
+
+## Quick start
+
+```bash
+# Build
+cargo build --release
+
+# Run a model
+./target/release/spite run \
+  --model ~/models/qwen3.5-8b-instruct.Q4_K_M.gguf \
+  --prompt "What is the capital of France?"
+
+# Start an API server (OpenAI-compatible)
+./target/release/spite-server \
+  --model ~/models/qwen3.5-8b-instruct.Q4_K_M.gguf \
+  --port 8080
+```
+
+Then point any OpenAI-compatible app at `http://localhost:8080`.
+
+---
+
+## Building GPU kernels
+
+The Rust host runs without GPU kernels (using the generic CPU fallback), but
+for full speed you'll want to compile the kernels for your GPU.
+
+```bash
+# Find your GPU architecture first — `spite dispatch` shows it:
+./target/release/spite dispatch -m ~/models/your.gguf --card RTX_4090
+
+# Build kernels for your card
+cmake -B build \
+  -DSPITE_MODELS="llama/llama4"  \
+  -DSPITE_GPU_ARCHS="RTX_4090"   \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+cmake --install build --prefix .
+```
+
+The install step copies the compiled kernels into `./kernels/`, which spite
+checks automatically. After that, run normally — no extra flags:
+
+```bash
+./target/release/spite run \
+  --model ~/models/your.gguf \
+  --prompt "Hello"
+```
+
+**You don't need to build kernels for every model or every GPU.** Build only
+the combination you actually use. The fallback covers everything else.
+
+---
+
+## Supported hardware
+
+Every card listed here runs today via the generic fallback. Tuned kernels exist
+where the community has contributed them; all other cards fall back to the
+generic CPU path automatically — slower, but always correct.
+
+### NVIDIA
+
+| Architecture | GPU arch | Cards |
+|---|---|---|
+| Ada Lovelace | `sm_89` | RTX 4090, RTX 4080 Super / 4080, RTX 4070 Ti Super / 4070 Ti / 4070 Super / 4070, RTX 4060 Ti / 4060, RTX 4000 / 5000 / 6000 Ada |
+| Ampere | `sm_86` | RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060, RTX A2000–A6000 |
+| Turing | `sm_75` | RTX 2080 Ti / 2080 Super / 2080 / 2070 Super / 2070 / 2060 Super / 2060, GTX 1660 Ti / 1660 Super / 1660 |
+| Blackwell | `sm_120` | RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060 |
+
+### AMD
+
+| Architecture | GPU arch | Cards |
+|---|---|---|
+| RDNA 4 | `rdna4` | RX 9070 XT / 9070 / 9070 GRE, RX 9060 XT / 9060 |
+| RDNA 3 | `rdna3` | RX 7900 XTX / 7900 XT / 7900 GRE, RX 7800 XT, RX 7700 XT, RX 7600 XT / 7600 |
+| RDNA 2 | `rdna2` | RX 6950 XT / 6900 XT / 6800 XT / 6800, RX 6750 XT / 6700 XT / 6650 XT / 6600 XT / 6600 |
+| RDNA 1 *(planned)* | `rdna1` | RX 5700 XT / 5700 / 5600 XT / 5500 XT |
+
+### Intel
+
+| Architecture | GPU arch | Cards |
+|---|---|---|
+| Arc Battlemage | `arc_battlemage` | Arc B580 / B570 |
+| Arc Alchemist | `arc_alchemist` | Arc A770 / A750 / A580 / A380 / A310 |
+
+### Apple Silicon
+
+| Architecture | GPU arch | Chips |
+|---|---|---|
+| Metal | `metal` | M1 / M1 Pro / Max / Ultra, M2 / M2 Pro / Max / Ultra, M3 / M3 Pro / Max, M4 / M4 Pro / Max |
+
+Not sure which architecture you have? Run `spite dispatch` — it detects and prints it.
 
 ---
 
@@ -300,7 +276,7 @@ cp kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu \
 # 3. Implement the op (the template has comments for each section)
 
 # 4. Build the kernels for your card
-cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="sm_120" \
+cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="RTX_5090" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
