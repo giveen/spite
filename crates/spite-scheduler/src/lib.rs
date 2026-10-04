@@ -92,13 +92,13 @@ pub enum FinishReason {
 }
 
 pub struct Scheduler {
-    pub slots:    Vec<Slot>,
-    next_req_id:  u64,
-    // TODO: executor: Executor
+    pub slots:      Vec<Slot>,
+    next_req_id:    u64,
+    pub executor:   spite_executor::Engine,
 }
 
 impl Scheduler {
-    pub fn new(n_slots: usize) -> Self {
+    pub fn new(n_slots: usize, executor: spite_executor::Engine) -> Self {
         let slots = (0..n_slots).map(|i| Slot {
             id:          i,
             state:       SlotState::Free,
@@ -106,7 +106,7 @@ impl Scheduler {
             n_generated: 0,
             max_tokens:  0,
         }).collect();
-        Self { slots, next_req_id: 1 }
+        Self { slots, next_req_id: 1, executor }
     }
 
     /// Assign the next free request ID (monotonically increasing).

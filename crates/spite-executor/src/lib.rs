@@ -16,7 +16,7 @@
 //!       let logits = exec.decode_step(token, &ctx)?;    // single-token step
 //!   }
 
-use spite_abi::SpiteCtx;
+use spite_abi::{SpiteCtx, ShardStrategy};
 use spite_plugin::{PluginKey, Registry};
 use spite_sampling::{Sampler, DefaultSampler};
 use spite_tokenizer::Tokenize;
@@ -74,52 +74,12 @@ pub enum ExecutorError {
     ContextOverflow { used: usize, max: usize },
 }
 
-/// One stage in a multi-GPU pipeline: which GPU handles which layers.
-#[derive(Debug, Clone)]
-pub struct PipelineStage {
-    /// Index into the `MultiGpuSpec::nodes` list (or a device ordinal).
-    pub gpu_idx:     usize,
-    /// Transformer layers this GPU processes.
-    pub layer_range: std::ops::Range<usize>,
-}
-
-/// How transformer layers are distributed across compute resources.
-#[derive(Debug, Clone)]
-pub enum LayerSplit {
-    /// All layers on GPU 0 (default when one GPU has sufficient VRAM).
-    All,
-    /// All layers on CPU scalar fallback (no GPU required).
-    None,
-    /// First `n` layers on GPU 0, remaining on CPU.
-    Gpu(usize),
-    /// Multi-GPU pipeline: each stage owns a contiguous layer range.
-    ///
-    /// Stages run sequentially; activations are transferred between GPUs
-    /// via `CommLink` (NVLink, PCIe P2P, or host-memory copy for
-    /// cross-vendor pairs like CUDA + ROCm).
-    ///
-    /// Build from a `MultiGpuSpec` after calling `assign_layers`:
-    /// ```rust,ignore
-    /// let mut mgpu = MultiGpuSpec::from_cards(&["RTX_5070", "RTX_3090"]);
-    /// mgpu.assign_layers(model.n_layers(), None);
-    /// let split = LayerSplit::from_multi(&mgpu);
-    /// ```
-    Pipeline(Vec<PipelineStage>),
-}
-
-impl LayerSplit {
-    /// Build a `Pipeline` split directly from a `MultiGpuSpec`.
-    pub fn from_multi(spec: &spite_dispatch::MultiGpuSpec) -> Self {
-        let stages = spec.nodes.iter().enumerate().map(|(i, node)| {
-            PipelineStage { gpu_idx: i, layer_range: node.layers.clone() }
-        }).collect();
-        Self::Pipeline(stages)
-    }
-}
+// Re-export so callers only need one import.
+pub use spite_abi::ShardStrategy as LayerSplit;
 
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
-    pub layer_split:  LayerSplit,
+    pub layer_split:  ShardStrategy,
     pub n_threads:    usize,
     pub ctx_len:      usize,
     pub batch_size:   usize,
@@ -137,7 +97,7 @@ pub struct ExecutorConfig {
 impl Default for ExecutorConfig {
     fn default() -> Self {
         Self {
-            layer_split: LayerSplit::All,
+            layer_split: ShardStrategy::None,
             n_threads:   4,
             ctx_len:     4096,
             batch_size:  512,

@@ -11,7 +11,7 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 // ── Tensor type tag ────────────────────────────────────────────────────────
 
@@ -22,6 +22,7 @@ pub enum SpiteType {
     F16  = 1,
     Bf16 = 2,
     Q8_0 = 8,
+    Q5_1 = 11,
     Q4_0 = 10,
     Q4K  = 12,
     Q5K  = 13,
@@ -65,6 +66,12 @@ pub struct SpiteCtx {
     pub n_ctx:            c_int,
     pub n_batch:          c_int,
     pub n_threads:        c_int,
+    /// Current token position in the sequence (0-based). Used by RoPE and KV cache.
+    pub pos:              c_int,
+    /// Total query heads (n_heads in config).
+    pub n_heads:          c_int,
+    /// KV heads — may be less than n_heads for GQA/MQA.
+    pub n_kv_heads:       c_int,
     /// CUDA stream / HIP stream / Metal command buffer. Null for CPU kernels.
     pub gpu_stream:       *mut c_void,
     pub scratchpad:       *mut c_void,
@@ -98,18 +105,46 @@ pub type AttentionFn = unsafe extern "C" fn(
     wv:             *const SpiteTensor,
     wo:             *const SpiteTensor,
     kvcache:        *mut SpiteKvCache,
-    pos:            c_int,
     rope_freq_base: f32,
-    ctx:            *const SpiteCtx,
+    ctx:            *const SpiteCtx,  // pos, n_heads, n_kv_heads are in ctx
 ) -> c_int;
 
+/// FFN activation function selector.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FfnActivation {
+    SiluGate = 0,  // SwiGLU — LLaMA, Mistral, Qwen
+    GeluGate = 1,  // GeGLU  — Gemma
+    Gelu     = 2,  // standard GELU — BERT-family, Phi
+    Relu     = 3,  // ReLU²  — GPT-NeoX variants
+}
+
 pub type FfnFn = unsafe extern "C" fn(
-    out:    *mut SpiteTensor,
-    x:      *const SpiteTensor,
-    w_gate: *const SpiteTensor,
-    w_up:   *const SpiteTensor,
-    w_down: *const SpiteTensor,
-    ctx:    *const SpiteCtx,
+    out:        *mut SpiteTensor,
+    x:          *const SpiteTensor,
+    w_gate:     *const SpiteTensor,
+    w_up:       *const SpiteTensor,
+    w_down:     *const SpiteTensor,
+    activation: FfnActivation,
+    ctx:        *const SpiteCtx,
+) -> c_int;
+
+/// Multi-head Latent Attention (DeepSeek MLA).
+///
+/// KV is compressed through low-rank projections before caching.
+/// The compressed latent is stored in the KV cache; up-projection
+/// happens during the attention score computation.
+pub type MlaFn = unsafe extern "C" fn(
+    out:     *mut SpiteTensor,
+    x:       *const SpiteTensor,
+    w_dq:    *const SpiteTensor,  // query down-projection (absorbs W_Q)
+    w_uq:    *const SpiteTensor,  // query up-projection
+    w_dkv:   *const SpiteTensor,  // KV down-projection (shared compress)
+    w_ukv:   *const SpiteTensor,  // KV up-projection
+    wo:      *const SpiteTensor,  // output projection
+    kvcache: *mut SpiteKvCache,
+    rope_freq_base: f32,
+    ctx:     *const SpiteCtx,
 ) -> c_int;
 
 /// Optional: fuse rms_norm + attention + ffn for one layer.
@@ -185,12 +220,13 @@ pub struct SpiteKernelInfo {
     /// None = not implemented; dispatcher uses fallback.
     pub rms_norm:           Option<RmsNormFn>,
     pub attention:          Option<AttentionFn>,
+    pub mla:                Option<MlaFn>,
     pub ffn:                Option<FfnFn>,
     pub layer:              Option<LayerFn>,
     pub speculative_verify: Option<SpecVerifyFn>,
     /// Chunked prefill: process a prompt in fixed-size chunks rather than all
     /// at once, enabling interleaving with decode steps and bounding peak memory.
-    /// Reuses `LayerFn` signature; the caller passes `chunk_idx` via `pos`.
+    /// Reuses `LayerFn` signature; the caller passes `chunk_idx` via `pos` in ctx.
     pub prefill:            Option<LayerFn>,
 }
 
@@ -200,3 +236,25 @@ unsafe impl Sync for SpiteKernelInfo {}
 /// The one symbol every kernel shared library must export.
 pub type KernelInfoFn = unsafe extern "C" fn() -> *const SpiteKernelInfo;
 pub const KERNEL_ENTRY_SYMBOL: &[u8] = b"spite_kernel_info\0";
+
+// ── Parallelism strategy ───────────────────────────────────────────────────
+
+/// How to distribute work across GPUs.
+///
+/// Defined here (in spite-abi) so both spite-executor and spite-parallel
+/// can reference it without creating a dependency cycle.
+///
+/// The `Default` is `None` (single GPU). Use `spite_parallel::gpu_aware_default()`
+/// when you want the GPU-count-aware strategy instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ShardStrategy {
+    /// Single GPU — no parallelism.
+    #[default]
+    None,
+    /// Transformer layers split in sequence across GPUs.
+    Pipeline { n_stages: usize },
+    /// Weight matrices split column-wise within each layer (Megatron-style).
+    Tensor { n_shards: usize },
+    /// Tensor parallelism within a node, pipeline across nodes.
+    Hybrid { n_shards: usize, n_stages: usize },
+}

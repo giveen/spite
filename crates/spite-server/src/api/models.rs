@@ -33,7 +33,7 @@ pub async fn list_models(
     Json(ModelList {
         object: "list",
         data: vec![ModelCard {
-            id:       state.model.arch().to_owned(),
+            id:       state.model_arch.clone(),
             object:   "model",
             created,
             owned_by: "spite",

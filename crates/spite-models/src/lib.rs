@@ -136,11 +136,20 @@ impl Default for ModelConfig {
 pub trait ModelArch: Send + Sync {
     fn config(&self) -> &ModelConfig;
 
+    /// Bind the mmap'd GGUF weight tensors to this model.
+    ///
+    /// Called once after construction, before the first `forward`.
+    /// The default no-op is intentional — implementations override it
+    /// to store tensor pointers from the GGUF buffer.
+    fn load_weights(&mut self, _model: &spite_loader::GgufModel) -> Result<(), ModelError> {
+        Ok(())
+    }
+
     /// Run one forward pass.
     ///
     /// `tokens`:     input token ids `[seq_len]`
     /// `logits_out`: pre-allocated `[seq_len × vocab_size]` F32 — caller zeroes
-    /// `ctx`:        batch/threading context
+    /// `ctx`:        batch/threading/position context (pos, n_heads, n_kv_heads)
     fn forward(
         &self,
         tokens:     &[u32],

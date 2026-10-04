@@ -22,6 +22,9 @@
 pub mod pipeline;
 pub mod tensor_par;
 
+// ShardStrategy lives in spite-abi to avoid a dependency cycle.
+pub use spite_abi::ShardStrategy;
+
 /// How many GPUs this process can see.
 /// Falls back to 1 if no GPU runtime is present.
 pub fn gpu_count() -> usize {
@@ -32,22 +35,10 @@ pub fn gpu_count() -> usize {
         .unwrap_or(1)
 }
 
-/// Shard strategy to use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShardStrategy {
-    /// Single GPU (no parallelism).
-    None,
-    /// Layers split across GPUs in sequence.
-    Pipeline { n_stages: usize },
-    /// Weights split column-wise within each layer.
-    Tensor { n_shards: usize },
-    /// Tensor within a node, pipeline across nodes.
-    Hybrid { n_shards: usize, n_stages: usize },
-}
-
-impl Default for ShardStrategy {
-    fn default() -> Self {
-        let n = gpu_count();
-        if n == 1 { Self::None } else { Self::Tensor { n_shards: n } }
-    }
+/// Returns the best `ShardStrategy` for the detected GPU count.
+/// Use this instead of `ShardStrategy::default()` when you want
+/// the runtime to automatically pick tensor parallelism on multi-GPU boxes.
+pub fn gpu_aware_default() -> ShardStrategy {
+    let n = gpu_count();
+    if n == 1 { ShardStrategy::None } else { ShardStrategy::Tensor { n_shards: n } }
 }

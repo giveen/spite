@@ -33,7 +33,7 @@ async fn dispatch_info(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
 ) -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
-        "gpu_arch": state.gpu_arch,
-        "model_arch": state.model.arch(),
+        "gpu_arch":   state.gpu_arch,
+        "model_arch": state.model_arch,
     }))
 }

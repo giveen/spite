@@ -9,6 +9,5 @@ repository.workspace = true
 [dependencies]
 spite-abi      = { workspace = true }
 spite-models   = { workspace = true }
-spite-executor = { workspace = true }
 spite-kvcache  = { workspace = true }
 anyhow         = { workspace = true }

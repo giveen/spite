@@ -11,9 +11,11 @@ name = "spite-server"
 path = "src/main.rs"
 
 [dependencies]
-spite-abi      = { workspace = true }
-spite-loader   = { workspace = true }
-spite-dispatch = { workspace = true }
+spite-abi       = { workspace = true }
+spite-loader    = { workspace = true }
+spite-dispatch  = { workspace = true }
+spite-executor  = { workspace = true }
+spite-scheduler = { workspace = true }
 
 tokio          = { workspace = true }
 axum           = { workspace = true }

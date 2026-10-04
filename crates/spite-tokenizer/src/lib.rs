@@ -11,6 +11,7 @@
 pub mod bpe;
 pub mod sentencepiece;
 
+use std::borrow::Cow;
 use thiserror::Error;
 
 // ── Tokenize trait ────────────────────────────────────────────────────────
@@ -30,7 +31,10 @@ pub trait Tokenize: Send + Sync {
     fn decode(&self, ids: &[u32], skip_special: bool) -> String;
 
     /// Decode a single token — used for streaming output.
-    fn decode_one(&self, id: u32) -> &str;
+    ///
+    /// Returns `Borrowed` for normal tokens (zero-copy from vocab table).
+    /// Returns `Owned` for byte-fallback tokens that need reconstruction.
+    fn decode_one(&self, id: u32) -> Cow<'_, str>;
 
     fn vocab_size(&self) -> usize;
     fn bos_id(&self) -> u32;
@@ -119,7 +123,7 @@ impl Tokenize for Tokenizer {
     fn decode(&self, ids: &[u32], skip_special: bool) -> String {
         self.decode(ids, skip_special)
     }
-    fn decode_one(&self, id: u32) -> &str {
+    fn decode_one(&self, id: u32) -> Cow<'_, str> {
         self.decode_one(id)
     }
     fn vocab_size(&self) -> usize { self.vocab.vocab_size() }
@@ -152,7 +156,9 @@ impl Tokenizer {
     }
 
     /// Decode a single token id — used for streaming output.
-    pub fn decode_one(&self, id: u32) -> &str {
-        self.vocab.token_to_str(id).unwrap_or("")
+    pub fn decode_one(&self, id: u32) -> Cow<'_, str> {
+        // TODO: handle byte-fallback tokens (token_type == Byte) by
+        // parsing "<0xNN>" and returning Cow::Owned with the decoded byte.
+        Cow::Borrowed(self.vocab.token_to_str(id).unwrap_or(""))
     }
 }

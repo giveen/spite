@@ -127,10 +127,7 @@ pub async fn create_chat_completion(
     State(state): State<Arc<AppState>>,
     Json(req):    Json<ChatRequest>,
 ) -> Response {
-    // Acquire a slot before moving `state` into the sub-handler.
-    // `acquire` borrows `state`, so we hold the permit, then clone the Arc.
-    let _permit = state.slots.acquire().await;
-    let state   = Arc::clone(&state);
+    let state = Arc::clone(&state);
 
     if req.stream {
         stream_response(state, req).await.into_response()
