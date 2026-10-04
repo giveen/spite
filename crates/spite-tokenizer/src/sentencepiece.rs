@@ -134,3 +134,18 @@ impl UnigramModel {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn viterbi_prefers_longest_match() {
+        // "AB" as one token outscores "A"+"B" separately.
+        let tokens = vec!["A".to_string(), "B".to_string(), "AB".to_string()];
+        let scores = vec![-1.0, -1.0, -0.1];
+        let model = UnigramModel::new(&tokens, &scores).unwrap();
+        assert_eq!(model.encode("AB"), vec![2]);
+        assert_eq!(model.encode("A"), vec![0]);
+    }
+}

@@ -526,7 +526,25 @@ fn cmd_serve(
         println!("context      : {n} tokens");
     }
     println!("\nlistening on : http://{host}:{port}");
-    println!("(server loop not yet implemented — contribute it!)");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let state = std::sync::Arc::new(spite_server::AppState::load(
+            &target,
+            &hw.kernels_dir,
+            &mgpu
+                .nodes
+                .first()
+                .map(|n| n.gpu_arch.clone())
+                .unwrap_or_default(),
+            4,
+        )?);
+        let app = spite_server::api::router(state);
+        let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
+        axum::serve(listener, app).await?;
+        Ok::<(), anyhow::Error>(())
+    })?;
     Ok(())
 }
 

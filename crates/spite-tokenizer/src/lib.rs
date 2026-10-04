@@ -114,6 +114,7 @@ pub struct Tokenizer {
     pub vocab: Vocab,
     pub kind: TokenizerKind,
     merges: Option<bpe::BpeMergeTable>,
+    unigram: Option<sentencepiece::UnigramModel>,
     /// token string → id, for BPE byte lookup and merge resolution.
     vocab_map: std::collections::HashMap<String, u32>,
 }
@@ -222,6 +223,12 @@ impl Tokenizer {
                 .transpose()?,
             _ => None,
         };
+        let unigram = match kind {
+            TokenizerKind::SentencePiece => {
+                Some(sentencepiece::UnigramModel::new(&vocab_tokens, &scores)?)
+            }
+            _ => None,
+        };
 
         let u32_id = |key: &str, default: u32| model.get_u32(key).unwrap_or(default);
         Ok(Self {
@@ -236,6 +243,7 @@ impl Tokenizer {
             },
             kind,
             merges,
+            unigram,
             vocab_map,
         })
     }
@@ -274,9 +282,13 @@ impl Tokenizer {
                 }
             }
             TokenizerKind::SentencePiece => {
-                return Err(TokenizerError::Encode(
-                    "sentencepiece encode not yet ported".into(),
-                ));
+                let model = self
+                    .unigram
+                    .as_ref()
+                    .ok_or_else(|| TokenizerError::Encode("no unigram model".into()))?;
+                // SentencePiece treats the input as-is (no pre-tokenization);
+                // a leading ▁ is handled by the model itself.
+                ids.extend(model.encode(text));
             }
             TokenizerKind::WordPiece => {
                 return Err(TokenizerError::Encode(

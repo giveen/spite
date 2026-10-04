@@ -101,6 +101,43 @@ impl KvStore {
     }
 }
 
+/// FFN activation variants (llama.cpp `llm_ffn_op`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Activation {
+    /// SwiGLU: `silu(gate) * up` — LLaMA, Mistral, Qwen, GLM.
+    #[default]
+    SwiGlu,
+    /// GeGLU: `gelu(gate) * up` — Gemma.
+    GeGlu,
+}
+
+/// Options selecting the dense-decoder variant. Defaults are the plain
+/// full-attention SwiGLU decoder (Mistral-style).
+#[derive(Debug, Clone, Copy)]
+pub struct DenseOptions {
+    pub activation: Activation,
+    /// Sliding-window attention span (Gemma-style local layers). None = full.
+    pub sliding_window: Option<usize>,
+    /// Apply RoPE every `rope_stride`-th layer starting at 0. 1 = every
+    /// layer; 2 = even layers only (LLaMA-4-style iRoPE NoPE layers).
+    pub rope_stride: usize,
+}
+
+impl Default for DenseOptions {
+    fn default() -> Self {
+        Self {
+            activation: Activation::SwiGlu,
+            sliding_window: None,
+            rope_stride: 1,
+        }
+    }
+}
+
+/// tanh-approximated GELU, matching llama.cpp ggml.
+fn gelu(x: f32) -> f32 {
+    0.5 * x * (1.0 + (0.797_884_6 * (x + 0.044_715 * x * x * x)).tanh())
+}
+
 /// RMS norm over `x` with `weight`, matching llama.cpp `llm_graph` norm.
 fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     let mean_sq = x.iter().map(|&v| v * v).sum::<f32>() / x.len() as f32;
@@ -138,6 +175,31 @@ pub fn forward(
     tokens: &[u32],
     pos_base: usize,
     logits_out: &mut [f32],
+) -> Result<(), ModelError> {
+    forward_with(
+        cfg,
+        weights,
+        kv,
+        tokens,
+        pos_base,
+        logits_out,
+        &DenseOptions::default(),
+    )
+}
+
+/// Dense forward over `tokens` starting at absolute position `pos_base`.
+///
+/// `logits_out` is `[tokens.len() × vocab_size]`; appends K/V to `kv`.
+/// Only the last position's logits are needed by callers, but computing all
+/// keeps prefill and decode on one path.
+pub fn forward_with(
+    cfg: &ModelConfig,
+    weights: &DenseWeights,
+    kv: &RwLock<KvStore>,
+    tokens: &[u32],
+    pos_base: usize,
+    logits_out: &mut [f32],
+    opts: &DenseOptions,
 ) -> Result<(), ModelError> {
     let d = cfg.d_model;
     let n_heads = cfg.n_heads;
@@ -189,10 +251,12 @@ pub fn forward(
             matvec(w_q, &n, &mut q)?;
             matvec(w_k, &n, &mut k)?;
             matvec(w_v, &n, &mut v)?;
-            apply_rope(&mut q, pos as u32, &rope)
-                .map_err(|e| ModelError::Forward(format!("rope: {e}")))?;
-            apply_rope(&mut k, pos as u32, &rope)
-                .map_err(|e| ModelError::Forward(format!("rope: {e}")))?;
+            if layer % opts.rope_stride == 0 {
+                apply_rope(&mut q, pos as u32, &rope)
+                    .map_err(|e| ModelError::Forward(format!("rope: {e}")))?;
+                apply_rope(&mut k, pos as u32, &rope)
+                    .map_err(|e| ModelError::Forward(format!("rope: {e}")))?;
+            }
 
             while kv.k.len() <= layer {
                 kv.k.push(Vec::new());
@@ -200,11 +264,26 @@ pub fn forward(
             }
             kv.k[layer].extend_from_slice(&k);
             kv.v[layer].extend_from_slice(&v);
-            let n_prev = kv.k[layer].len() / (n_kv_heads * head_dim);
+            // Sliding window: attend only to the trailing span.
+            let row_len = n_kv_heads * head_dim;
+            let n_prev = kv.k[layer].len() / row_len;
+            let (kk, vv) = match opts.sliding_window {
+                Some(w) if n_prev > w => {
+                    let skip = (n_prev - w) * row_len;
+                    (&kv.k[layer][skip..], &kv.v[layer][skip..])
+                }
+                _ => (kv.k[layer].as_slice(), kv.v[layer].as_slice()),
+            };
 
-            let attn_cfg = FlashAttnConfig::new(1, n_prev, n_heads, n_kv_heads, head_dim);
+            let attn_cfg = FlashAttnConfig::new(
+                1,
+                n_prev.min(opts.sliding_window.unwrap_or(n_prev)),
+                n_heads,
+                n_kv_heads,
+                head_dim,
+            );
             let mut attn_out = vec![0f32; n_heads * head_dim];
-            scalar_attention(&q, &kv.k[layer], &kv.v[layer], &mut attn_out, &attn_cfg)
+            scalar_attention(&q, kk, vv, &mut attn_out, &attn_cfg)
                 .map_err(|e| ModelError::Forward(format!("attn: {e}")))?;
             let mut proj = vec![0f32; d];
             matvec(w_o, &attn_out, &mut proj)?;
@@ -212,15 +291,18 @@ pub fn forward(
                 *h_i += p;
             }
 
-            // ffn block (SwiGLU)
+            // ffn block
             rmsnorm(&h, &w_ffn_norm.data, cfg.norm_eps, &mut n);
             let mut gate = vec![0f32; d_ffn];
             let mut up = vec![0f32; d_ffn];
             matvec(w_gate, &n, &mut gate)?;
             matvec(w_up, &n, &mut up)?;
             for (g, &u) in gate.iter_mut().zip(up.iter()) {
-                let s = *g / (1.0 + (-*g).exp());
-                *g = s * u;
+                let a = match opts.activation {
+                    Activation::SwiGlu => *g / (1.0 + (-*g).exp()),
+                    Activation::GeGlu => gelu(*g),
+                };
+                *g = a * u;
             }
             let mut down = vec![0f32; d];
             matvec(w_down, &gate, &mut down)?;
@@ -242,7 +324,7 @@ mod tests {
     use super::*;
     use spite_loader::GgufModel;
 
-    fn test_config() -> ModelConfig {
+    pub(crate) fn test_config() -> ModelConfig {
         ModelConfig {
             arch: "mistral4".into(),
             n_layers: 2,
@@ -286,5 +368,31 @@ mod tests {
         forward(&cfg, &weights, &kv3, &[2], 1, &mut step).unwrap();
         assert!(logits_a[..cfg.vocab_size] == pre[..]);
         assert!(logits_a[cfg.vocab_size..] == step[..]);
+    }
+}
+
+#[cfg(test)]
+mod options_tests {
+    use super::tests::test_config;
+    use super::*;
+    use spite_loader::GgufModel;
+
+    #[test]
+    fn geglu_windowed_stride_forward_is_finite() {
+        let tmp = spite_testkit::FakeGguf::default()
+            .write_to_tempfile()
+            .unwrap();
+        let model = GgufModel::open(tmp.path()).unwrap();
+        let weights = DenseWeights::load(&model).unwrap();
+        let kv = RwLock::new(KvStore::default());
+        let cfg = test_config();
+        let opts = DenseOptions {
+            activation: Activation::GeGlu,
+            sliding_window: Some(1),
+            rope_stride: 2,
+        };
+        let mut logits = vec![0f32; 2 * cfg.vocab_size];
+        forward_with(&cfg, &weights, &kv, &[1, 2], 0, &mut logits, &opts).unwrap();
+        assert!(logits.iter().all(|v| v.is_finite()));
     }
 }

@@ -64,6 +64,8 @@ pub struct ModelConfig {
     pub max_seq_len: usize,
     pub rope_theta: f32,
     pub norm_eps: f32,
+    /// Sliding-window span for local-attention archs. None = full attention.
+    pub sliding_window: Option<usize>,
 
     // ── RoPE scaling (YaRN / linear / NTK) ───────────────────────────────
     /// Multiplicative rope scale factor. 1.0 = no scaling (default).
@@ -112,6 +114,7 @@ impl Default for ModelConfig {
             max_seq_len: 4096,
             rope_theta: 10000.0,
             norm_eps: 1e-5,
+            sliding_window: None,
             rope_scale_factor: 1.0,
             rope_original_ctx: 0,
             yarn_beta_fast: 32.0,
@@ -134,6 +137,7 @@ impl From<spite_loader::config::ModelHyperparams> for ModelConfig {
             max_seq_len: h.max_seq_len.max(1) as usize,
             rope_theta: h.rope_theta,
             norm_eps: h.norm_eps,
+            sliding_window: (h.sliding_window > 0).then_some(h.sliding_window as usize),
             ..Default::default()
         }
     }

@@ -1274,6 +1274,7 @@ name = "spite"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "spite-abi",
  "spite-dispatch",
@@ -1283,8 +1284,10 @@ dependencies = [
  "spite-models",
  "spite-offload",
  "spite-sampling",
+ "spite-server",
  "spite-testkit",
  "spite-tokenizer",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

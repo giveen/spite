@@ -20,16 +20,28 @@
 //! - Sizes: 1B, 9B (2025)
 //! - Trained on multi-repo code (JetBrains internal crawl + permissive OSS)
 
-use crate::{ModelArch, ModelConfig, ModelError};
+use std::sync::RwLock;
+
 use spite_abi::SpiteCtx;
+use spite_loader::GgufModel;
+
+use crate::dense::{self, DenseWeights, KvStore};
+use crate::{ModelArch, ModelConfig, ModelError};
 
 pub struct Mellum {
     config: ModelConfig,
+    weights: Option<DenseWeights>,
+    // ponytail: RwLock, uncontended single-threaded use; sharded locks if parallel decode matters.
+    kv: RwLock<KvStore>,
 }
 
 impl Mellum {
     pub fn new(config: ModelConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            weights: None,
+            kv: RwLock::new(KvStore::default()),
+        }
     }
 }
 
@@ -38,15 +50,33 @@ impl ModelArch for Mellum {
         &self.config
     }
 
+    fn load_weights(&mut self, model: &GgufModel) -> Result<(), ModelError> {
+        self.weights = Some(DenseWeights::load(model)?);
+        Ok(())
+    }
+
+    fn reset_cache(&self) {
+        if let Ok(mut kv) = self.kv.write() {
+            kv.reset();
+        }
+    }
+
     fn forward(
         &self,
-        _tokens: &[u32],
-        _logits_out: &mut [f32],
-        _ctx: &SpiteCtx,
+        tokens: &[u32],
+        logits_out: &mut [f32],
+        ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
-        // TODO: standard Llama-style dense forward
-        //   FIM token handling is at the tokenizer / prompt assembly layer,
-        //   not in the forward pass itself.
-        Err(ModelError::Forward("not implemented".into()))
+        let Some(w) = &self.weights else {
+            return Err(ModelError::Forward("load_weights not called".into()));
+        };
+        dense::forward(
+            &self.config,
+            w,
+            &self.kv,
+            tokens,
+            ctx.pos as usize,
+            logits_out,
+        )
     }
 }

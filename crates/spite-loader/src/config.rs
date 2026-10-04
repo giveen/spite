@@ -34,6 +34,8 @@ pub struct ModelHyperparams {
     pub max_seq_len: u32,
     pub rope_theta: f32,
     pub norm_eps: f32,
+    /// Sliding-window span, if the arch uses local attention (0 = full).
+    pub sliding_window: u32,
 }
 
 impl ModelHyperparams {
@@ -87,6 +89,7 @@ impl ModelHyperparams {
             max_seq_len: u("context_length"),
             rope_theta,
             norm_eps,
+            sliding_window: u("attention.sliding_window"),
         }
     }
 
