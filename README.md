@@ -60,30 +60,6 @@ Then point any OpenAI-compatible app at `http://localhost:8080`.
 
 ---
 
-## Getting a model
-
-Models are distributed as `.gguf` files. The most common source is
-[Hugging Face](https://huggingface.co/models?library=gguf). Search for the
-model you want, filter by GGUF, and download a quantized version that fits
-your GPU's VRAM.
-
-| VRAM  | Recommended quant | Fits                                          | Size on disk |
-|-------|-------------------|-----------------------------------------------|--------------|
-| 4 GB  | Q4_K_M            | 7B — keep context short                       | 3.9 GB       |
-| 8 GB  | Q5_K_M            | 7B higher quality, or 13B at Q4_K_M           | 4.8 / 7.3 GB |
-| 12 GB | Q6_K              | 7B near-lossless, or 13B good quality         | 5.7 / 10.6 GB |
-| 16 GB | Q8_0              | 13B near-lossless, or 27B at Q3_K_M           | 13.8 / 11.8 GB |
-| 24 GB | Q5_K_M            | 27B (18.6 GB) or 34B at Q4_K_M (19.1 GB)     | 18.6 / 19.1 GB |
-| 32 GB | Q8_0              | 27B near-lossless (28.7 GB) or 70B at Q3_K_M (30.6 GB) | 28.7 / 30.6 GB |
-| 48 GB | Q4_K_M            | 70B (39.4 GB) with room for KV cache          | 39.4 GB      |
-| 80 GB+| Q8_0              | 70B near-lossless                             | 74.4 GB      |
-
-If you don't specify a quantization, spite uses your full GPU memory as
-efficiently as possible — automatically stepping down from f16 to Q8 to Q5
-to Q4 as it fills.
-
----
-
 ## Building GPU kernels
 
 The Rust host runs without GPU kernels (using the generic CPU fallback), but
