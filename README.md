@@ -13,7 +13,7 @@ engine adapts — not the other way around.
 - **One Engine** — a single Rust host that loads any GGUF model and runs it.
   No cloud required, no subscription, no data leaving your machine.
 - **Your Model** — any GGUF file works. Download a model once, run it forever.
-  Llama 3, Mistral, Phi-3, Qwen, DeepSeek — if it's a `.gguf`, spite loads it.
+  DeepSeek-R1, DeepSeek-V3, Qwen 2.5, Phi-4, Llama 3.3 — if it's a `.gguf`, spite loads it.
 - **Your Card** — kernels are written *for* specific GPUs, not against the lowest
   common denominator. RTX 3060, RX 7800 XT, Intel Arc, Apple M-series. If nobody
   has written a tuned kernel for your card yet, the generic fallback runs. When
@@ -47,12 +47,12 @@ cargo build --release
 
 # Run a model
 ./target/release/spite run \
-  --model ~/models/llama-3-8b-instruct.Q4_K_M.gguf \
+  --model ~/models/qwen2.5-7b-instruct.Q4_K_M.gguf \
   --prompt "What is the capital of France?"
 
 # Start an API server (OpenAI-compatible)
 ./target/release/spite-server \
-  --model ~/models/llama-3-8b-instruct.Q4_K_M.gguf \
+  --model ~/models/qwen2.5-7b-instruct.Q4_K_M.gguf \
   --port 8080
 ```
 
@@ -161,7 +161,7 @@ That sounds abstract, so here's what it means in practice:
 
 ### Every model is its own module
 
-Llama 3, Mistral, Phi-3, Qwen, DeepSeek — each lives in its own folder inside
+DeepSeek-R1, Qwen 2.5, Phi-4, Llama 3.3, Gemma 2 — each lives in its own folder inside
 `kernels/`. Adding a new model means adding a new folder. Nothing about the
 existing models changes. The dispatcher finds it automatically.
 
@@ -303,11 +303,14 @@ GPU-specific notes (tile sizes, WMMA shapes, memory layout):
 
 ## Supported models
 
-| Model     | Status   |
-|-----------|----------|
-| llama3    | template |
-| mistral   | template |
-| phi3      | template |
+| Model       | Status   |
+|-------------|----------|
+| deepseek_v3 | template |
+| deepseek_r1 | template |
+| qwen2.5     | template |
+| phi4        | template |
+| llama3.3    | template |
+| gemma2      | template |
 
 "Template" means the model layout and loader are wired up; kernel contributions
 welcome. Running any of these on the generic fallback works today.
