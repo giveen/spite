@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="screenshots/logo.png" alt="SPITE Logo" width="700" />
+</p>
+
 # spite
 
 **One Engine. Your Model. Your Card.**
