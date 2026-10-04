@@ -68,7 +68,7 @@ model you want, filter by GGUF, and download a quantized version that fits
 your GPU's VRAM.
 
 | VRAM  | Recommended quant | Fits                                          | Size on disk |
-|-------|-------------------|-----------------------------------------------|--|
+|-------|-------------------|-----------------------------------------------|--------------|
 | 4 GB  | Q4_K_M            | 7B — keep context short                       | 3.9 GB       |
 | 8 GB  | Q5_K_M            | 7B higher quality, or 13B at Q4_K_M           | 4.8 / 7.3 GB |
 | 12 GB | Q6_K              | 7B near-lossless, or 13B good quality         | 5.7 / 10.6 GB |
@@ -307,17 +307,113 @@ GPU-specific notes (tile sizes, WMMA shapes, memory layout):
 
 ## Supported models
 
-| Model       | Status   |
-|-------------|----------|
-| llama4      | template |
-| deepseek4   | template |
-| qwen35      | template |
-| mistral4    | template |
-| gemma3      | template |
-| glm5        | template |
+spite loads any `.gguf` file. The architectures below are wired into the
+dispatcher — model layout, tokenizer, and generic CPU fallback are all live.
+GPU kernel contributions are welcome for any row.
 
-"Template" means the model layout and loader are wired up; kernel contributions
-welcome. Running any of these on the generic fallback works today.
+### Meta
+| Model | Common sizes | Status |
+|---|---|---|
+| Llama 3.1 / 3.2 / 3.3 | 1B, 3B, 8B, 70B, 405B | template |
+| Llama 4 Scout | 17B×16E (109B total, MoE) | template |
+| Llama 4 Maverick | 17B×128E (400B total, MoE) | template |
+
+### Mistral AI
+| Model | Common sizes | Status |
+|---|---|---|
+| Mistral 7B v0.3 | 7B | template |
+| Mistral Small 3.1 / 3.2 | 24B | template |
+| Mistral Medium 3 | 123B | template |
+| Devstral Small | 24B | template |
+
+### Google
+| Model | Common sizes | Status |
+|---|---|---|
+| Gemma 3 | 1B, 4B, 12B, 27B | template |
+| Gemma 3n (edge) | E2B, E4B | template |
+| Gemma 4 | 4B, 12B, 27B | template |
+
+### Microsoft
+| Model | Common sizes | Status |
+|---|---|---|
+| Phi-3 Mini / Small / Medium | 3.8B, 7B, 14B | template |
+| Phi-4 | 14B | template |
+| Phi-4-mini | 3.8B | template |
+
+### Alibaba (Qwen)
+| Model | Common sizes | Status |
+|---|---|---|
+| Qwen3 | 0.6B, 1.7B, 4B, 8B, 14B, 32B | template |
+| Qwen3 MoE | 30B-A3B, 235B-A22B | template |
+| Qwen3.5 | 3B, 7B, 14B, 32B, 72B | template |
+| Qwen4 | 7B, 14B, 32B, 72B | template |
+| QwQ (reasoning) | 32B | template |
+
+### DeepSeek
+| Model | Common sizes | Status |
+|---|---|---|
+| DeepSeek-V3 | 671B (37B active, MoE) | template |
+| DeepSeek-V4 | 671B (37B active, MoE) | template |
+
+### NVIDIA
+| Model | Common sizes | Status |
+|---|---|---|
+| Nemotron | 8B, 51B, 340B | template |
+| Nemotron-H (hybrid) | 8B, 47B | template |
+
+### IBM
+| Model | Common sizes | Status |
+|---|---|---|
+| Granite 3.x hybrid (Mamba+Attn) | 2B, 3B, 8B | template |
+| Granite SWA / Switch (MoE) | 3B, 8B | template |
+
+### THUDM
+| Model | Common sizes | Status |
+|---|---|---|
+| GLM-4 | 9B | template |
+| GLM-4 MoE | — | template |
+| GLM-5 | 9B, 32B | template |
+
+### Tencent
+| Model | Common sizes | Status |
+|---|---|---|
+| Hunyuan-Dense | 0.5B, 7B | template |
+| Hunyuan-MoE | ~52B total, 8B active | template |
+
+### AI21 Labs
+| Model | Common sizes | Status |
+|---|---|---|
+| Jamba 1.6 (SSM+Attn hybrid) | 52B (12B active) | template |
+
+### Moonshot AI
+| Model | Common sizes | Status |
+|---|---|---|
+| Kimi K3 | — | template |
+
+### MiniMax
+| Model | Common sizes | Status |
+|---|---|---|
+| MiniMax Text-01 | 456B (45.9B active, MoE) | template |
+| MiniMax M2 / M3 | — | template |
+
+### Other architectures
+| Model | Key sizes | Status |
+|---|---|---|
+| Cohere Command R2 | 35B | template |
+| Falcon H1 (hybrid) | 1.5B, 7B, 34B | template |
+| OLMo 2 / OLMoE (AllenAI) | 1B, 7B, 13B | template |
+| MiniCPM-3 (OpenBMB) | 4B | template |
+| ERNIE 4.5 (Baidu) | 0.3B, 1.8B, 4B | template |
+| EXAONE 4.0 (LG AI Research) | 2.4B, 7.8B | template |
+| LFM-2 (Liquid AI) | 1.2B, 3.1B | template |
+| SmolLM3 (HuggingFace) | 3B | template |
+| PLaMo-2 (Preferred Networks) | 8B, 32B | template |
+| Mellum (JetBrains) | 4B | template |
+| GLM-DSA | — | template |
+| RWKV-7 / ARWKV-7 | 0.4B–7B | template |
+| Mamba 2 | 130M–2.8B | template |
+| ModernBERT | base (149M), large (395M) | template |
+| EAGLE-3 (speculative draft) | — | template |
 
 ---
 
