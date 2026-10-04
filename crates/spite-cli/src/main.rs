@@ -506,12 +506,31 @@ fn cmd_dispatch(model_args: &ModelArgs, hw: &HardwareArgs, feat: &FeatureArgs) -
 
 fn cmd_pull(model: &str, quant: &str) -> Result<()> {
     let dir = models_dir();
+    std::fs::create_dir_all(&dir)?;
     println!("models dir   : {}", dir.display());
     println!("model        : {model}");
     println!("quant        : {quant}");
-    println!("\n(download not yet implemented — contribute it!)");
-    println!("For now, download the .gguf manually and place it in:");
-    println!("  {}/{}.gguf", dir.display(), model.replace('/', "--"));
+
+    // Download the matching .gguf via the Hugging Face CLI. The quant name is
+    // matched as a substring of the file name (e.g. Q4_K_M -> *Q4_K_M*.gguf).
+    let include = if quant.is_empty() {
+        "*.gguf".to_string()
+    } else {
+        format!("*{quant}*.gguf")
+    };
+    println!("\nrunning: hf download {model} --include {include}");
+    let status = std::process::Command::new("hf")
+        .args(["download", model, "--include", &include, "--local-dir"])
+        .arg(&dir)
+        .status()?;
+
+    if !status.success() {
+        bail!(
+            "`hf download` failed. Is the hf CLI installed and authenticated? \
+             (https://huggingface.co/docs/hub/cli)"
+        );
+    }
+    println!("\nDownloaded to {}", dir.display());
     Ok(())
 }
 
