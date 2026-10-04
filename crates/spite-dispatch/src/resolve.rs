@@ -54,13 +54,16 @@ impl KernelSpec {
     /// Convenience constructor for callers that only know the GGUF arch string
     /// and GPU arch (no family/model split, no card/quant).
     /// Suitable for the CLI and server when no richer spec is available.
+    ///
+    /// The GGUF `general.architecture` string is translated to the kernel
+    /// tree's `<family>/<model>` directory pair via [`arch_to_family_model`],
+    /// so model-specific kernels are found when they exist; generic fallbacks
+    /// still apply when they don't.
     pub fn from_arch(model_arch: &str, gpu_arch: &str) -> Self {
-        // Use the arch string as a stand-in for both family and model so that
-        // model-specific kernels under kernels/<family>/<model>/ are found if
-        // they exist; generic fallbacks still apply when they don't.
+        let (family, model) = arch_to_family_model(model_arch);
         Self {
-            family:   model_arch.into(),
-            model:    model_arch.into(),
+            family,
+            model,
             gpu_arch: gpu_arch.into(),
             card_id:  String::new(),
             quant:    String::new(),
@@ -118,6 +121,130 @@ impl KernelSpec {
         paths.push(kernels_dir.join("_engine").join(feature).join("generic"));
         paths
     }
+}
+
+// ── GGUF arch → kernel tree mapping ────────────────────────────────────────
+
+/// Map a GGUF `general.architecture` string to the kernel tree's
+/// `<family>/<model>` directory pair.
+///
+/// The GGUF arch does not encode the kernel-tree family/variant split —
+/// `qwen35` lives in `kernels/qwen/qwen3_5/`, `deepseek4` in
+/// `kernels/deepseek/v4/`, and so on. This table is the single source of
+/// truth bridging model detection (`spite-models`) and kernel resolution.
+///
+/// Unknown architectures map to `(arch, arch)` so the generic fallback still
+/// applies.
+pub fn arch_to_family_model(arch: &str) -> (String, String) {
+    let (family, model) = match arch {
+        // ── Llama ────────────────────────────────────────────────────────
+        "llama" | "llama3" => ("llama", "llama3"),
+        "llama4"           => ("llama", "llama4"),
+
+        // ── Mistral ──────────────────────────────────────────────────────
+        "mistral"                      => ("mistral", "base"),
+        "mistral3"                     => ("mistral", "mistral3"),
+        "mistral4" | "magistral"       => ("mistral", "mistral4"),
+
+        // ── Phi ──────────────────────────────────────────────────────────
+        "phi3" => ("phi", "phi3"),
+        "phi4" => ("phi", "phi4"),
+
+        // ── Qwen ─────────────────────────────────────────────────────────
+        "qwen3"                  => ("qwen", "qwen3"),
+        "qwen3moe"               => ("qwen", "qwen3_moe"),
+        "qwen3next" | "qwq"      => ("qwen", "qwq"),
+        "qwen35" | "qwen35moe"   => ("qwen", "qwen3_5"),
+        "qwen3vl"                => ("qwen", "qwen3_vl"),
+        "qwen4" | "qwen4exp"     => ("qwen", "qwen4"),
+
+        // ── DeepSeek ─────────────────────────────────────────────────────
+        "deepseek2" | "deepseek32" => ("deepseek", "v3"),
+        "deepseek4"                => ("deepseek", "v4"),
+
+        // ── Gemma ────────────────────────────────────────────────────────
+        "gemma3"  => ("gemma", "gemma3"),
+        "gemma3n" => ("gemma", "gemma3n"),
+        "gemma4"  => ("gemma", "gemma4"),
+
+        // ── Falcon ───────────────────────────────────────────────────────
+        "falcon-h1" => ("falcon", "h1"),
+
+        // ── RWKV ─────────────────────────────────────────────────────────
+        "rwkv7"  => ("rwkv", "v7"),
+        "arwkv7" => ("rwkv", "arwkv7"),
+
+        // ── Mamba ────────────────────────────────────────────────────────
+        "mamba2" => ("mamba", "mamba2"),
+
+        // ── GLM ──────────────────────────────────────────────────────────
+        "glm4"                   => ("glm", "glm4"),
+        "glm4moe"                => ("glm", "glm4_moe"),
+        "glm-dsa"                => ("glm", "glm_dsa"),
+        "glm5" | "glm5-next"     => ("glm", "glm5"),
+
+        // ── Granite ──────────────────────────────────────────────────────
+        "granitehybrid" => ("granite", "hybrid"),
+        "graniteswitch" => ("granite", "switch"),
+        "granite_swa"   => ("granite", "swa"),
+
+        // ── Nemotron ─────────────────────────────────────────────────────
+        "nemotron"   => ("nemotron", "nemotron"),
+        "nemotron_h" => ("nemotron", "h"),
+
+        // ── OLMo ─────────────────────────────────────────────────────────
+        "olmo2" => ("olmo", "olmo2"),
+        "olmoe" => ("olmo", "olmoe"),
+
+        // ── Jamba ────────────────────────────────────────────────────────
+        "jamba" => ("jamba", "v1"),
+
+        // ── MiniMax ──────────────────────────────────────────────────────
+        "minimax-01" => ("minimax", "text01"),
+        "minimax-m2" => ("minimax", "m2"),
+        "minimax-m3" => ("minimax", "m3"),
+
+        // ── Encoder / embedding ──────────────────────────────────────────
+        "modern-bert" => ("modern_bert", "base"),
+
+        // ── Cohere ───────────────────────────────────────────────────────
+        "cohere2" | "cohere2moe" => ("cohere", "command_r2"),
+
+        // ── ExaOne ───────────────────────────────────────────────────────
+        "exaone4" | "exaone-moe" => ("exaone", "exaone4"),
+
+        // ── Hunyuan ──────────────────────────────────────────────────────
+        "hunyuan-dense" => ("hunyuan", "dense"),
+        "hunyuan-moe"   => ("hunyuan", "moe"),
+
+        // ── ERNIE ────────────────────────────────────────────────────────
+        "ernie4_5" | "ernie4_5-moe" => ("ernie", "ernie4_5"),
+
+        // ── LFM ──────────────────────────────────────────────────────────
+        "lfm2" | "lfm2moe" => ("lfm", "lfm2"),
+
+        // ── Kimi ─────────────────────────────────────────────────────────
+        "kimi-k3" => ("kimi", "k3"),
+
+        // ── SmolLM ───────────────────────────────────────────────────────
+        "smollm3" => ("smollm", "smollm3"),
+
+        // ── MiniCPM ──────────────────────────────────────────────────────
+        "minicpm3" => ("minicpm", "minicpm3"),
+
+        // ── PLaMo ────────────────────────────────────────────────────────
+        "plamo2" | "plamo3" => ("plamo", "plamo2"),
+
+        // ── Draft / speculative ──────────────────────────────────────────
+        "eagle3" => ("eagle", "eagle3"),
+
+        // ── Code completion ──────────────────────────────────────────────
+        "mellum" => ("mellum", "base"),
+
+        // Unknown arch: keep the old behaviour so generic fallback applies.
+        _ => (arch, arch),
+    };
+    (family.to_owned(), model.to_owned())
 }
 
 // ── Card detection ─────────────────────────────────────────────────────────
@@ -243,6 +370,28 @@ mod tests {
         let c = spec.engine_candidates("speculative", &root);
         assert_eq!(c[0], PathBuf::from("/k/_engine/speculative/sm_89"));
         assert_eq!(c[1], PathBuf::from("/k/_engine/speculative/generic"));
+    }
+
+    #[test]
+    fn arch_maps_to_family_model() {
+        assert_eq!(arch_to_family_model("qwen35"),   ("qwen".into(),     "qwen3_5".into()));
+        assert_eq!(arch_to_family_model("llama"),    ("llama".into(),    "llama3".into()));
+        assert_eq!(arch_to_family_model("llama4"),   ("llama".into(),    "llama4".into()));
+        assert_eq!(arch_to_family_model("deepseek4"),("deepseek".into(), "v4".into()));
+        assert_eq!(arch_to_family_model("gemma4"),   ("gemma".into(),    "gemma4".into()));
+        assert_eq!(arch_to_family_model("glm5-next"),("glm".into(),      "glm5".into()));
+        // Unknown arch falls back to (arch, arch) so generic still applies.
+        assert_eq!(arch_to_family_model("mystery"),  ("mystery".into(),  "mystery".into()));
+    }
+
+    #[test]
+    fn from_arch_resolves_nested_dir() {
+        let root = PathBuf::from("/k");
+        let c = KernelSpec::from_arch("qwen35", "sm_120").model_candidates(&root);
+        assert_eq!(c[0], PathBuf::from("/k/qwen/qwen3_5/sm_120"));
+        // Unknown arch keeps the flat (family == model == arch) layout.
+        let c = KernelSpec::from_arch("mystery", "sm_120").model_candidates(&root);
+        assert_eq!(c[0], PathBuf::from("/k/mystery/mystery/sm_120"));
     }
 
     #[test]

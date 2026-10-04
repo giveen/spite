@@ -166,13 +166,8 @@ impl MultiGpuSpec {
         kernels_dir: &Path,
     ) -> Vec<Result<DispatchTable, DispatchError>> {
         self.nodes.iter().map(|node| {
-            let spec = KernelSpec {
-                family:   model_arch.into(),
-                model:    model_arch.into(),
-                gpu_arch: node.gpu_arch.clone(),
-                card_id:  node.card_id.clone(),
-                quant:    String::new(),
-            };
+            let mut spec = KernelSpec::from_arch(model_arch, &node.gpu_arch);
+            spec.card_id = node.card_id.clone();
             DispatchBuilder::new(kernels_dir, spec).build()
         }).collect()
     }
