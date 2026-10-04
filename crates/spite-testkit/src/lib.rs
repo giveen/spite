@@ -12,7 +12,7 @@
 //! ```rust,ignore
 //! let gguf = FakeGguf::default().write_to_tempfile();
 //! let model = GgufModel::open(gguf.path()).unwrap();
-//! assert_eq!(model.arch(), "llama");
+//! assert_eq!(model.arch(), "llama4");
 //! ```
 
 use std::io;
@@ -22,7 +22,7 @@ use tempfile::NamedTempFile;
 
 // ── GGUF binary constants (must match spite-loader) ────────────────────────
 
-const GGUF_MAGIC:   u32 = 0x46554747; // b"GGUF" little-endian
+const GGUF_MAGIC: u32 = 0x46554747; // b"GGUF" little-endian
 const GGUF_VERSION: u32 = 3;
 
 // value type tags
@@ -47,31 +47,31 @@ const ALIGNMENT: usize = 32;
 /// it passes every loader check — but weight tensors contain zeros.
 #[derive(Debug, Clone)]
 pub struct FakeGguf {
-    pub arch:        String,
-    pub n_layers:    u32,
-    pub n_heads:     u32,
-    pub n_kv_heads:  u32,
-    pub d_model:     u32,
-    pub d_ffn:       u32,
-    pub vocab_size:  u32,
+    pub arch: String,
+    pub n_layers: u32,
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub d_model: u32,
+    pub d_ffn: u32,
+    pub vocab_size: u32,
     pub max_seq_len: u32,
-    pub rope_theta:  f32,
-    pub norm_eps:    f32,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
 }
 
 impl Default for FakeGguf {
     fn default() -> Self {
         Self {
-            arch:        "llama".to_string(),
-            n_layers:    2,
-            n_heads:     2,
-            n_kv_heads:  2,
-            d_model:     64,
-            d_ffn:       128,
-            vocab_size:  32,
+            arch: "llama4".to_string(),
+            n_layers: 2,
+            n_heads: 2,
+            n_kv_heads: 2,
+            d_model: 64,
+            d_ffn: 128,
+            vocab_size: 32,
             max_seq_len: 512,
-            rope_theta:  10_000.0,
-            norm_eps:    1e-5,
+            rope_theta: 10_000.0,
+            norm_eps: 1e-5,
         }
     }
 }
@@ -85,9 +85,7 @@ impl FakeGguf {
 
     /// Write to a named temp file; the file is deleted when dropped.
     pub fn write_to_tempfile(&self) -> io::Result<NamedTempFile> {
-        let tmp = tempfile::Builder::new()
-            .suffix(".gguf")
-            .tempfile()?;
+        let tmp = tempfile::Builder::new().suffix(".gguf").tempfile()?;
         self.write(tmp.path())?;
         Ok(tmp)
     }
@@ -96,7 +94,7 @@ impl FakeGguf {
 
     pub fn encode(&self) -> Vec<u8> {
         let tensors = self.tensor_list();
-        let kvs     = self.kv_list();
+        let kvs = self.kv_list();
 
         let mut buf = Vec::with_capacity(4096);
 
@@ -110,9 +108,18 @@ impl FakeGguf {
         for (key, val) in &kvs {
             push_str(&mut buf, key);
             match val {
-                Kv::U32(v) => { push_u32(&mut buf, VTYPE_U32); push_u32(&mut buf, *v); }
-                Kv::F32(v) => { push_u32(&mut buf, VTYPE_F32); push_f32(&mut buf, *v); }
-                Kv::Str(s) => { push_u32(&mut buf, VTYPE_STR); push_str(&mut buf, s); }
+                Kv::U32(v) => {
+                    push_u32(&mut buf, VTYPE_U32);
+                    push_u32(&mut buf, *v);
+                }
+                Kv::F32(v) => {
+                    push_u32(&mut buf, VTYPE_F32);
+                    push_f32(&mut buf, *v);
+                }
+                Kv::Str(s) => {
+                    push_u32(&mut buf, VTYPE_STR);
+                    push_str(&mut buf, s);
+                }
             }
         }
 
@@ -149,41 +156,50 @@ impl FakeGguf {
     fn kv_list(&self) -> Vec<(String, Kv)> {
         let a = &self.arch;
         vec![
-            ("general.architecture".into(),                         Kv::Str(a.clone())),
-            (format!("{a}.block_count"),                            Kv::U32(self.n_layers)),
-            (format!("{a}.embedding_length"),                       Kv::U32(self.d_model)),
-            (format!("{a}.attention.head_count"),                   Kv::U32(self.n_heads)),
-            (format!("{a}.attention.head_count_kv"),                Kv::U32(self.n_kv_heads)),
-            (format!("{a}.feed_forward_length"),                    Kv::U32(self.d_ffn)),
-            (format!("{a}.context_length"),                         Kv::U32(self.max_seq_len)),
-            (format!("{a}.rope.freq_base"),                         Kv::F32(self.rope_theta)),
-            (format!("{a}.attention.layer_norm_rms_epsilon"),       Kv::F32(self.norm_eps)),
-            ("tokenizer.ggml.token_count".into(),                   Kv::U32(self.vocab_size)),
+            ("general.architecture".into(), Kv::Str(a.clone())),
+            (format!("{a}.block_count"), Kv::U32(self.n_layers)),
+            (format!("{a}.embedding_length"), Kv::U32(self.d_model)),
+            (format!("{a}.attention.head_count"), Kv::U32(self.n_heads)),
+            (
+                format!("{a}.attention.head_count_kv"),
+                Kv::U32(self.n_kv_heads),
+            ),
+            (format!("{a}.feed_forward_length"), Kv::U32(self.d_ffn)),
+            (format!("{a}.context_length"), Kv::U32(self.max_seq_len)),
+            (format!("{a}.rope.freq_base"), Kv::F32(self.rope_theta)),
+            (
+                format!("{a}.attention.layer_norm_rms_epsilon"),
+                Kv::F32(self.norm_eps),
+            ),
+            (
+                "tokenizer.ggml.token_count".into(),
+                Kv::U32(self.vocab_size),
+            ),
         ]
     }
 
     fn tensor_list(&self) -> Vec<Tensor> {
-        let d  = self.d_model as u64;
-        let ff = self.d_ffn   as u64;
-        let v  = self.vocab_size as u64;
+        let d = self.d_model as u64;
+        let ff = self.d_ffn as u64;
+        let v = self.vocab_size as u64;
 
         let mut t = vec![
-            Tensor::new("token_embd.weight",   vec![d, v]),
-            Tensor::new("output_norm.weight",  vec![d]),
-            Tensor::new("output.weight",       vec![d, v]),
+            Tensor::new("token_embd.weight", vec![d, v]),
+            Tensor::new("output_norm.weight", vec![d]),
+            Tensor::new("output.weight", vec![d, v]),
         ];
 
         for i in 0..self.n_layers {
             let b = format!("blk.{i}");
-            t.push(Tensor::new(format!("{b}.attn_norm.weight"),    vec![d]));
-            t.push(Tensor::new(format!("{b}.ffn_norm.weight"),     vec![d]));
-            t.push(Tensor::new(format!("{b}.attn_q.weight"),       vec![d, d]));
-            t.push(Tensor::new(format!("{b}.attn_k.weight"),       vec![d, d]));
-            t.push(Tensor::new(format!("{b}.attn_v.weight"),       vec![d, d]));
-            t.push(Tensor::new(format!("{b}.attn_output.weight"),  vec![d, d]));
-            t.push(Tensor::new(format!("{b}.ffn_gate.weight"),     vec![ff, d]));
-            t.push(Tensor::new(format!("{b}.ffn_up.weight"),       vec![ff, d]));
-            t.push(Tensor::new(format!("{b}.ffn_down.weight"),     vec![d, ff]));
+            t.push(Tensor::new(format!("{b}.attn_norm.weight"), vec![d]));
+            t.push(Tensor::new(format!("{b}.ffn_norm.weight"), vec![d]));
+            t.push(Tensor::new(format!("{b}.attn_q.weight"), vec![d, d]));
+            t.push(Tensor::new(format!("{b}.attn_k.weight"), vec![d, d]));
+            t.push(Tensor::new(format!("{b}.attn_v.weight"), vec![d, d]));
+            t.push(Tensor::new(format!("{b}.attn_output.weight"), vec![d, d]));
+            t.push(Tensor::new(format!("{b}.ffn_gate.weight"), vec![ff, d]));
+            t.push(Tensor::new(format!("{b}.ffn_up.weight"), vec![ff, d]));
+            t.push(Tensor::new(format!("{b}.ffn_down.weight"), vec![d, ff]));
         }
 
         t
@@ -192,13 +208,23 @@ impl FakeGguf {
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
-enum Kv { U32(u32), F32(f32), Str(String) }
+enum Kv {
+    U32(u32),
+    F32(f32),
+    Str(String),
+}
 
-struct Tensor { name: String, dims: Vec<u64> }
+struct Tensor {
+    name: String,
+    dims: Vec<u64>,
+}
 
 impl Tensor {
     fn new(name: impl Into<String>, dims: Vec<u64>) -> Self {
-        Self { name: name.into(), dims }
+        Self {
+            name: name.into(),
+            dims,
+        }
     }
 
     fn byte_size(&self) -> u64 {
@@ -206,9 +232,15 @@ impl Tensor {
     }
 }
 
-fn push_u32(buf: &mut Vec<u8>, v: u32) { buf.extend_from_slice(&v.to_le_bytes()); }
-fn push_u64(buf: &mut Vec<u8>, v: u64) { buf.extend_from_slice(&v.to_le_bytes()); }
-fn push_f32(buf: &mut Vec<u8>, v: f32) { buf.extend_from_slice(&v.to_le_bytes()); }
+fn push_u32(buf: &mut Vec<u8>, v: u32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn push_u64(buf: &mut Vec<u8>, v: u64) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+fn push_f32(buf: &mut Vec<u8>, v: f32) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
 fn push_str(buf: &mut Vec<u8>, s: &str) {
     push_u64(buf, s.len() as u64);
     buf.extend_from_slice(s.as_bytes());
@@ -225,16 +257,20 @@ mod tests {
     fn roundtrip_default() {
         let tmp = FakeGguf::default().write_to_tempfile().unwrap();
         let model = GgufModel::open(tmp.path()).expect("loader should accept fake GGUF");
-        assert_eq!(model.arch(), "llama");
-        assert_eq!(model.get_u32("llama.block_count"), Some(2));
-        assert_eq!(model.get_u32("llama.embedding_length"), Some(64));
-        assert_eq!(model.get_u32("llama.attention.head_count"), Some(2));
+        assert_eq!(model.arch(), "llama4");
+        assert_eq!(model.get_u32("llama4.block_count"), Some(2));
+        assert_eq!(model.get_u32("llama4.embedding_length"), Some(64));
+        assert_eq!(model.get_u32("llama4.attention.head_count"), Some(2));
         assert_eq!(model.get_u32("tokenizer.ggml.token_count"), Some(32));
     }
 
     #[test]
     fn roundtrip_custom_arch() {
-        let fake = FakeGguf { arch: "mistral".to_string(), n_layers: 4, ..Default::default() };
+        let fake = FakeGguf {
+            arch: "mistral".to_string(),
+            n_layers: 4,
+            ..Default::default()
+        };
         let tmp = fake.write_to_tempfile().unwrap();
         let model = GgufModel::open(tmp.path()).unwrap();
         assert_eq!(model.arch(), "mistral");
@@ -254,7 +290,10 @@ mod tests {
 
     #[test]
     fn tensor_count_matches() {
-        let fake = FakeGguf { n_layers: 2, ..Default::default() };
+        let fake = FakeGguf {
+            n_layers: 2,
+            ..Default::default()
+        };
         let tmp = fake.write_to_tempfile().unwrap();
         let model = GgufModel::open(tmp.path()).unwrap();
         // 3 global + 9 per layer × 2 layers = 21

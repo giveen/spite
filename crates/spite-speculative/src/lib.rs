@@ -36,9 +36,9 @@
 //! `Eagle`      — draft model trained to match main model's feature space.
 //!                More accurate draft; requires paired model weights.
 
-pub mod verify;
 pub mod draft;
 pub mod tree;
+pub mod verify;
 
 use spite_abi::SpiteModelCaps;
 use spite_dispatch::DispatchTable;
@@ -77,10 +77,10 @@ pub enum SpecStrategy {
 /// A live speculative decoding session.
 /// Holds both dispatch tables and the accept/reject state.
 pub struct SpecSession {
-    pub strategy:       SpecStrategy,
+    pub strategy: SpecStrategy,
     pub n_draft_tokens: u32,
     // Both dispatch tables stay alive for the session duration.
-    pub main_dispatch:  DispatchTable,
+    pub main_dispatch: DispatchTable,
     pub draft_dispatch: Option<DispatchTable>, // None for Medusa
 }
 
@@ -91,13 +91,13 @@ impl SpecSession {
     /// has `max_draft_tokens == 0` — the caller should fall back to
     /// regular autoregressive decoding rather than hard-failing.
     pub fn new(
-        main_caps:      &SpiteModelCaps,
-        main_dispatch:  DispatchTable,
-        draft_caps:     Option<&SpiteModelCaps>,
+        main_caps: &SpiteModelCaps,
+        main_dispatch: DispatchTable,
+        draft_caps: Option<&SpiteModelCaps>,
         draft_dispatch: Option<DispatchTable>,
-        draft_arch:     Option<&str>,
+        draft_arch: Option<&str>,
         n_draft_tokens: u32,
-        strategy:       SpecStrategy,
+        strategy: SpecStrategy,
     ) -> Result<Self, SpeculativeError> {
         if !main_caps.supports_speculative() {
             return Err(SpeculativeError::MainNotSupported);
@@ -105,7 +105,7 @@ impl SpecSession {
         if n_draft_tokens > main_caps.max_draft_tokens {
             return Err(SpeculativeError::TooManyDraftTokens {
                 requested: n_draft_tokens,
-                max:       main_caps.max_draft_tokens,
+                max: main_caps.max_draft_tokens,
             });
         }
 
@@ -115,12 +115,12 @@ impl SpecSession {
                 return Err(SpeculativeError::DraftNotSupported);
             }
             // Check compatibility
-            if let Some(arch) = draft_arch {
-                if !main_caps_allows_draft(main_caps, arch) {
-                    return Err(SpeculativeError::IncompatibleDraft {
-                        draft: arch.to_owned(),
-                    });
-                }
+            if let Some(arch) = draft_arch
+                && !main_caps_allows_draft(main_caps, arch)
+            {
+                return Err(SpeculativeError::IncompatibleDraft {
+                    draft: arch.to_owned(),
+                });
             }
         }
 
@@ -139,7 +139,7 @@ impl SpecSession {
     pub fn step(
         &mut self,
         _context: &[u32],
-        _output:  &mut Vec<u32>,
+        _output: &mut Vec<u32>,
     ) -> Result<usize, SpeculativeError> {
         // TODO:
         // 1. draft::run_draft  → draft_logits [n_draft, vocab]
@@ -156,13 +156,17 @@ impl SpecSession {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn main_caps_allows_draft(caps: &SpiteModelCaps, draft_arch: &str) -> bool {
-    if caps.draft_archs.is_null() { return false; }
+    if caps.draft_archs.is_null() {
+        return false;
+    }
     // Walk the null-terminated array of C strings
     unsafe {
         let mut ptr = caps.draft_archs;
         while !(*ptr).is_null() {
             let s = std::ffi::CStr::from_ptr(*ptr).to_str().unwrap_or("");
-            if s == draft_arch { return true; }
+            if s == draft_arch {
+                return true;
+            }
             ptr = ptr.add(1);
         }
     }

@@ -58,18 +58,18 @@ pub enum MemoryTier {
 impl MemoryTier {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Vram      => "VRAM",
+            Self::Vram => "VRAM",
             Self::SystemRam => "RAM",
-            Self::Disk      => "disk (mmap)",
+            Self::Disk => "disk (mmap)",
         }
     }
 
     /// Conservative peak bandwidth for planning (GB/s).
     pub fn bandwidth_gbs(self) -> f32 {
         match self {
-            Self::Vram      => 900.0,
+            Self::Vram => 900.0,
             Self::SystemRam => 100.0,
-            Self::Disk      =>   7.0,
+            Self::Disk => 7.0,
         }
     }
 }
@@ -104,10 +104,10 @@ impl Default for OffloadConfig {
     fn default() -> Self {
         Self {
             vram_reserved_bytes: 2 * GIB,
-            ram_budget_bytes:    u64::MAX,
-            prefetch_ahead:      1,
-            madvise_sequential:  true,
-            mlock_ram_weights:   false,
+            ram_budget_bytes: u64::MAX,
+            prefetch_ahead: 1,
+            madvise_sequential: true,
+            mlock_ram_weights: false,
         }
     }
 }
@@ -153,8 +153,8 @@ pub struct VisionSpec {
 /// Resolved placement for the vision encoder component.
 #[derive(Debug, Clone)]
 pub struct VisionEncoderPlacement {
-    pub tier:                MemoryTier,
-    pub encoder_bytes:       u64,
+    pub tier: MemoryTier,
+    pub encoder_bytes: u64,
     /// When `true` the encoder is evicted back to its storage tier after
     /// each image prefill, freeing VRAM for the backbone decode loop.
     pub evict_after_prefill: bool,
@@ -163,8 +163,8 @@ pub struct VisionEncoderPlacement {
 impl VisionEncoderPlacement {
     fn resolve(spec: &VisionSpec, vram_remaining: u64, ram_bytes: u64) -> Self {
         let tier = match spec.policy {
-            VisionOffloadPolicy::PinVram   => MemoryTier::Vram,
-            VisionOffloadPolicy::PinRam    => MemoryTier::SystemRam,
+            VisionOffloadPolicy::PinVram => MemoryTier::Vram,
+            VisionOffloadPolicy::PinRam => MemoryTier::SystemRam,
             VisionOffloadPolicy::StreamDisk => MemoryTier::Disk,
             VisionOffloadPolicy::Auto => {
                 if vram_remaining >= spec.encoder_bytes {
@@ -177,11 +177,19 @@ impl VisionEncoderPlacement {
             }
         };
         let evict_after_prefill = tier != MemoryTier::Vram;
-        Self { tier, encoder_bytes: spec.encoder_bytes, evict_after_prefill }
+        Self {
+            tier,
+            encoder_bytes: spec.encoder_bytes,
+            evict_after_prefill,
+        }
     }
 
     pub fn print_summary(&self) {
-        let evict = if self.evict_after_prefill { " (evict after prefill)" } else { " (resident)" };
+        let evict = if self.evict_after_prefill {
+            " (evict after prefill)"
+        } else {
+            " (resident)"
+        };
         println!(
             "  vision enc : {}  (~{:.1} GiB{})",
             self.tier.label(),
@@ -201,12 +209,12 @@ impl VisionEncoderPlacement {
 /// `vision` is `Some` when the model has a vision encoder.
 #[derive(Debug, Clone)]
 pub struct TieredPlacement {
-    pub placements:    Vec<LayerPlacement>,
+    pub placements: Vec<LayerPlacement>,
     pub n_vram_layers: usize,
-    pub n_ram_layers:  usize,
+    pub n_ram_layers: usize,
     pub n_disk_layers: usize,
     /// Resolved placement for the vision encoder, if present.
-    pub vision:        Option<VisionEncoderPlacement>,
+    pub vision: Option<VisionEncoderPlacement>,
 }
 
 #[derive(Debug, Error)]
@@ -225,12 +233,12 @@ impl TieredPlacement {
     /// - `cfg`: offload policy (reserves, mlock, etc.)
     /// - `vision`: optional vision encoder spec; `None` for text-only models
     pub fn plan(
-        vram_bytes:      u64,
-        ram_bytes:       u64,
+        vram_bytes: u64,
+        ram_bytes: u64,
         bytes_per_layer: u64,
-        n_layers:        usize,
-        cfg:             &OffloadConfig,
-        vision:          Option<&VisionSpec>,
+        n_layers: usize,
+        cfg: &OffloadConfig,
+        vision: Option<&VisionSpec>,
     ) -> Result<Self, OffloadError> {
         if bytes_per_layer == 0 {
             return Err(OffloadError::ZeroBytesPerLayer);
@@ -246,23 +254,34 @@ impl TieredPlacement {
         let n_disk = remaining - n_ram;
 
         let mut placements = Vec::with_capacity(n_layers);
-        for _ in 0..n_vram  { placements.push(LayerPlacement { tier: MemoryTier::Vram }); }
-        for _ in 0..n_ram   { placements.push(LayerPlacement { tier: MemoryTier::SystemRam }); }
-        for _ in 0..n_disk  { placements.push(LayerPlacement { tier: MemoryTier::Disk }); }
+        for _ in 0..n_vram {
+            placements.push(LayerPlacement {
+                tier: MemoryTier::Vram,
+            });
+        }
+        for _ in 0..n_ram {
+            placements.push(LayerPlacement {
+                tier: MemoryTier::SystemRam,
+            });
+        }
+        for _ in 0..n_disk {
+            placements.push(LayerPlacement {
+                tier: MemoryTier::Disk,
+            });
+        }
 
         // Place vision encoder in remaining VRAM budget after backbone layers.
         let vram_used_by_backbone = n_vram as u64 * bytes_per_layer;
         let vram_remaining = usable_vram.saturating_sub(vram_used_by_backbone);
-        let vision_placement = vision.map(|v| {
-            VisionEncoderPlacement::resolve(v, vram_remaining, ram_bytes)
-        });
+        let vision_placement =
+            vision.map(|v| VisionEncoderPlacement::resolve(v, vram_remaining, ram_bytes));
 
         Ok(Self {
             placements,
             n_vram_layers: n_vram,
-            n_ram_layers:  n_ram,
+            n_ram_layers: n_ram,
             n_disk_layers: n_disk,
-            vision:        vision_placement,
+            vision: vision_placement,
         })
     }
 
@@ -271,7 +290,11 @@ impl TieredPlacement {
         let total = self.placements.len();
         println!("memory tiers : {} layers total", total);
 
-        let vram_s = if vram_gib > 0 { format!("{} GiB VRAM", vram_gib) } else { "shared VRAM".into() };
+        let vram_s = if vram_gib > 0 {
+            format!("{} GiB VRAM", vram_gib)
+        } else {
+            "shared VRAM".into()
+        };
         if self.n_vram_layers > 0 {
             println!(
                 "  VRAM      : layers 0–{}  ({}, ~{} GiB weights)",
@@ -327,7 +350,9 @@ impl TieredPlacement {
 /// Estimate bytes-per-layer for a model given its total parameter count
 /// and an average bits-per-weight (e.g. 4.5 for Q4_K_M).
 pub fn bytes_per_layer_estimate(total_params: u64, bits_per_weight: f32, n_layers: usize) -> u64 {
-    if n_layers == 0 { return 0; }
+    if n_layers == 0 {
+        return 0;
+    }
     let total_bytes = (total_params as f32 * bits_per_weight / 8.0) as u64;
     total_bytes / n_layers as u64
 }
@@ -344,11 +369,17 @@ mod tests {
     fn all_fits_in_vram() {
         // 24 GiB VRAM, tiny model
         let plan = TieredPlacement::plan(
-            24 * GIB, 64 * GIB, 500 * MIB, 10, &OffloadConfig::default(), None,
-        ).unwrap();
+            24 * GIB,
+            64 * GIB,
+            500 * MIB,
+            10,
+            &OffloadConfig::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.n_vram_layers, 10);
-        assert_eq!(plan.n_ram_layers,   0);
-        assert_eq!(plan.n_disk_layers,  0);
+        assert_eq!(plan.n_ram_layers, 0);
+        assert_eq!(plan.n_disk_layers, 0);
         assert!(!plan.has_offload());
     }
 
@@ -357,11 +388,17 @@ mod tests {
         // 8 GiB VRAM (2 GiB reserved → 6 usable), 500 MiB/layer
         // 6 GiB / 0.5 GiB = 12 layers in VRAM; remaining 68 in RAM
         let plan = TieredPlacement::plan(
-            8 * GIB, 2048 * GIB, 500 * MIB, 80, &OffloadConfig::default(), None,
-        ).unwrap();
+            8 * GIB,
+            2048 * GIB,
+            500 * MIB,
+            80,
+            &OffloadConfig::default(),
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.n_vram_layers, 12);
-        assert_eq!(plan.n_ram_layers,  68);
-        assert_eq!(plan.n_disk_layers,  0);
+        assert_eq!(plan.n_ram_layers, 68);
+        assert_eq!(plan.n_disk_layers, 0);
         assert!(plan.has_offload());
         assert!(!plan.has_disk_tier());
     }
@@ -369,12 +406,13 @@ mod tests {
     #[test]
     fn ram_overflow_into_disk() {
         // 8 GiB VRAM, only 4 GiB RAM budget, 500 MiB/layer, 80 layers
-        let cfg = OffloadConfig { ram_budget_bytes: 4 * GIB, ..Default::default() };
-        let plan = TieredPlacement::plan(
-            8 * GIB, 4 * GIB, 500 * MIB, 80, &cfg, None,
-        ).unwrap();
+        let cfg = OffloadConfig {
+            ram_budget_bytes: 4 * GIB,
+            ..Default::default()
+        };
+        let plan = TieredPlacement::plan(8 * GIB, 4 * GIB, 500 * MIB, 80, &cfg, None).unwrap();
         assert_eq!(plan.n_vram_layers, 12);
-        assert_eq!(plan.n_ram_layers,   8); // 4 GiB / 0.5 GiB
+        assert_eq!(plan.n_ram_layers, 8); // 4 GiB / 0.5 GiB
         assert_eq!(plan.n_disk_layers, 60);
         assert!(plan.has_disk_tier());
     }
@@ -382,17 +420,18 @@ mod tests {
     #[test]
     fn zero_vram_all_ram() {
         // Apple Silicon: vram_gib=0 → vram_bytes=0, everything in RAM
-        let plan = TieredPlacement::plan(
-            0, 128 * GIB, 500 * MIB, 32, &OffloadConfig::default(), None,
-        ).unwrap();
-        assert_eq!(plan.n_vram_layers,  0);
-        assert_eq!(plan.n_ram_layers,  32);
-        assert_eq!(plan.n_disk_layers,  0);
+        let plan =
+            TieredPlacement::plan(0, 128 * GIB, 500 * MIB, 32, &OffloadConfig::default(), None)
+                .unwrap();
+        assert_eq!(plan.n_vram_layers, 0);
+        assert_eq!(plan.n_ram_layers, 32);
+        assert_eq!(plan.n_disk_layers, 0);
     }
 
     #[test]
     fn zero_bytes_per_layer_errors() {
-        let result = TieredPlacement::plan(8 * GIB, 64 * GIB, 0, 80, &OffloadConfig::default(), None);
+        let result =
+            TieredPlacement::plan(8 * GIB, 64 * GIB, 0, 80, &OffloadConfig::default(), None);
         assert!(result.is_err());
     }
 
@@ -401,10 +440,19 @@ mod tests {
         // 24 GiB VRAM, 10 layers × 500 MiB = 5 GiB backbone.
         // Usable after 2 GiB reserve = 22 GiB → all 10 layers in VRAM, 17 GiB left.
         // Vision encoder at 1.7 GiB fits in remaining VRAM.
-        let spec = VisionSpec { encoder_bytes: (1700 * MIB), policy: VisionOffloadPolicy::Auto };
+        let spec = VisionSpec {
+            encoder_bytes: (1700 * MIB),
+            policy: VisionOffloadPolicy::Auto,
+        };
         let plan = TieredPlacement::plan(
-            24 * GIB, 64 * GIB, 500 * MIB, 10, &OffloadConfig::default(), Some(&spec),
-        ).unwrap();
+            24 * GIB,
+            64 * GIB,
+            500 * MIB,
+            10,
+            &OffloadConfig::default(),
+            Some(&spec),
+        )
+        .unwrap();
         assert_eq!(plan.n_vram_layers, 10);
         let v = plan.vision.unwrap();
         assert_eq!(v.tier, MemoryTier::Vram);
@@ -415,10 +463,19 @@ mod tests {
     fn vision_spills_to_ram_when_vram_full() {
         // 8 GiB VRAM → 12 backbone layers use 6 GiB, 0 bytes remaining for vision.
         // Vision encoder (0.9 GiB) goes to RAM.
-        let spec = VisionSpec { encoder_bytes: 900 * MIB, policy: VisionOffloadPolicy::Auto };
+        let spec = VisionSpec {
+            encoder_bytes: 900 * MIB,
+            policy: VisionOffloadPolicy::Auto,
+        };
         let plan = TieredPlacement::plan(
-            8 * GIB, 2048 * GIB, 500 * MIB, 80, &OffloadConfig::default(), Some(&spec),
-        ).unwrap();
+            8 * GIB,
+            2048 * GIB,
+            500 * MIB,
+            80,
+            &OffloadConfig::default(),
+            Some(&spec),
+        )
+        .unwrap();
         assert_eq!(plan.n_vram_layers, 12);
         let v = plan.vision.unwrap();
         assert_eq!(v.tier, MemoryTier::SystemRam);
@@ -428,10 +485,19 @@ mod tests {
     #[test]
     fn vision_pin_vram_ignores_budget() {
         // Force PinVram even when VRAM is full — caller's explicit request.
-        let spec = VisionSpec { encoder_bytes: 900 * MIB, policy: VisionOffloadPolicy::PinVram };
+        let spec = VisionSpec {
+            encoder_bytes: 900 * MIB,
+            policy: VisionOffloadPolicy::PinVram,
+        };
         let plan = TieredPlacement::plan(
-            8 * GIB, 2048 * GIB, 500 * MIB, 80, &OffloadConfig::default(), Some(&spec),
-        ).unwrap();
+            8 * GIB,
+            2048 * GIB,
+            500 * MIB,
+            80,
+            &OffloadConfig::default(),
+            Some(&spec),
+        )
+        .unwrap();
         let v = plan.vision.unwrap();
         assert_eq!(v.tier, MemoryTier::Vram);
         assert!(!v.evict_after_prefill);
@@ -439,10 +505,19 @@ mod tests {
 
     #[test]
     fn vision_stream_disk_policy() {
-        let spec = VisionSpec { encoder_bytes: 900 * MIB, policy: VisionOffloadPolicy::StreamDisk };
+        let spec = VisionSpec {
+            encoder_bytes: 900 * MIB,
+            policy: VisionOffloadPolicy::StreamDisk,
+        };
         let plan = TieredPlacement::plan(
-            24 * GIB, 64 * GIB, 500 * MIB, 10, &OffloadConfig::default(), Some(&spec),
-        ).unwrap();
+            24 * GIB,
+            64 * GIB,
+            500 * MIB,
+            10,
+            &OffloadConfig::default(),
+            Some(&spec),
+        )
+        .unwrap();
         let v = plan.vision.unwrap();
         assert_eq!(v.tier, MemoryTier::Disk);
         assert!(v.evict_after_prefill);

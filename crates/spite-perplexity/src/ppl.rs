@@ -12,14 +12,18 @@ pub struct PplConfig {
     /// Maximum sequence length. Defaults to model's trained context length.
     pub context_len: usize,
     /// Stride between windows. Defaults to context_len / 2.
-    pub stride:      usize,
+    pub stride: usize,
     /// Maximum number of tokens to evaluate. 0 = all.
-    pub max_tokens:  usize,
+    pub max_tokens: usize,
 }
 
 impl Default for PplConfig {
     fn default() -> Self {
-        Self { context_len: 2048, stride: 1024, max_tokens: 0 }
+        Self {
+            context_len: 2048,
+            stride: 1024,
+            max_tokens: 0,
+        }
     }
 }
 
@@ -27,9 +31,9 @@ impl Default for PplConfig {
 #[derive(Debug, Clone)]
 pub struct PplResult {
     /// Perplexity. Lower is better.
-    pub ppl:     f64,
+    pub ppl: f64,
     /// Mean negative log-likelihood per token.
-    pub nll:     f64,
+    pub nll: f64,
     /// Number of tokens evaluated.
     pub n_tokens: usize,
     /// Per-token NLLs — useful for finding where the model is uncertain.
@@ -52,13 +56,9 @@ impl PplResult {
 ///
 /// This is intentionally decoupled from the model internals — the inference
 /// loop wires it up once that's implemented.
-pub fn compute_ppl<F>(
-    tokens:  &[u32],
-    cfg:     &PplConfig,
-    mut forward: F,
-) -> PplResult
+pub fn compute_ppl<F>(tokens: &[u32], cfg: &PplConfig, mut forward: F) -> PplResult
 where
-    F: FnMut(&[u32]) -> Vec<f32>,  // input tokens → log-probs over vocab
+    F: FnMut(&[u32]) -> Vec<f32>, // input tokens → log-probs over vocab
 {
     let limit = if cfg.max_tokens > 0 {
         tokens.len().min(cfg.max_tokens + cfg.context_len)
@@ -66,31 +66,40 @@ where
         tokens.len()
     };
 
-    let mut total_nll  = 0.0f64;
-    let mut n_scored   = 0usize;
+    let mut total_nll = 0.0f64;
+    let mut n_scored = 0usize;
     let mut token_nlls = Vec::new();
 
     let mut pos = 0usize;
     while pos + cfg.context_len < limit {
-        let window   = &tokens[pos..pos + cfg.context_len];
+        let window = &tokens[pos..pos + cfg.context_len];
         let log_probs = forward(window);
 
         // Score all tokens after the first one — they have context.
-        for i in 1..window.len() {
-            let target = window[i] as usize;
+        for &tok in window.iter().skip(1) {
+            let target = tok as usize;
             if target < log_probs.len() {
                 let nll = -log_probs[target] as f64;
                 total_nll += nll;
                 token_nlls.push(nll as f32);
-                n_scored  += 1;
+                n_scored += 1;
             }
         }
 
         pos += cfg.stride;
     }
 
-    let nll = if n_scored > 0 { total_nll / n_scored as f64 } else { f64::INFINITY };
+    let nll = if n_scored > 0 {
+        total_nll / n_scored as f64
+    } else {
+        f64::INFINITY
+    };
     let ppl = nll.exp();
 
-    PplResult { ppl, nll, n_tokens: n_scored, token_nlls }
+    PplResult {
+        ppl,
+        nll,
+        n_tokens: n_scored,
+        token_nlls,
+    }
 }

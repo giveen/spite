@@ -16,13 +16,13 @@
 //! LLaMA-3 uses tiktoken with a similar but slightly different pattern.
 //! The pattern is embedded in GGUF as `tokenizer.ggml.pre` (optional).
 
-use std::collections::HashMap;
 use crate::TokenizerError;
+use std::collections::HashMap;
 
 /// A compiled BPE merge table: (token_a, token_b) → merged_id.
 pub struct BpeMergeTable {
     /// Maps (a_id, b_id) → merged_id. Priority is implicit in insertion order.
-    merges:    Vec<(u32, u32, u32)>,  // (a, b, result)
+    merges: Vec<(u32, u32, u32)>, // (a, b, result)
     merge_map: HashMap<(u32, u32), u32>,
 }
 
@@ -33,19 +33,26 @@ impl BpeMergeTable {
     /// `vocab`:      maps token string → id (needed to resolve merge string pairs).
     pub fn from_merges(
         merges_raw: &[String],
-        vocab_map:  &HashMap<String, u32>,
+        vocab_map: &HashMap<String, u32>,
     ) -> Result<Self, TokenizerError> {
-        let mut merges    = Vec::with_capacity(merges_raw.len());
+        let mut merges = Vec::with_capacity(merges_raw.len());
         let mut merge_map = HashMap::with_capacity(merges_raw.len());
 
         for raw in merges_raw {
-            let (a, b) = raw.split_once(' ')
+            let (a, b) = raw
+                .split_once(' ')
                 .ok_or_else(|| TokenizerError::Encode(format!("bad merge entry: {raw}")))?;
-            let a_id = vocab_map.get(a).copied()
+            let a_id = vocab_map
+                .get(a)
+                .copied()
                 .ok_or_else(|| TokenizerError::Encode(format!("merge token not in vocab: {a}")))?;
-            let b_id = vocab_map.get(b).copied()
+            let b_id = vocab_map
+                .get(b)
+                .copied()
                 .ok_or_else(|| TokenizerError::Encode(format!("merge token not in vocab: {b}")))?;
-            let merged = vocab_map.get(&format!("{a}{b}")).copied()
+            let merged = vocab_map
+                .get(&format!("{a}{b}"))
+                .copied()
                 .unwrap_or(u32::MAX);
             merges.push((a_id, b_id, merged));
             merge_map.insert((a_id, b_id), merged);
@@ -60,15 +67,19 @@ impl BpeMergeTable {
         let mut tokens: Vec<u32> = bytes.to_vec();
         loop {
             // Find the highest-priority (lowest merge index) applicable pair.
-            let best = tokens.windows(2)
+            let best = tokens
+                .windows(2)
                 .enumerate()
                 .filter_map(|(i, pair)| {
-                    self.merge_map.get(&(pair[0], pair[1]))
+                    self.merge_map
+                        .get(&(pair[0], pair[1]))
                         .map(|&merged| (i, merged, self.priority(pair[0], pair[1])))
                 })
                 .min_by_key(|&(_, _, priority)| priority);
 
-            let Some((pos, merged, _)) = best else { break; };
+            let Some((pos, merged, _)) = best else {
+                break;
+            };
             tokens[pos] = merged;
             tokens.remove(pos + 1);
         }
@@ -76,7 +87,9 @@ impl BpeMergeTable {
     }
 
     fn priority(&self, a: u32, b: u32) -> usize {
-        self.merges.iter().position(|&(x, y, _)| x == a && y == b)
+        self.merges
+            .iter()
+            .position(|&(x, y, _)| x == a && y == b)
             .unwrap_or(usize::MAX)
     }
 }

@@ -11,44 +11,44 @@ use crate::ppl::PplResult;
 
 #[derive(Debug, Serialize)]
 pub struct Report {
-    pub gpu_arch:    String,
-    pub model_arch:  String,
+    pub gpu_arch: String,
+    pub model_arch: String,
     pub kernel_path: String,
-    pub ppl:         Option<PplReport>,
-    pub kld:         Option<KldReport>,
+    pub ppl: Option<PplReport>,
+    pub kld: Option<KldReport>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct PplReport {
-    pub ppl:          f64,
-    pub nll:          f64,
-    pub n_tokens:     usize,
-    pub ref_ppl:      Option<f64>,
-    pub delta_pct:    Option<f64>,
-    pub passed:       bool,
+    pub ppl: f64,
+    pub nll: f64,
+    pub n_tokens: usize,
+    pub ref_ppl: Option<f64>,
+    pub delta_pct: Option<f64>,
+    pub passed: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct KldReport {
-    pub mean_kld:    f64,
-    pub max_kld:     f64,
-    pub p95_kld:     f64,
+    pub mean_kld: f64,
+    pub max_kld: f64,
+    pub p95_kld: f64,
     pub n_positions: usize,
-    pub verdict:     String,
+    pub verdict: String,
     pub worst_tokens: Vec<WorstToken>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct WorstToken {
     pub token_id: u32,
-    pub kld:      f64,
+    pub kld: f64,
 }
 
 impl Report {
     pub fn new(gpu_arch: &str, model_arch: &str, kernel_path: &str) -> Self {
         Self {
-            gpu_arch:    gpu_arch.to_owned(),
-            model_arch:  model_arch.to_owned(),
+            gpu_arch: gpu_arch.to_owned(),
+            model_arch: model_arch.to_owned(),
             kernel_path: kernel_path.to_owned(),
             ppl: None,
             kld: None,
@@ -70,8 +70,8 @@ impl Report {
         };
 
         self.ppl = Some(PplReport {
-            ppl:      result.ppl,
-            nll:      result.nll,
+            ppl: result.ppl,
+            nll: result.nll,
             n_tokens: result.n_tokens,
             ref_ppl,
             delta_pct,
@@ -82,15 +82,19 @@ impl Report {
 
     pub fn with_kld(mut self, result: &KldResult) -> Self {
         self.kld = Some(KldReport {
-            mean_kld:    result.mean_kld,
-            max_kld:     result.max_kld,
-            p95_kld:     result.p95_kld,
+            mean_kld: result.mean_kld,
+            max_kld: result.max_kld,
+            p95_kld: result.p95_kld,
             n_positions: result.n_positions,
-            verdict:     result.verdict.to_string(),
-            worst_tokens: result.worst.iter().map(|w| WorstToken {
-                token_id: w.token_id,
-                kld:      w.kld,
-            }).collect(),
+            verdict: result.verdict.to_string(),
+            worst_tokens: result
+                .worst
+                .iter()
+                .map(|w| WorstToken {
+                    token_id: w.token_id,
+                    kld: w.kld,
+                })
+                .collect(),
         });
         self
     }
@@ -116,7 +120,7 @@ impl Report {
             let marker = match k.verdict.as_str() {
                 "PASS" => "✓ PASS",
                 "WARN" => "⚠ WARN",
-                _      => "✗ FAIL",
+                _ => "✗ FAIL",
             };
             println!("├─ KLD ─────────────────────────────────────────────────────");
             println!("│ verdict : {marker}");
@@ -141,8 +145,8 @@ impl Report {
 
     /// Overall pass/fail — both PPL and KLD must pass.
     pub fn passed(&self) -> bool {
-        let ppl_ok = self.ppl.as_ref().map_or(true, |p| p.passed);
-        let kld_ok = self.kld.as_ref().map_or(true, |k| k.verdict == "PASS");
+        let ppl_ok = self.ppl.as_ref().is_none_or(|p| p.passed);
+        let kld_ok = self.kld.as_ref().is_none_or(|k| k.verdict == "PASS");
         ppl_ok && kld_ok
     }
 }

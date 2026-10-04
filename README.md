@@ -135,7 +135,7 @@ generic CPU path automatically — slower, but always correct.
 
 | Architecture | Build flag | Cards |
 |---|---|---|
-| RDNA 4 *(planned)* | `rdna4` | RX 9070 XT / 9070 / 9060 XT |
+| RDNA 4 | `rdna4` | RX 9070 XT / 9070 / 9060 XT |
 | RDNA 3 | `rdna3` | RX 7900 XTX / 7900 XT / 7900 GRE, RX 7800 XT, RX 7700 XT, RX 7600 XT / 7600 |
 | RDNA 2 | `rdna2` | RX 6950 XT / 6900 XT / 6800 XT / 6800, RX 6700 XT / 6650 XT / 6600 XT / 6600 |
 | RDNA 1 *(planned)* | `rdna1` | RX 5700 XT / 5700 / 5600 XT / 5500 XT |
@@ -144,7 +144,7 @@ generic CPU path automatically — slower, but always correct.
 
 | Architecture | Build flag | Cards |
 |---|---|---|
-| Arc Battlemage *(planned)* | `arc_battlemage` | Arc B580 / B570 |
+| Arc Battlemage | `arc_battlemage` | Arc B580 / B570 |
 | Arc Alchemist | `arc_alchemist` | Arc A770 / A750 / A580 / A380 / A310 |
 
 ### Apple Silicon

@@ -3,14 +3,14 @@
 /// A single benchmark result — one op, one configuration.
 #[derive(Debug, Clone)]
 pub struct BenchResult {
-    pub label:        String,
+    pub label: String,
     /// Tokens per second (decode).
-    pub tps:          f64,
+    pub tps: f64,
     /// Time-to-first-token in milliseconds (prefill).
-    pub ttft_ms:      f64,
+    pub ttft_ms: f64,
     /// Peak GPU memory in MiB.
     pub peak_mem_mib: u64,
-    pub n_runs:       usize,
+    pub n_runs: usize,
 }
 
 impl BenchResult {

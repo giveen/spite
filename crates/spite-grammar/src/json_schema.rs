@@ -25,16 +25,14 @@ pub fn schema_to_gbnf(schema: &serde_json::Value) -> Result<String, GrammarError
 
 fn emit_type(schema: &serde_json::Value, out: &mut String) -> Result<(), GrammarError> {
     match schema.get("type").and_then(|v| v.as_str()) {
-        Some("object")  => out.push_str("object"),
-        Some("array")   => out.push_str("array"),
-        Some("string")  => out.push_str("string"),
-        Some("number")  => out.push_str("number"),
+        Some("object") => out.push_str("object"),
+        Some("array") => out.push_str("array"),
+        Some("string") => out.push_str("string"),
+        Some("number") => out.push_str("number"),
         Some("integer") => out.push_str("integer"),
         Some("boolean") => out.push_str("( \"true\" | \"false\" )"),
-        Some("null")    => out.push_str("\"null\""),
-        Some(other) => return Err(GrammarError::SchemaError(
-            format!("unknown type: {other}")
-        )),
+        Some("null") => out.push_str("\"null\""),
+        Some(other) => return Err(GrammarError::SchemaError(format!("unknown type: {other}"))),
         None => out.push_str("value"), // untyped → accept any JSON value
     }
     Ok(())

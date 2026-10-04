@@ -26,13 +26,15 @@ impl DeepSeekV4 {
 }
 
 impl ModelArch for DeepSeekV4 {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
+        _tokens: &[u32],
         _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        _ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
         // TODO: implement once DeepSeek V4 architecture is documented.
         // See deepseek/v3.rs for the V3 MLA + MoE forward reference.

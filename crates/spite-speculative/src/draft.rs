@@ -21,11 +21,7 @@ pub struct DraftOutput {
 ///
 /// Uses `draft_dispatch` for all ops. Returns the proposed tokens
 /// and their logit distributions for the verify step.
-pub fn run_draft(
-    _context:  &[u32],
-    _n_tokens: u32,
-    _ctx:      &SpiteCtx,
-) -> DraftOutput {
+pub fn run_draft(_context: &[u32], _n_tokens: u32, _ctx: &SpiteCtx) -> DraftOutput {
     // TODO:
     // for i in 0..n_tokens:
     //   1. embed(context + accepted so far)
@@ -33,5 +29,8 @@ pub fn run_draft(
     //   3. project to vocab → logits
     //   4. greedy sample (draft uses greedy; verify adjusts for main dist)
     //   5. append token, append logits
-    DraftOutput { tokens: vec![], logits: vec![] }
+    DraftOutput {
+        tokens: vec![],
+        logits: vec![],
+    }
 }

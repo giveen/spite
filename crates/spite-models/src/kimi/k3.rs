@@ -25,13 +25,15 @@ impl KimiK3 {
 }
 
 impl ModelArch for KimiK3 {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
+        _tokens: &[u32],
         _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        _ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
         // TODO: MLA attention (see deepseek/v3.rs for reference impl pattern)
         //   MoE FFN: top-k of n_routed_experts + n_shared_experts always active

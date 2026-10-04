@@ -12,8 +12,8 @@
 //!   Q5KM   — 5-bit K-quants mixed
 //!   Q6K    — 6-bit K-quants, near-lossless
 
-pub mod q8_0;
 pub mod q4k;
+pub mod q8_0;
 
 use std::path::Path;
 use thiserror::Error;
@@ -48,7 +48,7 @@ impl QuantType {
             Self::Q4KM => "Q4_K_M",
             Self::Q4KS => "Q4_K_S",
             Self::Q5KM => "Q5_K_M",
-            Self::Q6K  => "Q6_K",
+            Self::Q6K => "Q6_K",
         }
     }
 
@@ -60,7 +60,7 @@ impl QuantType {
             Self::Q4KM => 4.85,
             Self::Q4KS => 4.58,
             Self::Q5KM => 5.68,
-            Self::Q6K  => 6.57,
+            Self::Q6K => 6.57,
         }
     }
 }
@@ -68,18 +68,18 @@ impl QuantType {
 #[derive(Debug, Clone)]
 pub struct QuantizeConfig {
     /// Target quantization type for most tensors.
-    pub target:    QuantType,
+    pub target: QuantType,
     pub n_threads: usize,
     /// Tensor names (prefix match) to keep in F32 or F16 (embeddings, output head).
-    pub keep_f32:  Vec<String>,
+    pub keep_f32: Vec<String>,
 }
 
 impl Default for QuantizeConfig {
     fn default() -> Self {
         Self {
-            target:   QuantType::Q4KM,
+            target: QuantType::Q4KM,
             n_threads: 4,
-            keep_f32:  vec!["token_embd".into(), "output.weight".into()],
+            keep_f32: vec!["token_embd".into(), "output.weight".into()],
         }
     }
 }
@@ -88,15 +88,24 @@ impl Default for QuantizeConfig {
 ///
 /// `dst` must be pre-allocated to the correct block-packed byte size.
 pub fn quantize_f32(
-    src:    &[f32],
-    dst:    &mut [u8],
-    kind:   QuantType,
+    src: &[f32],
+    dst: &mut [u8],
+    kind: QuantType,
     n_elem: usize,
 ) -> Result<(), QuantizeError> {
     match kind {
-        QuantType::Q8_0 => { q8_0::quantize(src, dst, n_elem); Ok(()) }
-        QuantType::Q4KM | QuantType::Q4KS => { q4k::quantize_q4k(src, dst, n_elem); Ok(()) }
-        _ => Err(QuantizeError::UnsupportedSource(format!("{} not yet implemented", kind.name()))),
+        QuantType::Q8_0 => {
+            q8_0::quantize(src, dst, n_elem);
+            Ok(())
+        }
+        QuantType::Q4KM | QuantType::Q4KS => {
+            q4k::quantize_q4k(src, dst, n_elem);
+            Ok(())
+        }
+        _ => Err(QuantizeError::UnsupportedSource(format!(
+            "{} not yet implemented",
+            kind.name()
+        ))),
     }
 }
 
@@ -104,7 +113,7 @@ pub fn quantize_f32(
 pub fn quantize_model(
     _src_path: &Path,
     _dst_path: &Path,
-    _cfg:      &QuantizeConfig,
+    _cfg: &QuantizeConfig,
 ) -> Result<(), QuantizeError> {
     // TODO:
     // 1. Open src GGUF with spite-loader
@@ -113,17 +122,19 @@ pub fn quantize_model(
     //    - if name matches keep_f32 prefix → copy as F32
     //    - else: dequant to F32 if needed → quantize_f32(data, buf, cfg.target)
     // 4. Write tensor index + data section
-    Err(QuantizeError::Gguf("quantize_model not yet implemented".into()))
+    Err(QuantizeError::Gguf(
+        "quantize_model not yet implemented".into(),
+    ))
 }
 
 /// Required output buffer size in bytes for `n_elem` elements of `kind`.
 pub fn block_bytes(kind: QuantType, n_elem: usize) -> usize {
     let (block_elems, block_bytes) = match kind {
-        QuantType::Q8_0 => (32usize, 34usize),  // 2B scale + 32×i8
-        QuantType::Q4_0 => (32, 18),             // 2B scale + 16×u8
+        QuantType::Q8_0 => (32usize, 34usize), // 2B scale + 32×i8
+        QuantType::Q4_0 => (32, 18),           // 2B scale + 16×u8
         QuantType::Q4KM | QuantType::Q4KS => (256, 144), // 2+2+12+128 bytes
         QuantType::Q5KM => (256, 176),
-        QuantType::Q6K  => (256, 210),
+        QuantType::Q6K => (256, 210),
     };
     let n_blocks = n_elem.div_ceil(block_elems);
     n_blocks * block_bytes

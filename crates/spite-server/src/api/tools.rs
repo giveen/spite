@@ -16,28 +16,28 @@ use serde::{Deserialize, Serialize};
 /// A tool definition as sent by the client in the chat request.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ToolDefinition {
-    pub r#type:   String,    // always "function"
+    pub r#type: String, // always "function"
     pub function: FunctionDef,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FunctionDef {
-    pub name:        String,
+    pub name: String,
     pub description: String,
-    pub parameters:  serde_json::Value, // JSON Schema
+    pub parameters: serde_json::Value, // JSON Schema
 }
 
 /// A tool call produced by the model.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCall {
-    pub id:       String,           // random id, e.g. "call_abc123"
-    pub r#type:   &'static str,     // "function"
+    pub id: String,           // random id, e.g. "call_abc123"
+    pub r#type: &'static str, // "function"
     pub function: ToolCallFunction,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolCallFunction {
-    pub name:      String,
+    pub name: String,
     pub arguments: String, // JSON-encoded argument object
 }
 
@@ -47,11 +47,13 @@ pub struct ToolCallFunction {
 /// Mistral 4 uses `[TOOL_CALLS]` markers; generic fallback uses a plain
 /// "Available functions:" block.
 pub fn inject_tools(arch: &str, system: &mut String, tools: &[ToolDefinition]) {
-    if tools.is_empty() { return; }
+    if tools.is_empty() {
+        return;
+    }
     match arch {
-        "llama4"                   => inject_llama4(system, tools),
-        "mistral4" | "magistral"   => inject_mistral(system, tools),
-        _                          => inject_generic(system, tools),
+        "llama4" => inject_llama4(system, tools),
+        "mistral4" | "magistral" => inject_mistral(system, tools),
+        _ => inject_generic(system, tools),
     }
 }
 
@@ -69,7 +71,10 @@ fn inject_generic(system: &mut String, tools: &[ToolDefinition]) {
     system.push_str("\n\nAvailable functions (call as JSON):\n");
     for t in tools {
         let sig = serde_json::to_string(&t.function.parameters).unwrap_or_default();
-        system.push_str(&format!("  {} — {} — params: {}\n", t.function.name, t.function.description, sig));
+        system.push_str(&format!(
+            "  {} — {} — params: {}\n",
+            t.function.name, t.function.description, sig
+        ));
     }
 }
 

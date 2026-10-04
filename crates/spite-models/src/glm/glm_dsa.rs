@@ -29,13 +29,15 @@ impl GlmDsa {
 }
 
 impl ModelArch for GlmDsa {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
+        _tokens: &[u32],
         _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        _ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
         // TODO: for each attention layer:
         //   scores = Q · K^T / sqrt(head_dim)    // full pairwise for routing

@@ -37,17 +37,17 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Default)]
 pub struct KernelSpec {
     /// Model family directory: "llama", "deepseek", "qwen", …
-    pub family:   String,
+    pub family: String,
     /// Model variant directory: "llama4", "v4", "qwen3_5", …
-    pub model:    String,
+    pub model: String,
     /// GPU architecture: "sm_89", "rdna4", "cdna3", "metal", …
     pub gpu_arch: String,
     /// Specific card id: "rtx_4090", "mi300x", "rx_9900_xtx", …
     /// Empty string means "no card-specific override available".
-    pub card_id:  String,
+    pub card_id: String,
     /// Quantisation format: "Q4_K_M", "Q8_0", "F16", …
     /// Empty string means "any quant" (pick up the arch-level kernel).
-    pub quant:    String,
+    pub quant: String,
 }
 
 impl KernelSpec {
@@ -65,8 +65,8 @@ impl KernelSpec {
             family,
             model,
             gpu_arch: gpu_arch.into(),
-            card_id:  String::new(),
-            quant:    String::new(),
+            card_id: String::new(),
+            quant: String::new(),
         }
     }
 
@@ -77,7 +77,7 @@ impl KernelSpec {
             .join(&self.model)
             .join(&self.gpu_arch);
 
-        let has_card  = !self.card_id.is_empty();
+        let has_card = !self.card_id.is_empty();
         let has_quant = !self.quant.is_empty();
 
         let mut paths = Vec::with_capacity(6);
@@ -111,7 +111,10 @@ impl KernelSpec {
     /// Engine kernels are cross-model — they live under `_engine/<feature>/`
     /// and are selected independently from the model forward-pass kernels.
     pub fn engine_candidates(&self, feature: &str, kernels_dir: &Path) -> Vec<PathBuf> {
-        let base = kernels_dir.join("_engine").join(feature).join(&self.gpu_arch);
+        let base = kernels_dir
+            .join("_engine")
+            .join(feature)
+            .join(&self.gpu_arch);
         let mut paths = Vec::with_capacity(3);
 
         if !self.card_id.is_empty() {
@@ -145,7 +148,7 @@ pub fn arch_to_family_model(arch: &str) -> (String, String) {
 
         // ── Qwen ─────────────────────────────────────────────────────────
         "qwen35" | "qwen35moe" => ("qwen", "qwen3_5"),
-        "qwen4" | "qwen4exp"   => ("qwen", "qwen4"),
+        "qwen4" | "qwen4exp" => ("qwen", "qwen4"),
 
         // ── DeepSeek ─────────────────────────────────────────────────────
         "deepseek4" => ("deepseek", "v4"),
@@ -154,7 +157,7 @@ pub fn arch_to_family_model(arch: &str) -> (String, String) {
         "gemma4" => ("gemma", "gemma4"),
 
         // ── GLM ──────────────────────────────────────────────────────────
-        "glm-dsa"            => ("glm", "glm_dsa"),
+        "glm-dsa" => ("glm", "glm_dsa"),
         "glm5" | "glm5-next" => ("glm", "glm5"),
 
         // ── MiniMax ──────────────────────────────────────────────────────
@@ -200,10 +203,17 @@ pub fn normalize_card_name(name: &str) -> String {
     // Strip well-known vendor/product prefixes so we get the model designator.
     const PREFIXES: &[&str] = &[
         // Keep "RTX"/"GTX" in the output — strip only the branding before it.
-        "NVIDIA GeForce ", "NVIDIA Quadro ", "NVIDIA ",
+        "NVIDIA GeForce ",
+        "NVIDIA Quadro ",
+        "NVIDIA ",
         // AMD: keep "RX" and "MI" designators; strip "Instinct" product line.
-        "AMD Radeon Pro ", "AMD Radeon ", "AMD Instinct ", "AMD ",
-        "Intel Arc ", "Intel Data Center GPU ", "Intel ",
+        "AMD Radeon Pro ",
+        "AMD Radeon ",
+        "AMD Instinct ",
+        "AMD ",
+        "Intel Arc ",
+        "Intel Data Center GPU ",
+        "Intel ",
     ];
     let mut s = name;
     for prefix in PREFIXES {
@@ -236,18 +246,18 @@ mod tests {
 
     fn spec_full() -> KernelSpec {
         KernelSpec {
-            family:   "llama".into(),
-            model:    "llama4".into(),
+            family: "llama".into(),
+            model: "llama4".into(),
             gpu_arch: "sm_89".into(),
-            card_id:  "rtx_4090".into(),
-            quant:    "Q4_K_M".into(),
+            card_id: "rtx_4090".into(),
+            quant: "Q4_K_M".into(),
         }
     }
 
     fn spec_arch_only() -> KernelSpec {
         KernelSpec {
-            family:   "deepseek".into(),
-            model:    "v4".into(),
+            family: "deepseek".into(),
+            model: "v4".into(),
             gpu_arch: "sm_89".into(),
             ..Default::default()
         }
@@ -282,7 +292,7 @@ mod tests {
         let root = PathBuf::from("/k");
         let spec = KernelSpec {
             gpu_arch: "cdna3".into(),
-            card_id:  "mi300x".into(),
+            card_id: "mi300x".into(),
             ..Default::default()
         };
         let c = spec.engine_candidates("prefill", &root);
@@ -294,7 +304,10 @@ mod tests {
     #[test]
     fn engine_candidates_no_card() {
         let root = PathBuf::from("/k");
-        let spec = KernelSpec { gpu_arch: "sm_89".into(), ..Default::default() };
+        let spec = KernelSpec {
+            gpu_arch: "sm_89".into(),
+            ..Default::default()
+        };
         let c = spec.engine_candidates("speculative", &root);
         assert_eq!(c[0], PathBuf::from("/k/_engine/speculative/sm_89"));
         assert_eq!(c[1], PathBuf::from("/k/_engine/speculative/generic"));
@@ -302,14 +315,35 @@ mod tests {
 
     #[test]
     fn arch_maps_to_family_model() {
-        assert_eq!(arch_to_family_model("qwen35"),   ("qwen".into(),     "qwen3_5".into()));
-        assert_eq!(arch_to_family_model("qwen4"),    ("qwen".into(),     "qwen4".into()));
-        assert_eq!(arch_to_family_model("llama4"),   ("llama".into(),    "llama4".into()));
-        assert_eq!(arch_to_family_model("deepseek4"),("deepseek".into(), "v4".into()));
-        assert_eq!(arch_to_family_model("gemma4"),   ("gemma".into(),    "gemma4".into()));
-        assert_eq!(arch_to_family_model("glm5-next"),("glm".into(),      "glm5".into()));
+        assert_eq!(
+            arch_to_family_model("qwen35"),
+            ("qwen".into(), "qwen3_5".into())
+        );
+        assert_eq!(
+            arch_to_family_model("qwen4"),
+            ("qwen".into(), "qwen4".into())
+        );
+        assert_eq!(
+            arch_to_family_model("llama4"),
+            ("llama".into(), "llama4".into())
+        );
+        assert_eq!(
+            arch_to_family_model("deepseek4"),
+            ("deepseek".into(), "v4".into())
+        );
+        assert_eq!(
+            arch_to_family_model("gemma4"),
+            ("gemma".into(), "gemma4".into())
+        );
+        assert_eq!(
+            arch_to_family_model("glm5-next"),
+            ("glm".into(), "glm5".into())
+        );
         // Unknown arch falls back to (arch, arch) so generic still applies.
-        assert_eq!(arch_to_family_model("mystery"),  ("mystery".into(),  "mystery".into()));
+        assert_eq!(
+            arch_to_family_model("mystery"),
+            ("mystery".into(), "mystery".into())
+        );
     }
 
     #[test]
@@ -325,9 +359,9 @@ mod tests {
     #[test]
     fn card_id_normalization() {
         assert_eq!(normalize_card_name("NVIDIA GeForce RTX 4090"), "rtx_4090");
-        assert_eq!(normalize_card_name("AMD Radeon RX 9900 XTX"),  "rx_9900_xtx");
-        assert_eq!(normalize_card_name("AMD Instinct MI300X"),      "mi300x");
-        assert_eq!(normalize_card_name("Intel Arc B580"),           "b580");
-        assert_eq!(normalize_card_name("AMD Radeon RX 7900 XTX"),  "rx_7900_xtx");
+        assert_eq!(normalize_card_name("AMD Radeon RX 9900 XTX"), "rx_9900_xtx");
+        assert_eq!(normalize_card_name("AMD Instinct MI300X"), "mi300x");
+        assert_eq!(normalize_card_name("Intel Arc B580"), "b580");
+        assert_eq!(normalize_card_name("AMD Radeon RX 7900 XTX"), "rx_7900_xtx");
     }
 }

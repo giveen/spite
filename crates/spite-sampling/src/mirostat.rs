@@ -20,14 +20,18 @@ pub struct MirostatConfig {
     /// 1 (v1, Zipf-based) or 2 (v2, μ-tracking, default).
     pub version: u8,
     /// Target entropy in bits. Typical: 5.0.
-    pub tau:     f32,
+    pub tau: f32,
     /// Learning rate for μ updates. Typical: 0.1.
-    pub eta:     f32,
+    pub eta: f32,
 }
 
 impl Default for MirostatConfig {
     fn default() -> Self {
-        Self { version: 2, tau: 5.0, eta: 0.1 }
+        Self {
+            version: 2,
+            tau: 5.0,
+            eta: 0.1,
+        }
     }
 }
 
@@ -36,7 +40,7 @@ impl Default for MirostatConfig {
 pub struct MirostatState {
     pub cfg: MirostatConfig,
     /// Running estimate of the cross-entropy; initialised to 2 × τ.
-    pub mu:  f32,
+    pub mu: f32,
 }
 
 impl MirostatState {
@@ -72,7 +76,10 @@ impl MirostatState {
         let mut sampled = candidates[0];
         for &i in candidates {
             acc += probs[i];
-            if u <= acc { sampled = i; break; }
+            if u <= acc {
+                sampled = i;
+                break;
+            }
         }
 
         // Update μ

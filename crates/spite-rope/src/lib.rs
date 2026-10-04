@@ -27,7 +27,7 @@ pub enum RopeError {
 pub enum RopeVariant {
     Default,
     Linear { scale: f32 },
-    Yarn   { scale: f32, original_ctx: usize },
+    Yarn { scale: f32, original_ctx: usize },
     Alibi,
     LongRope,
 }
@@ -35,13 +35,17 @@ pub enum RopeVariant {
 #[derive(Debug, Clone)]
 pub struct RopeConfig {
     pub head_dim: usize,
-    pub theta:    f32,        // default 10 000.0; llama3 uses 500 000.0
-    pub variant:  RopeVariant,
+    pub theta: f32, // default 10 000.0; llama3 uses 500 000.0
+    pub variant: RopeVariant,
 }
 
 impl Default for RopeConfig {
     fn default() -> Self {
-        Self { head_dim: 128, theta: 10_000.0, variant: RopeVariant::Default }
+        Self {
+            head_dim: 128,
+            theta: 10_000.0,
+            variant: RopeVariant::Default,
+        }
     }
 }
 
@@ -50,18 +54,16 @@ impl Default for RopeConfig {
 /// `qk`:  flat F32 buffer `[n_heads, head_dim]` for one sequence position
 /// `pos`: the absolute token position
 /// `cfg`: rope configuration
-pub fn apply_rope(
-    qk:  &mut [f32],
-    pos: u32,
-    cfg: &RopeConfig,
-) -> Result<(), RopeError> {
+pub fn apply_rope(qk: &mut [f32], pos: u32, cfg: &RopeConfig) -> Result<(), RopeError> {
     let d = cfg.head_dim;
-    if d % 2 != 0 { return Err(RopeError::OddHeadDim(d)); }
+    if !d.is_multiple_of(2) {
+        return Err(RopeError::OddHeadDim(d));
+    }
     let n_heads = qk.len() / d;
     let theta_scale = match cfg.variant {
-        RopeVariant::Linear { scale }          => scale,
-        RopeVariant::Yarn   { scale, .. }      => scale,
-        _                                      => 1.0,
+        RopeVariant::Linear { scale } => scale,
+        RopeVariant::Yarn { scale, .. } => scale,
+        _ => 1.0,
     };
     for h in 0..n_heads {
         let base = h * d;
@@ -71,7 +73,7 @@ pub fn apply_rope(
             let (sin, cos) = angle.sin_cos();
             let x0 = qk[base + i];
             let x1 = qk[base + i + d / 2];
-            qk[base + i]         = x0 * cos - x1 * sin;
+            qk[base + i] = x0 * cos - x1 * sin;
             qk[base + i + d / 2] = x0 * sin + x1 * cos;
         }
     }
@@ -91,19 +93,22 @@ pub fn alibi_slope(h: usize, n_heads: usize) -> f32 {
 /// Returns a vec of per-pair scale factors for the frequency interpolation.
 /// See https://arxiv.org/abs/2309.00071 for the algorithm.
 pub fn yarn_correction_dims(
-    head_dim:     usize,
-    theta:        f32,
+    head_dim: usize,
+    theta: f32,
     original_ctx: usize,
-    target_ctx:   usize,
+    target_ctx: usize,
 ) -> Vec<f32> {
     let scale = target_ctx as f32 / original_ctx as f32;
-    (0..head_dim / 2).map(|i| {
-        let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
-        let wavelength = 2.0 * std::f32::consts::PI / freq;
-        // Interpolate between linear and NTK scaling based on wavelength
-        let alpha = 1.0f32;   // TODO: derive from context length ratio
-        let beta  = 32.0f32;  // TODO: tune per model
-        let ramp = ((wavelength / original_ctx as f32 - alpha) / (beta - alpha)).clamp(0.0, 1.0);
-        1.0 / (ramp / scale + (1.0 - ramp))  // TODO: per-dim correction
-    }).collect()
+    (0..head_dim / 2)
+        .map(|i| {
+            let freq = 1.0 / theta.powf(2.0 * i as f32 / head_dim as f32);
+            let wavelength = 2.0 * std::f32::consts::PI / freq;
+            // Interpolate between linear and NTK scaling based on wavelength
+            let alpha = 1.0f32; // TODO: derive from context length ratio
+            let beta = 32.0f32; // TODO: tune per model
+            let ramp =
+                ((wavelength / original_ctx as f32 - alpha) / (beta - alpha)).clamp(0.0, 1.0);
+            1.0 / (ramp / scale + (1.0 - ramp)) // TODO: per-dim correction
+        })
+        .collect()
 }

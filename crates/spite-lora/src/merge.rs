@@ -27,7 +27,15 @@ pub fn merge_adapter(
     for layer in &adapter.layers {
         let key = format!("blk.{}.{}.weight", layer.layer_idx, layer.module);
         if let Some(w) = weights.get_mut(&key) {
-            apply_lora(w, &layer.a, &layer.b, scale, layer.out_feat, layer.in_feat, layer.rank);
+            apply_lora(
+                w,
+                &layer.a,
+                &layer.b,
+                scale,
+                layer.out_feat,
+                layer.in_feat,
+                layer.rank,
+            );
         }
     }
 }
@@ -37,13 +45,19 @@ pub fn validate_layer(layer: &LoraLayer) -> Result<(), String> {
     if layer.a.len() != layer.rank * layer.in_feat {
         return Err(format!(
             "lora_a shape mismatch: expected {}×{} = {}, got {}",
-            layer.rank, layer.in_feat, layer.rank * layer.in_feat, layer.a.len()
+            layer.rank,
+            layer.in_feat,
+            layer.rank * layer.in_feat,
+            layer.a.len()
         ));
     }
     if layer.b.len() != layer.out_feat * layer.rank {
         return Err(format!(
             "lora_b shape mismatch: expected {}×{} = {}, got {}",
-            layer.out_feat, layer.rank, layer.out_feat * layer.rank, layer.b.len()
+            layer.out_feat,
+            layer.rank,
+            layer.out_feat * layer.rank,
+            layer.b.len()
         ));
     }
     Ok(())

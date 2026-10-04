@@ -25,13 +25,15 @@ impl Llama4 {
 }
 
 impl ModelArch for Llama4 {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
+        _tokens: &[u32],
         _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        _ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
         // TODO (per layer):
         //   if layer_idx % 2 == 0 → apply RoPE to Q,K (full RoPE, standard theta)

@@ -35,23 +35,23 @@ pub enum EmbedFormat {
 
 #[derive(Debug, Serialize)]
 pub struct EmbedResponse {
-    pub object: &'static str,  // "list"
-    pub data:   Vec<EmbedObject>,
-    pub model:  String,
-    pub usage:  EmbedUsage,
+    pub object: &'static str, // "list"
+    pub data: Vec<EmbedObject>,
+    pub model: String,
+    pub usage: EmbedUsage,
 }
 
 #[derive(Debug, Serialize)]
 pub struct EmbedObject {
-    pub object:    &'static str, // "embedding"
+    pub object: &'static str, // "embedding"
     pub embedding: Vec<f32>,
-    pub index:     usize,
+    pub index: usize,
 }
 
 #[derive(Debug, Serialize)]
 pub struct EmbedUsage {
     pub prompt_tokens: usize,
-    pub total_tokens:  usize,
+    pub total_tokens: usize,
 }
 
 // Handler (wired in api/mod.rs once Executor is integrated):

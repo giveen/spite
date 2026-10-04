@@ -24,22 +24,22 @@ use std::collections::HashMap;
 /// weight-name maps and layer configurations.
 #[derive(Debug, Clone)]
 pub struct ModelHyperparams {
-    pub arch:        String,
-    pub n_layers:    u32,
-    pub n_heads:     u32,
-    pub n_kv_heads:  u32,
-    pub d_model:     u32,
-    pub d_ffn:       u32,
-    pub vocab_size:  u32,
+    pub arch: String,
+    pub n_layers: u32,
+    pub n_heads: u32,
+    pub n_kv_heads: u32,
+    pub d_model: u32,
+    pub d_ffn: u32,
+    pub vocab_size: u32,
     pub max_seq_len: u32,
-    pub rope_theta:  f32,
-    pub norm_eps:    f32,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
 }
 
 impl ModelHyperparams {
     /// Extract hyperparameters from a raw GGUF metadata map.
     ///
-    /// `arch` is the value of `general.architecture` (e.g. `"llama"`).
+    /// `arch` is the value of `general.architecture` (e.g. `"llama4"`).
     /// `meta` is the full key→value map from `GgufModel`.
     ///
     /// Returns a struct with zero/default values for missing keys —
@@ -62,23 +62,28 @@ impl ModelHyperparams {
                 _ => 0.0,
             }
         };
-        let vocab = u("vocab_size")
-            .max(match meta.get("tokenizer.ggml.token_count") {
-                Some(crate::MetaValue::U32(v)) => *v,
-                _ => 0,
-            });
+        let vocab = u("vocab_size").max(match meta.get("tokenizer.ggml.token_count") {
+            Some(crate::MetaValue::U32(v)) => *v,
+            _ => 0,
+        });
 
-        let rope_theta = { let v = f("rope.freq_base"); if v == 0.0 { 10_000.0 } else { v } };
-        let norm_eps   = { let v = f("attention.layer_norm_rms_epsilon"); if v == 0.0 { 1e-5 } else { v } };
+        let rope_theta = {
+            let v = f("rope.freq_base");
+            if v == 0.0 { 10_000.0 } else { v }
+        };
+        let norm_eps = {
+            let v = f("attention.layer_norm_rms_epsilon");
+            if v == 0.0 { 1e-5 } else { v }
+        };
 
         Self {
-            arch:        arch.to_owned(),
-            n_layers:    u("block_count"),
-            n_heads:     u("attention.head_count"),
-            n_kv_heads:  u("attention.head_count_kv"),
-            d_model:     u("embedding_length"),
-            d_ffn:       u("feed_forward_length"),
-            vocab_size:  vocab,
+            arch: arch.to_owned(),
+            n_layers: u("block_count"),
+            n_heads: u("attention.head_count"),
+            n_kv_heads: u("attention.head_count_kv"),
+            d_model: u("embedding_length"),
+            d_ffn: u("feed_forward_length"),
+            vocab_size: vocab,
             max_seq_len: u("context_length"),
             rope_theta,
             norm_eps,

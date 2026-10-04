@@ -25,13 +25,15 @@ impl Glm5 {
 }
 
 impl ModelArch for Glm5 {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
+        _tokens: &[u32],
         _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        _ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
         // TODO: implement once GLM-5 architecture is documented.
         Err(ModelError::Forward("not implemented".into()))

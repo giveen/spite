@@ -64,37 +64,47 @@ pub struct PluginKey {
     /// GGUF model architecture string: "llama4", "mistral4", "gemma4", …
     pub model_arch: Option<String>,
     /// GPU architecture string: "sm_89", "rdna3", "metal", …
-    pub gpu_arch:   Option<String>,
+    pub gpu_arch: Option<String>,
     /// Task label: "chat", "completion", "embed", "rerank", …
-    pub task:       Option<String>,
+    pub task: Option<String>,
 }
 
 impl PluginKey {
     /// Convenience: a key that matches only the given model arch.
     pub fn for_model(arch: impl Into<String>) -> Self {
-        Self { model_arch: Some(arch.into()), ..Default::default() }
+        Self {
+            model_arch: Some(arch.into()),
+            ..Default::default()
+        }
     }
 
     /// Convenience: a key that matches only the given task.
     pub fn for_task(task: impl Into<String>) -> Self {
-        Self { task: Some(task.into()), ..Default::default() }
+        Self {
+            task: Some(task.into()),
+            ..Default::default()
+        }
     }
 
     /// Convenience: a key that matches model + task.
     pub fn for_model_task(arch: impl Into<String>, task: impl Into<String>) -> Self {
         Self {
             model_arch: Some(arch.into()),
-            task:       Some(task.into()),
+            task: Some(task.into()),
             ..Default::default()
         }
     }
 
     /// Number of non-wildcard fields — higher means more specific.
     pub fn specificity(&self) -> u32 {
-        [self.model_arch.is_some(), self.gpu_arch.is_some(), self.task.is_some()]
-            .iter()
-            .filter(|&&b| b)
-            .count() as u32
+        [
+            self.model_arch.is_some(),
+            self.gpu_arch.is_some(),
+            self.task.is_some(),
+        ]
+        .iter()
+        .filter(|&&b| b)
+        .count() as u32
     }
 
     /// Does this key (as a pattern) match the given query?
@@ -102,14 +112,14 @@ impl PluginKey {
     pub fn matches(&self, query: &PluginKey) -> bool {
         fn field_ok(pattern: &Option<String>, value: &Option<String>) -> bool {
             match (pattern, value) {
-                (None, _)            => true,               // wildcard
-                (Some(p), Some(v))   => p == v,             // exact match
-                (Some(_), None)      => false,              // pattern requires a value
+                (None, _) => true,            // wildcard
+                (Some(p), Some(v)) => p == v, // exact match
+                (Some(_), None) => false,     // pattern requires a value
             }
         }
         field_ok(&self.model_arch, &query.model_arch)
             && field_ok(&self.gpu_arch, &query.gpu_arch)
-            && field_ok(&self.task,     &query.task)
+            && field_ok(&self.task, &query.task)
     }
 }
 
@@ -125,12 +135,16 @@ pub struct Registry<T: ?Sized + 'static> {
 }
 
 impl<T: ?Sized + 'static> Default for Registry<T> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: ?Sized + 'static> Registry<T> {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self {
+            entries: Vec::new(),
+        }
     }
 
     /// Register `implementation` under `key`.
@@ -142,7 +156,8 @@ impl<T: ?Sized + 'static> Registry<T> {
     pub fn register(&mut self, key: PluginKey, implementation: Box<T>) {
         self.entries.push((key, implementation));
         // Stable sort: equal-specificity entries keep insertion order.
-        self.entries.sort_by(|a, b| b.0.specificity().cmp(&a.0.specificity()));
+        self.entries
+            .sort_by_key(|b| std::cmp::Reverse(b.0.specificity()));
     }
 
     /// Register `implementation` as the global default (wildcard key).
@@ -156,21 +171,27 @@ impl<T: ?Sized + 'static> Registry<T> {
     ///
     /// Returns `None` only if the registry is empty.
     pub fn resolve(&self, query: &PluginKey) -> Option<&T> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .find(|(key, _)| key.matches(query))
             .map(|(_, imp)| imp.as_ref())
     }
 
     /// Mutable version of `resolve`.
     pub fn resolve_mut(&mut self, query: &PluginKey) -> Option<&mut T> {
-        self.entries.iter_mut()
+        self.entries
+            .iter_mut()
             .find(|(key, _)| key.matches(query))
             .map(|(_, imp)| imp.as_mut())
     }
 
     /// Number of registered implementations.
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -187,15 +208,27 @@ mod tests {
     struct Fr;
     struct FrChat;
 
-    impl Greeter for En     { fn greet(&self) -> &'static str { "hello"   } }
-    impl Greeter for Fr     { fn greet(&self) -> &'static str { "bonjour" } }
-    impl Greeter for FrChat { fn greet(&self) -> &'static str { "salut"   } }
+    impl Greeter for En {
+        fn greet(&self) -> &'static str {
+            "hello"
+        }
+    }
+    impl Greeter for Fr {
+        fn greet(&self) -> &'static str {
+            "bonjour"
+        }
+    }
+    impl Greeter for FrChat {
+        fn greet(&self) -> &'static str {
+            "salut"
+        }
+    }
 
     fn make_registry() -> Registry<dyn Greeter> {
         let mut r: Registry<dyn Greeter> = Registry::new();
         r.set_default(Box::new(En));
-        r.register(PluginKey::for_task("fr"),              Box::new(Fr));
-        r.register(PluginKey::for_model_task("x", "fr"),   Box::new(FrChat));
+        r.register(PluginKey::for_task("fr"), Box::new(Fr));
+        r.register(PluginKey::for_model_task("x", "fr"), Box::new(FrChat));
         r
     }
 
@@ -235,9 +268,10 @@ mod tests {
 
     #[test]
     fn specificity_ordering() {
-        assert!(PluginKey::for_model_task("m", "t").specificity() >
-                PluginKey::for_task("t").specificity());
-        assert!(PluginKey::for_task("t").specificity() >
-                PluginKey::default().specificity());
+        assert!(
+            PluginKey::for_model_task("m", "t").specificity()
+                > PluginKey::for_task("t").specificity()
+        );
+        assert!(PluginKey::for_task("t").specificity() > PluginKey::default().specificity());
     }
 }

@@ -23,19 +23,19 @@ use libloading::{Library, Symbol};
 use thiserror::Error;
 
 use spite_abi::{
-    ABI_VERSION, AttentionFn, FfnFn, KernelInfoFn, LayerFn, RmsNormFn,
-    SpecVerifyFn, SpiteKernelInfo, SpiteType, KERNEL_ENTRY_SYMBOL,
+    ABI_VERSION, AttentionFn, FfnFn, KERNEL_ENTRY_SYMBOL, KernelInfoFn, LayerFn, RmsNormFn,
+    SpecVerifyFn, SpiteKernelInfo,
 };
 
-pub mod fallback;
-pub mod resolve;
-pub mod hot_reload;
 pub mod cards;
+pub mod fallback;
+pub mod hot_reload;
 pub mod multi;
+pub mod resolve;
 
-pub use resolve::{KernelSpec, detect_card_id, normalize_card_name, arch_to_family_model};
 pub use cards::card_spec;
 pub use multi::{CommLink, GpuNode, MultiGpuSpec};
+pub use resolve::{KernelSpec, arch_to_family_model, detect_card_id, normalize_card_name};
 
 #[derive(Debug, Error)]
 pub enum DispatchError {
@@ -51,32 +51,28 @@ pub enum DispatchError {
 
 struct LoadedKernel {
     // Library must stay alive; dropping it unloads the .so.
-    _lib:  Library,
-    info:  &'static SpiteKernelInfo,
+    _lib: Library,
+    info: &'static SpiteKernelInfo,
 }
 
 impl LoadedKernel {
     fn open(path: &Path) -> Result<Self, DispatchError> {
         let lib: Library = unsafe { Library::new(path)? };
-        let info_fn: Symbol<KernelInfoFn> = unsafe {
-            lib.get(KERNEL_ENTRY_SYMBOL)?
-        };
+        let info_fn: Symbol<KernelInfoFn> = unsafe { lib.get(KERNEL_ENTRY_SYMBOL)? };
         let info: &'static SpiteKernelInfo = unsafe { &*info_fn() };
         if info.abi_version != ABI_VERSION {
             return Err(DispatchError::AbiMismatch {
                 kernel: info.abi_version,
-                host:   ABI_VERSION,
+                host: ABI_VERSION,
             });
         }
         Ok(Self { _lib: lib, info })
     }
 
     fn gpu_arch(&self) -> &str {
-        unsafe { CStr::from_ptr(self.info.gpu_arch) }.to_str().unwrap_or("")
-    }
-
-    fn supports_quant(&self, q: SpiteType) -> bool {
-        self.info.supported_quants.iter().any(|&v| v != 0 && v == q as u32)
+        unsafe { CStr::from_ptr(self.info.gpu_arch) }
+            .to_str()
+            .unwrap_or("")
     }
 }
 
@@ -86,18 +82,18 @@ impl LoadedKernel {
 #[derive(Debug, Clone)]
 pub struct OpSource {
     pub gpu_arch: String,
-    pub path:     PathBuf,
+    pub path: PathBuf,
 }
 
 pub struct DispatchTable {
     // ── Model-specific ops ────────────────────────────────────────────────
-    pub rms_norm:  (Option<RmsNormFn>,   OpSource),
+    pub rms_norm: (Option<RmsNormFn>, OpSource),
     pub attention: (Option<AttentionFn>, OpSource),
-    pub ffn:       (Option<FfnFn>,       OpSource),
-    pub layer:     (Option<LayerFn>,     OpSource),
+    pub ffn: (Option<FfnFn>, OpSource),
+    pub layer: (Option<LayerFn>, OpSource),
     // ── Engine-level ops (cross-model, card/arch/generic chain) ──────────
     pub speculative_verify: (Option<SpecVerifyFn>, OpSource),
-    pub prefill:            (Option<LayerFn>,      OpSource), // chunked prefill
+    pub prefill: (Option<LayerFn>, OpSource), // chunked prefill
     // Keep libraries alive.
     _libs: Vec<LoadedKernel>,
 }
@@ -106,12 +102,12 @@ impl DispatchTable {
     /// Print which kernel won each slot (for --verbose).
     pub fn print_sources(&self) {
         let rows = [
-            ("rms_norm",    &self.rms_norm.1),
-            ("attention",   &self.attention.1),
-            ("ffn",         &self.ffn.1),
-            ("layer",       &self.layer.1),
+            ("rms_norm", &self.rms_norm.1),
+            ("attention", &self.attention.1),
+            ("ffn", &self.ffn.1),
+            ("layer", &self.layer.1),
             ("spec_verify", &self.speculative_verify.1),
-            ("prefill",     &self.prefill.1),
+            ("prefill", &self.prefill.1),
         ];
         for (op, src) in rows {
             println!("  {op:<14} → {}/{}", src.gpu_arch, src.path.display());
@@ -123,14 +119,17 @@ impl DispatchTable {
 
 pub struct DispatchBuilder {
     kernels_dir: PathBuf,
-    spec:        KernelSpec,
+    spec: KernelSpec,
 }
 
 impl DispatchBuilder {
     /// Construct with a fully-populated `KernelSpec`.
     /// Use `resolve::detect_card_id` to fill `spec.card_id` from the GPU name.
     pub fn new(kernels_dir: impl AsRef<Path>, spec: KernelSpec) -> Self {
-        Self { kernels_dir: kernels_dir.as_ref().to_owned(), spec }
+        Self {
+            kernels_dir: kernels_dir.as_ref().to_owned(),
+            spec,
+        }
     }
 
     pub fn build(self) -> Result<DispatchTable, DispatchError> {
@@ -140,32 +139,72 @@ impl DispatchBuilder {
         let model_cands = self.spec.model_candidates(kdir);
         let mut model_libs: Vec<LoadedKernel> = Vec::new();
         for dir in &model_cands {
-            if let Some(k) = try_load_dir(dir) { model_libs.push(k); }
+            if let Some(k) = try_load_dir(dir) {
+                model_libs.push(k);
+            }
         }
 
         // ── Engine-level candidates (one set per feature) ──────────────────
-        let spec_cands    = self.spec.engine_candidates("speculative", kdir);
-        let prefill_cands = self.spec.engine_candidates("prefill",     kdir);
+        let spec_cands = self.spec.engine_candidates("speculative", kdir);
+        let prefill_cands = self.spec.engine_candidates("prefill", kdir);
 
-        let mut spec_libs:    Vec<LoadedKernel> = Vec::new();
+        let mut spec_libs: Vec<LoadedKernel> = Vec::new();
         let mut prefill_libs: Vec<LoadedKernel> = Vec::new();
-        for dir in &spec_cands    { if let Some(k) = try_load_dir(dir) { spec_libs.push(k); } }
-        for dir in &prefill_cands { if let Some(k) = try_load_dir(dir) { prefill_libs.push(k); } }
+        for dir in &spec_cands {
+            if let Some(k) = try_load_dir(dir) {
+                spec_libs.push(k);
+            }
+        }
+        for dir in &prefill_cands {
+            if let Some(k) = try_load_dir(dir) {
+                prefill_libs.push(k);
+            }
+        }
 
         let generic_src = OpSource {
             gpu_arch: "generic".into(),
-            path:     kdir.join("generic").join("generic"),
+            path: kdir.join("generic").join("generic"),
         };
 
         // Model ops resolved from model candidate chain
-        let rms_norm  = find_op(&model_libs, |k| k.info.rms_norm,  &model_cands, generic_src.clone());
-        let attention = find_op(&model_libs, |k| k.info.attention,  &model_cands, generic_src.clone());
-        let ffn       = find_op(&model_libs, |k| k.info.ffn,        &model_cands, generic_src.clone());
-        let layer     = find_op(&model_libs, |k| k.info.layer,      &model_cands, generic_src.clone());
+        let rms_norm = find_op(
+            &model_libs,
+            |k| k.info.rms_norm,
+            &model_cands,
+            generic_src.clone(),
+        );
+        let attention = find_op(
+            &model_libs,
+            |k| k.info.attention,
+            &model_cands,
+            generic_src.clone(),
+        );
+        let ffn = find_op(
+            &model_libs,
+            |k| k.info.ffn,
+            &model_cands,
+            generic_src.clone(),
+        );
+        let layer = find_op(
+            &model_libs,
+            |k| k.info.layer,
+            &model_cands,
+            generic_src.clone(),
+        );
 
         // Engine ops resolved from their own candidate chains
-        let speculative_verify = find_op(&spec_libs,    |k| k.info.speculative_verify, &spec_cands,    generic_src.clone());
-        let prefill            = find_op(&prefill_libs, |k| k.info.prefill,            &prefill_cands, generic_src.clone());
+        let speculative_verify = find_op(
+            &spec_libs,
+            |k| k.info.speculative_verify,
+            &spec_cands,
+            generic_src.clone(),
+        );
+        let prefill = find_op(
+            &prefill_libs,
+            |k| k.info.prefill,
+            &prefill_cands,
+            generic_src.clone(),
+        );
 
         let mut all_libs = model_libs;
         all_libs.extend(spec_libs);
@@ -186,12 +225,17 @@ impl DispatchBuilder {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn try_load_dir(dir: &Path) -> Option<LoadedKernel> {
-    if !dir.is_dir() { return None; }
+    if !dir.is_dir() {
+        return None;
+    }
     // Look for the first .so / .dylib / .dll in the directory.
     let exts = ["so", "dylib", "dll"];
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
-        if exts.iter().any(|e| path.extension().map_or(false, |x| x == *e)) {
+        if exts
+            .iter()
+            .any(|e| path.extension().is_some_and(|x| x == *e))
+        {
             return LoadedKernel::open(&path).ok();
         }
     }
@@ -199,17 +243,20 @@ fn try_load_dir(dir: &Path) -> Option<LoadedKernel> {
 }
 
 fn find_op<T: Copy>(
-    libs:       &[LoadedKernel],
-    getter:     impl Fn(&LoadedKernel) -> Option<T>,
+    libs: &[LoadedKernel],
+    getter: impl Fn(&LoadedKernel) -> Option<T>,
     candidates: &[PathBuf],
-    fallback:   OpSource,
+    fallback: OpSource,
 ) -> (Option<T>, OpSource) {
     for (lib, dir) in libs.iter().zip(candidates.iter()) {
         if let Some(f) = getter(lib) {
-            return (Some(f), OpSource {
-                gpu_arch: lib.gpu_arch().to_owned(),
-                path:     dir.clone(),
-            });
+            return (
+                Some(f),
+                OpSource {
+                    gpu_arch: lib.gpu_arch().to_owned(),
+                    path: dir.clone(),
+                },
+            );
         }
     }
     (None, fallback)
@@ -218,9 +265,34 @@ fn find_op<T: Copy>(
 // ── GPU detection ──────────────────────────────────────────────────────────
 
 /// Returns the GPU arch string for the primary GPU, e.g. "sm_89", "rdna3".
-/// Falls back to "generic" if detection fails.
+///
+/// Resolution order:
+///   1. `$SPITE_GPU_ARCH` if set (useful for testing / headless hosts).
+///   2. `nvidia-smi` compute capability, mapped to `sm_<major><minor>`.
+///   3. `"generic"` — the caller falls through to the generic kernel chain.
 pub fn detect_gpu_arch() -> String {
-    // TODO: use CUDA / HIP / Metal APIs to query compute capability.
-    // For now, try reading from environment (useful for testing).
-    std::env::var("SPITE_GPU_ARCH").unwrap_or_else(|_| "generic".into())
+    if let Ok(v) = std::env::var("SPITE_GPU_ARCH")
+        && !v.is_empty()
+    {
+        return v;
+    }
+    if let Some(arch) = detect_nvidia_arch() {
+        return arch;
+    }
+    "generic".into()
+}
+
+/// Query `nvidia-smi` for the primary GPU's compute capability and map it to
+/// the kernel-tree arch string (`"8.9"` → `"sm_89"`, `"12.0"` → `"sm_120"`).
+fn detect_nvidia_arch() -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let cap = text.lines().next()?.trim();
+    let mut parts = cap.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some(format!("sm_{major}{minor}"))
 }

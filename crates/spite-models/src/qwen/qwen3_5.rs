@@ -25,13 +25,15 @@ impl Qwen3_5 {
 }
 
 impl ModelArch for Qwen3_5 {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
+        _tokens: &[u32],
         _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        _ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
         // TODO: implement when Qwen 3.5 architecture is publicly documented.
         Err(ModelError::Forward("not implemented".into()))

@@ -36,6 +36,9 @@ fn main() -> Result<()> {
     let args = Args::parse();
     // TODO: load model via spite-loader, build DispatchTable, run warm-up then
     //       timed loops, emit BenchResult per kernel slot.
-    println!("spite-bench: model={} n_tokens={} n_runs={}", args.model, args.n_tokens, args.n_runs);
+    println!(
+        "spite-bench: model={} n_tokens={} n_runs={}",
+        args.model, args.n_tokens, args.n_runs
+    );
     Ok(())
 }

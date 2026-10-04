@@ -17,13 +17,15 @@ impl MinimaxM3 {
 }
 
 impl ModelArch for MinimaxM3 {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
+        _tokens: &[u32],
         _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        _ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
         Err(ModelError::Forward("not implemented".into()))
     }

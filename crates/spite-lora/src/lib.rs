@@ -34,26 +34,28 @@ pub enum LoraError {
 
 #[derive(Debug, Clone)]
 pub struct LoraConfig {
-    pub rank:           u32,
-    pub alpha:          f32,
+    pub rank: u32,
+    pub alpha: f32,
     pub target_modules: Vec<String>,
-    pub base_arch:      String,
+    pub base_arch: String,
 }
 
 impl LoraConfig {
     /// Scaling factor applied after B × A.
-    pub fn scale(&self) -> f32 { self.alpha / self.rank as f32 }
+    pub fn scale(&self) -> f32 {
+        self.alpha / self.rank as f32
+    }
 }
 
 /// One A/B pair for a single weight matrix in a single transformer layer.
 pub struct LoraLayer {
     pub layer_idx: usize,
-    pub module:    String,      // e.g. "attn_q"
-    pub a:         Vec<f32>,    // [rank, in_features]
-    pub b:         Vec<f32>,    // [out_features, rank]
-    pub rank:      usize,
-    pub in_feat:   usize,
-    pub out_feat:  usize,
+    pub module: String, // e.g. "attn_q"
+    pub a: Vec<f32>,    // [rank, in_features]
+    pub b: Vec<f32>,    // [out_features, rank]
+    pub rank: usize,
+    pub in_feat: usize,
+    pub out_feat: usize,
 }
 
 /// A fully loaded LoRA adapter.
@@ -72,10 +74,10 @@ impl LoraAdapter {
         //    load "blk.{i}.{module}.lora_a" and "blk.{i}.{module}.lora_b"
         Ok(Self {
             config: LoraConfig {
-                rank:           16,
-                alpha:          16.0,
+                rank: 16,
+                alpha: 16.0,
                 target_modules: vec![],
-                base_arch:      String::new(),
+                base_arch: String::new(),
             },
             layers: vec![],
         })
@@ -85,13 +87,13 @@ impl LoraAdapter {
 /// Apply a LoRA delta to a weight matrix in-place:
 ///   weight[out, in] += (b[out, rank] × a[rank, in]) * scale
 pub fn apply_lora(
-    weight:  &mut [f32],
-    a:       &[f32],
-    b:       &[f32],
-    scale:   f32,
+    weight: &mut [f32],
+    a: &[f32],
+    b: &[f32],
+    scale: f32,
     out_dim: usize,
-    in_dim:  usize,
-    rank:    usize,
+    in_dim: usize,
+    rank: usize,
 ) {
     // Compute B × A and accumulate into weight
     for o in 0..out_dim {

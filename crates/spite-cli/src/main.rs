@@ -19,17 +19,15 @@
 //!   spite run   -m Qwen3.5-27B --card RTX_4090,RX_7900_XTX -p "Hello"
 
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use spite_dispatch::{
-    normalize_card_name,
-    MultiGpuSpec, detect_gpu_arch,
-};
-use spite_loader::GgufModel;
+use spite_dispatch::{MultiGpuSpec, detect_gpu_arch, normalize_card_name};
 use spite_kvcache::KvQuantConfig;
+use spite_loader::GgufModel;
 use spite_offload::{OffloadConfig, TieredPlacement};
 
 // ── Hardware args ──────────────────────────────────────────────────────────
@@ -50,9 +48,9 @@ struct HardwareArgs {
     /// Examples: RTX_5090  |  RTX_5070,RTX_3090  |  RTX_4090,RX_7900_XTX
     #[arg(
         long = "card",
-        env  = "SPITE_CARD",
+        env = "SPITE_CARD",
         value_name = "CARD[,CARD…]",
-        value_delimiter = ',',
+        value_delimiter = ','
     )]
     cards: Vec<String>,
 
@@ -79,33 +77,38 @@ struct HardwareArgs {
     ///
     /// Asymmetric (K is more sensitive than V):
     ///   --kv-quant q8,q5_1   K at q8, V at q5_1
-    #[arg(
-        long = "kv-quant",
-        env  = "SPITE_KV_QUANT",
-        value_name = "TYPE[,TYPE]",
-    )]
+    #[arg(long = "kv-quant", env = "SPITE_KV_QUANT", value_name = "TYPE[,TYPE]")]
     kv_quant: Option<String>,
 
     // ── Advanced (hidden from --help; still usable) ────────────────────────
-
     /// [advanced] Override GPU arch detection (e.g. sm_89, rdna3, metal).
     /// Ignored when --card is given.
-    #[arg(long = "gpu-arch", env = "SPITE_GPU_ARCH", value_name = "ARCH", hide = true)]
+    #[arg(
+        long = "gpu-arch",
+        env = "SPITE_GPU_ARCH",
+        value_name = "ARCH",
+        hide = true
+    )]
     gpu_arch: Option<String>,
 
     /// [advanced] Manual layer counts per GPU (comma-separated).
     /// Default: proportional to each GPU's VRAM.
     /// E.g. --layer-split 20,12 assigns ≈20/32 layers to the first GPU.
-    #[arg(long = "layer-split", value_name = "N[,N…]", value_delimiter = ',', hide = true)]
+    #[arg(
+        long = "layer-split",
+        value_name = "N[,N…]",
+        value_delimiter = ',',
+        hide = true
+    )]
     layer_split: Vec<u32>,
 
     /// [advanced] Directory containing compiled kernel .so files.
     #[arg(
         long = "kernels-dir",
-        env  = "SPITE_KERNELS_DIR",
+        env = "SPITE_KERNELS_DIR",
         default_value = "kernels",
         value_name = "DIR",
-        hide = true,
+        hide = true
     )]
     kernels_dir: PathBuf,
 
@@ -113,10 +116,10 @@ struct HardwareArgs {
     /// Only relevant when --offload-ram or --offload-disk is set.
     #[arg(
         long = "vram-reserve-gib",
-        env  = "SPITE_VRAM_RESERVE_GIB",
+        env = "SPITE_VRAM_RESERVE_GIB",
         default_value_t = 2,
         value_name = "GIB",
-        hide = true,
+        hide = true
     )]
     vram_reserve_gib: u32,
 }
@@ -163,11 +166,7 @@ struct ModelArgs {
     /// "Org/Name"            look in $SPITE_MODELS_DIR (default: ~/.spite/models)
     /// "/abs/path/file.gguf" direct path
     /// "target,draft"        two models for speculative decoding
-    #[arg(
-        short = 'm',
-        long  = "model",
-        value_name = "MODEL[,DRAFT]",
-    )]
+    #[arg(short = 'm', long = "model", value_name = "MODEL[,DRAFT]")]
     model: String,
 }
 
@@ -175,14 +174,14 @@ struct ModelArgs {
 
 #[derive(Parser)]
 #[command(
-    name    = "spite",
-    about   = "One Engine, Your Model, Your Card.",
+    name = "spite",
+    about = "One Engine, Your Model, Your Card.",
     long_about = "One Engine, Your Model, Your Card.\n\n\
                   spite auto-tunes for your GPU and model — no -ngl, no batch-size \
                   knobs, no dozens of flags.\n\
                   Pass --card and -m and you're running at peak performance.",
     version,
-    propagate_version = true,
+    propagate_version = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -293,18 +292,25 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.cmd {
-        Cmd::Run { model, hw, feat, prompt, max_tokens, temperature, ctx } => {
-            cmd_run(&model, &hw, &feat, &prompt, max_tokens, temperature, ctx)
-        }
-        Cmd::Serve { model, hw, feat, host, port, ctx } => {
-            cmd_serve(&model, &hw, &feat, &host, port, ctx)
-        }
-        Cmd::Dispatch { model, hw, feat } => {
-            cmd_dispatch(&model, &hw, &feat)
-        }
-        Cmd::Pull { model, quant } => {
-            cmd_pull(&model, &quant)
-        }
+        Cmd::Run {
+            model,
+            hw,
+            feat,
+            prompt,
+            max_tokens,
+            temperature,
+            ctx,
+        } => cmd_run(&model, &hw, &feat, &prompt, max_tokens, temperature, ctx),
+        Cmd::Serve {
+            model,
+            hw,
+            feat,
+            host,
+            port,
+            ctx,
+        } => cmd_serve(&model, &hw, &feat, &host, port, ctx),
+        Cmd::Dispatch { model, hw, feat } => cmd_dispatch(&model, &hw, &feat),
+        Cmd::Pull { model, quant } => cmd_pull(&model, &quant),
     }
 }
 
@@ -313,8 +319,12 @@ fn main() -> Result<()> {
 fn resolve_hardware(hw: &HardwareArgs) -> MultiGpuSpec {
     if hw.cards.is_empty() {
         let arch = hw.gpu_arch.clone().unwrap_or_else(detect_gpu_arch);
-        let raw  = std::env::var("SPITE_CARD").unwrap_or_default();
-        let card = if raw.is_empty() { arch.clone() } else { normalize_card_name(&raw) };
+        let raw = std::env::var("SPITE_CARD").unwrap_or_default();
+        let card = if raw.is_empty() {
+            arch.clone()
+        } else {
+            normalize_card_name(&raw)
+        };
         MultiGpuSpec::from_cards(&[card.as_str()])
     } else {
         let refs: Vec<&str> = hw.cards.iter().map(String::as_str).collect();
@@ -337,7 +347,9 @@ fn models_dir() -> PathBuf {
 fn resolve_model_path(name: &str) -> Result<PathBuf> {
     let p = Path::new(name);
     if p.is_absolute() || name.starts_with("./") || name.starts_with("../") {
-        if p.exists() { return Ok(p.to_owned()); }
+        if p.exists() {
+            return Ok(p.to_owned());
+        }
         bail!("model path not found: {name}");
     }
     let dir = models_dir();
@@ -352,19 +364,27 @@ fn resolve_model_path(name: &str) -> Result<PathBuf> {
     let candidates = vec![
         dir.join(format!("{base}.gguf")),
         dir.join(name).with_extension("gguf"),
-        dir.join(name.split('/').last().unwrap_or(name)).with_extension("gguf"),
+        dir.join(name.split('/').next_back().unwrap_or(name))
+            .with_extension("gguf"),
     ];
     for c in &candidates {
-        if c.exists() { return Ok(c.clone()); }
+        if c.exists() {
+            return Ok(c.clone());
+        }
     }
-    let short = name.split('/').last().unwrap_or(name).to_lowercase();
+    let short = name.split('/').next_back().unwrap_or(name).to_lowercase();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for entry in rd.flatten() {
             let p = entry.path();
-            if p.extension().map_or(false, |e| e == "gguf") {
-                let stem = p.file_stem().unwrap_or_default()
-                    .to_string_lossy().to_lowercase();
-                if stem.contains(&short) { return Ok(p); }
+            if p.extension().is_some_and(|e| e == "gguf") {
+                let stem = p
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                if stem.contains(&short) {
+                    return Ok(p);
+                }
             }
         }
     }
@@ -379,7 +399,8 @@ fn resolve_model_path(name: &str) -> Result<PathBuf> {
 fn resolve_models(spec: &str) -> Result<(PathBuf, Option<PathBuf>)> {
     let parts: Vec<&str> = spec.splitn(2, ',').collect();
     let target = resolve_model_path(parts[0].trim())?;
-    let draft  = parts.get(1)
+    let draft = parts
+        .get(1)
         .map(|s| resolve_model_path(s.trim()))
         .transpose()?;
     Ok((target, draft))
@@ -388,18 +409,18 @@ fn resolve_models(spec: &str) -> Result<(PathBuf, Option<PathBuf>)> {
 // ── Command implementations ────────────────────────────────────────────────
 
 fn cmd_run(
-    model_args:  &ModelArgs,
-    hw:          &HardwareArgs,
-    feat:        &FeatureArgs,
-    prompt:      &str,
-    max_tokens:  usize,
+    model_args: &ModelArgs,
+    hw: &HardwareArgs,
+    feat: &FeatureArgs,
+    prompt: &str,
+    max_tokens: usize,
     temperature: f32,
-    ctx:         Option<usize>,
+    ctx: Option<usize>,
 ) -> Result<()> {
     let (target, draft) = resolve_models(&model_args.model)?;
-    let mgpu            = resolve_hardware(hw);
-    let target_gguf     = GgufModel::open(&target)?;
-    let model_arch      = target_gguf.arch().to_owned();
+    let mgpu = resolve_hardware(hw);
+    let target_gguf = GgufModel::open(&target)?;
+    let model_arch = target_gguf.arch().to_owned();
 
     let kv_cfg = resolve_kv_quant(hw);
 
@@ -414,7 +435,7 @@ fn cmd_run(
 
     print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
 
-    let vram_gib    = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
+    let vram_gib = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
     let model_bytes = std::fs::metadata(&target).map_or(0, |m| m.len());
     maybe_print_offload_plan(hw, vram_gib, model_bytes, 0);
 
@@ -430,16 +451,16 @@ fn cmd_run(
 
 fn cmd_serve(
     model_args: &ModelArgs,
-    hw:         &HardwareArgs,
-    feat:       &FeatureArgs,
-    host:       &str,
-    port:       u16,
-    ctx:        Option<usize>,
+    hw: &HardwareArgs,
+    feat: &FeatureArgs,
+    host: &str,
+    port: u16,
+    ctx: Option<usize>,
 ) -> Result<()> {
     let (target, draft) = resolve_models(&model_args.model)?;
-    let mgpu            = resolve_hardware(hw);
-    let target_gguf     = GgufModel::open(&target)?;
-    let model_arch      = target_gguf.arch().to_owned();
+    let mgpu = resolve_hardware(hw);
+    let target_gguf = GgufModel::open(&target)?;
+    let model_arch = target_gguf.arch().to_owned();
     let kv_cfg = resolve_kv_quant(hw);
 
     print_engine_header(&model_arch, &mgpu);
@@ -453,7 +474,7 @@ fn cmd_serve(
 
     print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
 
-    let vram_gib    = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
+    let vram_gib = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
     let model_bytes = std::fs::metadata(&target).map_or(0, |m| m.len());
     maybe_print_offload_plan(hw, vram_gib, model_bytes, 0);
 
@@ -467,9 +488,9 @@ fn cmd_serve(
 
 fn cmd_dispatch(model_args: &ModelArgs, hw: &HardwareArgs, feat: &FeatureArgs) -> Result<()> {
     let (target, _) = resolve_models(&model_args.model)?;
-    let mgpu        = resolve_hardware(hw);
-    let gguf        = GgufModel::open(&target)?;
-    let model_arch  = gguf.arch().to_owned();
+    let mgpu = resolve_hardware(hw);
+    let gguf = GgufModel::open(&target)?;
+    let model_arch = gguf.arch().to_owned();
     let kv_cfg = resolve_kv_quant(hw);
 
     print_engine_header(&model_arch, &mgpu);
@@ -477,7 +498,7 @@ fn cmd_dispatch(model_args: &ModelArgs, hw: &HardwareArgs, feat: &FeatureArgs) -
     print_kv_quant_summary(&kv_cfg);
     print_dispatch_tables(&model_arch, &mgpu, &hw.kernels_dir)?;
 
-    let vram_gib    = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
+    let vram_gib = mgpu.nodes.first().map_or(0, |n| n.vram_gib);
     let model_bytes = std::fs::metadata(&target).map_or(0, |m| m.len());
     maybe_print_offload_plan(hw, vram_gib, model_bytes, 0);
     Ok(())
@@ -502,7 +523,11 @@ fn print_engine_header(model_arch: &str, mgpu: &MultiGpuSpec) {
     println!("model arch   : {model_arch}");
     if mgpu.nodes.len() == 1 {
         let n = &mgpu.nodes[0];
-        let vram_s = if n.vram_gib > 0 { format!(" ({} GiB)", n.vram_gib) } else { String::new() };
+        let vram_s = if n.vram_gib > 0 {
+            format!(" ({} GiB)", n.vram_gib)
+        } else {
+            String::new()
+        };
         println!("card         : {}{vram_s}", n.card_id);
         println!("gpu arch     : {}", n.gpu_arch);
     } else {
@@ -517,33 +542,48 @@ fn resolve_kv_quant(hw: &HardwareArgs) -> KvQuantConfig {
     };
     match KvQuantConfig::from_str(s) {
         Ok(cfg) => cfg,
-        Err(e)  => { eprintln!("warning: {e} — using f16 default"); KvQuantConfig::default() }
+        Err(e) => {
+            eprintln!("warning: {e} — using f16 default");
+            KvQuantConfig::default()
+        }
     }
 }
 
 fn print_kv_quant_summary(cfg: &KvQuantConfig) {
-    if cfg.is_default() { return; }
+    if cfg.is_default() {
+        return;
+    }
     if cfg.key == cfg.val {
         println!("kv cache     : {} start  (auto-VBR)", cfg.key);
     } else {
-        println!("kv cache     : K={} V={} start  (auto-VBR)", cfg.key, cfg.val);
+        println!(
+            "kv cache     : K={} V={} start  (auto-VBR)",
+            cfg.key, cfg.val
+        );
     }
 }
 
 fn print_feature_summary(feat: &FeatureArgs) {
     let mut active: Vec<&str> = Vec::new();
-    if feat.mtp     { active.push("mtp"); }
-    if feat.dflash2 { active.push("dflash2"); }
-    else if feat.dflash { active.push("dflash"); }
-    if feat.vision  { active.push("vision"); }
+    if feat.mtp {
+        active.push("mtp");
+    }
+    if feat.dflash2 {
+        active.push("dflash2");
+    } else if feat.dflash {
+        active.push("dflash");
+    }
+    if feat.vision {
+        active.push("vision");
+    }
     if !active.is_empty() {
         println!("features     : {}", active.join(", "));
     }
 }
 
 fn print_dispatch_tables(
-    model_arch:  &str,
-    mgpu:        &MultiGpuSpec,
+    model_arch: &str,
+    mgpu: &MultiGpuSpec,
     kernels_dir: &std::path::Path,
 ) -> Result<()> {
     let tables = mgpu.build_tables(model_arch, kernels_dir);
@@ -562,17 +602,31 @@ fn maybe_print_offload_plan(hw: &HardwareArgs, vram_gib: u32, model_bytes: u64, 
         return;
     }
     const GIB: u64 = 1 << 30;
-    let ram_bytes  = read_total_ram_bytes().unwrap_or(16 * GIB);
+    let ram_bytes = read_total_ram_bytes().unwrap_or(16 * GIB);
     let ram_budget = if hw.offload_disk { u64::MAX } else { ram_bytes };
-    let bytes_per_layer = if n_layers > 0 { model_bytes / n_layers as u64 } else { model_bytes };
+    let bytes_per_layer = if n_layers > 0 {
+        model_bytes / n_layers as u64
+    } else {
+        model_bytes
+    };
     let cfg = OffloadConfig {
         vram_reserved_bytes: hw.vram_reserve_gib as u64 * GIB,
-        ram_budget_bytes:    ram_budget,
+        ram_budget_bytes: ram_budget,
         ..Default::default()
     };
-    match TieredPlacement::plan(vram_gib as u64 * GIB, ram_bytes, bytes_per_layer, n_layers, &cfg, None) {
-        Ok(plan)  => { println!(); plan.print_summary(vram_gib, bytes_per_layer); }
-        Err(e)    => eprintln!("offload plan error: {e}"),
+    match TieredPlacement::plan(
+        vram_gib as u64 * GIB,
+        ram_bytes,
+        bytes_per_layer,
+        n_layers,
+        &cfg,
+        None,
+    ) {
+        Ok(plan) => {
+            println!();
+            plan.print_summary(vram_gib, bytes_per_layer);
+        }
+        Err(e) => eprintln!("offload plan error: {e}"),
     }
 }
 

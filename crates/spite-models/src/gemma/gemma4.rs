@@ -30,13 +30,15 @@ impl Gemma4 {
 }
 
 impl ModelArch for Gemma4 {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
+        _tokens: &[u32],
         _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        _ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
         // TODO: implement once Gemma 4 architecture is documented.
         Err(ModelError::Forward("not implemented".into()))

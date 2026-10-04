@@ -58,12 +58,12 @@ pub enum TokenizerError {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
-    Normal      = 1,
-    Unknown     = 2,
-    Control     = 3,
+    Normal = 1,
+    Unknown = 2,
+    Control = 3,
     UserDefined = 4,
-    Unused      = 5,
-    Byte        = 6,
+    Unused = 5,
+    Byte = 6,
 }
 
 // ── Vocabulary ────────────────────────────────────────────────────────────
@@ -112,7 +112,7 @@ pub enum TokenizerKind {
 
 pub struct Tokenizer {
     pub vocab: Vocab,
-    pub kind:  TokenizerKind,
+    pub kind: TokenizerKind,
     // TODO: BPE merge table or SP model trie
 }
 
@@ -126,9 +126,15 @@ impl Tokenize for Tokenizer {
     fn decode_one(&self, id: u32) -> Cow<'_, str> {
         self.decode_one(id)
     }
-    fn vocab_size(&self) -> usize { self.vocab.vocab_size() }
-    fn bos_id(&self) -> u32      { self.vocab.bos_id }
-    fn eos_id(&self) -> u32      { self.vocab.eos_id }
+    fn vocab_size(&self) -> usize {
+        self.vocab.vocab_size()
+    }
+    fn bos_id(&self) -> u32 {
+        self.vocab.bos_id
+    }
+    fn eos_id(&self) -> u32 {
+        self.vocab.eos_id
+    }
 }
 
 impl Tokenizer {
