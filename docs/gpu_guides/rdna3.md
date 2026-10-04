@@ -36,7 +36,7 @@ from the ROCm runtime package. On most distros: `sudo apt install rocm-hip-sdk`.
 
 **L3 (Infinity Cache) is the key advantage.**  
 96 MB of L3 on the 7900 XTX is larger than NVIDIA's 72 MB L2 on the 4090,
-and it's shared across all CUs. At ctx_len=4096, llama3-8b K/V fits entirely
+and it's shared across all CUs. At ctx_len=4096, an 8B model's K/V fits entirely
 in L3. Subsequent tokens hit L3 instead of HBM — bandwidth effectively
 doubles for the attention KV-read bottleneck.
 

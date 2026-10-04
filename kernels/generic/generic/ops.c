@@ -145,10 +145,13 @@ int spite_generic_ffn(
     const SpiteTensor *w_gate,
     const SpiteTensor *w_up,
     const SpiteTensor *w_down,
+    SpiteFfnActivation activation,
     const SpiteCtx    *ctx
 ) {
     (void)ctx;
     if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
+    /* Only SwiGLU is implemented; the dispatcher falls back for the rest. */
+    if (activation != SPITE_FFN_SILU_GATE) return -1;
 
     float *wg = dequant_to_f32(w_gate);
     float *wu = dequant_to_f32(w_up);
@@ -194,11 +197,10 @@ int spite_generic_attention(
     const SpiteTensor *wv,
     const SpiteTensor *wo,
     SpiteKvCache      *kvcache,
-    int                pos,
     float              rope_freq_base,
     const SpiteCtx    *ctx
 ) {
     (void)out; (void)x; (void)wq; (void)wk; (void)wv; (void)wo;
-    (void)kvcache; (void)pos; (void)rope_freq_base; (void)ctx;
+    (void)kvcache; (void)rope_freq_base; (void)ctx;
     return -1; /* defer to Rust scalar fallback */
 }

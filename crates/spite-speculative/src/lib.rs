@@ -10,9 +10,9 @@
 //! a kernel op in the ABI — `SpiteSpecVerifyFn`. Each GPU architecture can
 //! ship an optimized implementation:
 //!
-//!   kernels/llama3/sm_89/speculative_verify.cu  ← fused softmax+compare
-//!   kernels/llama3/rdna3/speculative_verify.hip
-//!   kernels/generic/generic/spec_verify.c       ← scalar fallback
+//!   kernels/_engine/speculative/sm_89/speculative_verify.cu  ← fused softmax+compare
+//!   kernels/_engine/speculative/rdna3/speculative_verify.hip
+//!   kernels/_engine/speculative/generic/spec_verify.c        ← scalar fallback
 //!
 //! If no optimized kernel exists the dispatcher falls back to the generic
 //! scalar implementation in `verify::scalar_verify`.

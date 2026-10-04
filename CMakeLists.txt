@@ -9,15 +9,16 @@ set(CMAKE_CUDA_STANDARD         20)   # CUDA 12.x supports C++20; 23 coming
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
 # ── User build selections ─────────────────────────────────────────────────
-# cmake -DSPITE_MODELS="llama3,mistral" -DSPITE_GPU_ARCHS="sm_89,rdna3"
-set(SPITE_MODELS      "llama3"      CACHE STRING "Comma-separated model list")
-set(SPITE_GPU_ARCHS   "sm_89"       CACHE STRING "Comma-separated GPU arch list")
-set(SPITE_QUANT_TYPES "q4_k,q8_0"  CACHE STRING "Comma-separated quant types (informational)")
+# Model specs are "<family>/<model>" pairs matching the kernels/ tree:
+# cmake -DSPITE_MODELS="llama/llama3,mistral/mistral4" -DSPITE_GPU_ARCHS="sm_89,rdna3"
+set(SPITE_MODELS      "llama/llama3"  CACHE STRING "Comma-separated <family>/<model> list")
+set(SPITE_GPU_ARCHS   "sm_89"         CACHE STRING "Comma-separated GPU arch list")
+set(SPITE_QUANT_TYPES "q4_k,q8_0"     CACHE STRING "Comma-separated quant types (informational)")
 
-string(REPLACE "," ";" _models  ${SPITE_MODELS})
-string(REPLACE "," ";" _archs   ${SPITE_GPU_ARCHS})
+string(REPLACE "," ";" _model_specs ${SPITE_MODELS})
+string(REPLACE "," ";" _archs       ${SPITE_GPU_ARCHS})
 
-message(STATUS "spite kernels: models=${_models}  archs=${_archs}")
+message(STATUS "spite kernels: models=${_model_specs}  archs=${_archs}")
 
 # ── CUDA arch flags ───────────────────────────────────────────────────────
 set(_cuda_archs "")
@@ -39,11 +40,20 @@ add_compile_options(
 )
 
 # ── Kernel targets ────────────────────────────────────────────────────────
-# For each (model, gpu_arch) pair, compile all .cu/.cpp/.c files into a
-# shared library: libkernel_<model>_<arch>.so
-foreach(_model ${_models})
+# For each (<family>/<model>, gpu_arch) pair, compile all .cu/.cpp/.c files
+# into a shared library: libkernel_<family>_<model>_<arch>.so
+foreach(_spec ${_model_specs})
+    string(REPLACE "/" ";" _parts "${_spec}")
+    list(LENGTH _parts _n_parts)
+    if(NOT _n_parts EQUAL 2)
+        message(WARNING "spite kernels: skipping '${_spec}' — expected <family>/<model>")
+        continue()
+    endif()
+    list(GET _parts 0 _family)
+    list(GET _parts 1 _model)
+
     foreach(_arch ${_archs})
-        set(_dir "${CMAKE_SOURCE_DIR}/kernels/${_model}/${_arch}")
+        set(_dir "${CMAKE_SOURCE_DIR}/kernels/${_family}/${_model}/${_arch}")
         if(NOT IS_DIRECTORY "${_dir}")
             continue()
         endif()
@@ -59,7 +69,7 @@ foreach(_model ${_models})
             continue()
         endif()
 
-        set(_target "kernel_${_model}_${_arch}")
+        set(_target "kernel_${_family}_${_model}_${_arch}")
         add_library(${_target} SHARED ${_srcs})
         target_include_directories(${_target} PRIVATE "${CMAKE_SOURCE_DIR}")
 
@@ -72,11 +82,18 @@ foreach(_model ${_models})
         endif()
 
         set_target_properties(${_target} PROPERTIES
-            OUTPUT_NAME      "kernel_${_model}_${_arch}"
-            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/kernels/${_model}/${_arch}"
+            OUTPUT_NAME      "kernel_${_family}_${_model}_${_arch}"
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/kernels/${_family}/${_model}/${_arch}"
         )
 
-        message(STATUS "spite kernels: + ${_model}/${_arch}")
+        # `cmake --install build --prefix .` copies the .so into ./kernels/,
+        # which the host checks by default.
+        install(TARGETS ${_target}
+            LIBRARY DESTINATION kernels/${_family}/${_model}/${_arch}
+            RUNTIME DESTINATION kernels/${_family}/${_model}/${_arch}
+        )
+
+        message(STATUS "spite kernels: + ${_family}/${_model}/${_arch}")
     endforeach()
 endforeach()
 
@@ -87,5 +104,9 @@ if(_generic_srcs)
     target_include_directories(kernel_generic PRIVATE "${CMAKE_SOURCE_DIR}")
     set_target_properties(kernel_generic PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/kernels/generic/generic"
+    )
+    install(TARGETS kernel_generic
+        LIBRARY DESTINATION kernels/generic/generic
+        RUNTIME DESTINATION kernels/generic/generic
     )
 endif()

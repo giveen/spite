@@ -33,7 +33,7 @@ pub mod hot_reload;
 pub mod cards;
 pub mod multi;
 
-pub use resolve::{KernelSpec, detect_card_id, normalize_card_name};
+pub use resolve::{KernelSpec, detect_card_id, normalize_card_name, arch_to_family_model};
 pub use cards::card_spec;
 pub use multi::{CommLink, GpuNode, MultiGpuSpec};
 
@@ -82,7 +82,7 @@ impl LoadedKernel {
 
 // ── Dispatch table ─────────────────────────────────────────────────────────
 
-/// Source label for each resolved op — shown by `spite benchmark --verbose`.
+/// Source label for each resolved op — shown by `spite dispatch`.
 #[derive(Debug, Clone)]
 pub struct OpSource {
     pub gpu_arch: String,

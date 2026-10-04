@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 pub struct KernelSpec {
     /// Model family directory: "llama", "deepseek", "qwen", …
     pub family:   String,
-    /// Model variant directory: "llama3", "v3", "qwen3", …
+    /// Model variant directory: "llama4", "v4", "qwen3_5", …
     pub model:    String,
     /// GPU architecture: "sm_89", "rdna4", "cdna3", "metal", …
     pub gpu_arch: String,
@@ -54,13 +54,16 @@ impl KernelSpec {
     /// Convenience constructor for callers that only know the GGUF arch string
     /// and GPU arch (no family/model split, no card/quant).
     /// Suitable for the CLI and server when no richer spec is available.
+    ///
+    /// The GGUF `general.architecture` string is translated to the kernel
+    /// tree's `<family>/<model>` directory pair via [`arch_to_family_model`],
+    /// so model-specific kernels are found when they exist; generic fallbacks
+    /// still apply when they don't.
     pub fn from_arch(model_arch: &str, gpu_arch: &str) -> Self {
-        // Use the arch string as a stand-in for both family and model so that
-        // model-specific kernels under kernels/<family>/<model>/ are found if
-        // they exist; generic fallbacks still apply when they don't.
+        let (family, model) = arch_to_family_model(model_arch);
         Self {
-            family:   model_arch.into(),
-            model:    model_arch.into(),
+            family,
+            model,
             gpu_arch: gpu_arch.into(),
             card_id:  String::new(),
             quant:    String::new(),
@@ -118,6 +121,58 @@ impl KernelSpec {
         paths.push(kernels_dir.join("_engine").join(feature).join("generic"));
         paths
     }
+}
+
+// ── GGUF arch → kernel tree mapping ────────────────────────────────────────
+
+/// Map a GGUF `general.architecture` string to the kernel tree's
+/// `<family>/<model>` directory pair.
+///
+/// The GGUF arch does not encode the kernel-tree family/variant split —
+/// `qwen35` lives in `kernels/qwen/qwen3_5/`, `deepseek4` in
+/// `kernels/deepseek/v4/`, and so on. This table is the single source of
+/// truth bridging model detection (`spite-models`) and kernel resolution.
+///
+/// Unknown architectures map to `(arch, arch)` so the generic fallback still
+/// applies.
+pub fn arch_to_family_model(arch: &str) -> (String, String) {
+    let (family, model) = match arch {
+        // ── Llama ────────────────────────────────────────────────────────
+        "llama4" => ("llama", "llama4"),
+
+        // ── Mistral ──────────────────────────────────────────────────────
+        "mistral4" | "magistral" => ("mistral", "mistral4"),
+
+        // ── Qwen ─────────────────────────────────────────────────────────
+        "qwen35" | "qwen35moe" => ("qwen", "qwen3_5"),
+        "qwen4" | "qwen4exp"   => ("qwen", "qwen4"),
+
+        // ── DeepSeek ─────────────────────────────────────────────────────
+        "deepseek4" => ("deepseek", "v4"),
+
+        // ── Gemma ────────────────────────────────────────────────────────
+        "gemma4" => ("gemma", "gemma4"),
+
+        // ── GLM ──────────────────────────────────────────────────────────
+        "glm-dsa"            => ("glm", "glm_dsa"),
+        "glm5" | "glm5-next" => ("glm", "glm5"),
+
+        // ── MiniMax ──────────────────────────────────────────────────────
+        "minimax-m3" => ("minimax", "m3"),
+
+        // ── Kimi ─────────────────────────────────────────────────────────
+        "kimi-k3" => ("kimi", "k3"),
+
+        // ── Draft / speculative ──────────────────────────────────────────
+        "eagle3" => ("eagle", "eagle3"),
+
+        // ── Code completion ──────────────────────────────────────────────
+        "mellum" => ("mellum", "base"),
+
+        // Unknown arch: keep the old behaviour so generic fallback applies.
+        _ => (arch, arch),
+    };
+    (family.to_owned(), model.to_owned())
 }
 
 // ── Card detection ─────────────────────────────────────────────────────────
@@ -182,7 +237,7 @@ mod tests {
     fn spec_full() -> KernelSpec {
         KernelSpec {
             family:   "llama".into(),
-            model:    "llama3".into(),
+            model:    "llama4".into(),
             gpu_arch: "sm_89".into(),
             card_id:  "rtx_4090".into(),
             quant:    "Q4_K_M".into(),
@@ -192,7 +247,7 @@ mod tests {
     fn spec_arch_only() -> KernelSpec {
         KernelSpec {
             family:   "deepseek".into(),
-            model:    "v3".into(),
+            model:    "v4".into(),
             gpu_arch: "sm_89".into(),
             ..Default::default()
         }
@@ -202,10 +257,10 @@ mod tests {
     fn model_candidates_full_spec() {
         let root = PathBuf::from("/k");
         let c = spec_full().model_candidates(&root);
-        assert_eq!(c[0], PathBuf::from("/k/llama/llama3/sm_89/rtx_4090/Q4_K_M"));
-        assert_eq!(c[1], PathBuf::from("/k/llama/llama3/sm_89/rtx_4090"));
-        assert_eq!(c[2], PathBuf::from("/k/llama/llama3/sm_89/Q4_K_M"));
-        assert_eq!(c[3], PathBuf::from("/k/llama/llama3/sm_89"));
+        assert_eq!(c[0], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090/Q4_K_M"));
+        assert_eq!(c[1], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090"));
+        assert_eq!(c[2], PathBuf::from("/k/llama/llama4/sm_89/Q4_K_M"));
+        assert_eq!(c[3], PathBuf::from("/k/llama/llama4/sm_89"));
         // generic_cuda before generic/<arch>
         assert_eq!(c[4], PathBuf::from("/k/generic/generic_cuda"));
         assert_eq!(c[5], PathBuf::from("/k/generic/sm_89"));
@@ -216,7 +271,7 @@ mod tests {
     fn model_candidates_arch_only() {
         let root = PathBuf::from("/k");
         let c = spec_arch_only().model_candidates(&root);
-        assert_eq!(c[0], PathBuf::from("/k/deepseek/v3/sm_89"));
+        assert_eq!(c[0], PathBuf::from("/k/deepseek/v4/sm_89"));
         assert_eq!(c[1], PathBuf::from("/k/generic/generic_cuda"));
         assert_eq!(c[2], PathBuf::from("/k/generic/sm_89"));
         assert_eq!(c[3], PathBuf::from("/k/generic/generic"));
@@ -243,6 +298,28 @@ mod tests {
         let c = spec.engine_candidates("speculative", &root);
         assert_eq!(c[0], PathBuf::from("/k/_engine/speculative/sm_89"));
         assert_eq!(c[1], PathBuf::from("/k/_engine/speculative/generic"));
+    }
+
+    #[test]
+    fn arch_maps_to_family_model() {
+        assert_eq!(arch_to_family_model("qwen35"),   ("qwen".into(),     "qwen3_5".into()));
+        assert_eq!(arch_to_family_model("qwen4"),    ("qwen".into(),     "qwen4".into()));
+        assert_eq!(arch_to_family_model("llama4"),   ("llama".into(),    "llama4".into()));
+        assert_eq!(arch_to_family_model("deepseek4"),("deepseek".into(), "v4".into()));
+        assert_eq!(arch_to_family_model("gemma4"),   ("gemma".into(),    "gemma4".into()));
+        assert_eq!(arch_to_family_model("glm5-next"),("glm".into(),      "glm5".into()));
+        // Unknown arch falls back to (arch, arch) so generic still applies.
+        assert_eq!(arch_to_family_model("mystery"),  ("mystery".into(),  "mystery".into()));
+    }
+
+    #[test]
+    fn from_arch_resolves_nested_dir() {
+        let root = PathBuf::from("/k");
+        let c = KernelSpec::from_arch("qwen35", "sm_120").model_candidates(&root);
+        assert_eq!(c[0], PathBuf::from("/k/qwen/qwen3_5/sm_120"));
+        // Unknown arch keeps the flat (family == model == arch) layout.
+        let c = KernelSpec::from_arch("mystery", "sm_120").model_candidates(&root);
+        assert_eq!(c[0], PathBuf::from("/k/mystery/mystery/sm_120"));
     }
 
     #[test]

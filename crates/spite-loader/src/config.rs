@@ -12,7 +12,7 @@
 //!   general.architecture                       str  → arch
 //!   tokenizer.ggml.token_count                 u32  → vocab_size
 //!
-//! The arch prefix changes per model family (mistral, phi3, …) but the
+//! The arch prefix changes per model family (llama4, mistral4, …) but the
 //! suffix conventions are shared. `ModelHyperparams::from_meta` handles
 //! the lookup transparently.
 

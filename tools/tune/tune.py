@@ -53,7 +53,7 @@ def main():
     print("Planned implementation:")
     print("  1. dlopen kernel, extract source path from debug info")
     print("  2. For each config: recompile with -D<PARAM>=<value>")
-    print("  3. dlopen recompiled .so, run op with spite bench harness")
+    print("  3. dlopen recompiled .so, run op with spite-bench harness")
     print("  4. Track best config, emit #define block to stdout / --out")
     sys.exit(0)
 

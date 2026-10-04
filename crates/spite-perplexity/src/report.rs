@@ -1,7 +1,7 @@
 //! Human-readable and machine-readable report output.
 //!
 //! The report is printed to stdout and optionally written as JSON.
-//! The JSON format is what `spite bench` uses when it runs the full
+//! The JSON format is what `spite-bench` uses when it runs the full
 //! PPL + KLD suite and embeds the result in a PR description.
 
 use serde::Serialize;

@@ -17,36 +17,16 @@
 //!   3. Register GGUF arch strings in ArchRegistry::default() below
 //!   4. Add kernel dirs: kernels/<family>/<model>/<gpu_arch>/
 
-// Existing families
+// 2026 model families. Each family keeps only its current-generation
+// variant; older generations were removed. See kernels/<family>/<model>/.
 pub mod llama;
 pub mod mistral;
-pub mod phi;
-
-// 2025 model families
 pub mod qwen;
 pub mod deepseek;
 pub mod gemma;
-pub mod falcon;
-pub mod rwkv;
-pub mod mamba;
 pub mod glm;
-pub mod granite;
-pub mod nemotron;
-pub mod olmo;
-pub mod jamba;
 pub mod minimax;
-pub mod modern_bert;
-
-// Additional 2025 families
-pub mod cohere;
-pub mod exaone;
-pub mod hunyuan;
-pub mod ernie;
-pub mod lfm;
 pub mod kimi;
-pub mod smollm;
-pub mod minicpm;
-pub mod plamo;
 pub mod eagle;
 pub mod mellum;
 
@@ -168,114 +148,34 @@ impl Default for ArchRegistry {
         Self {
             entries: vec![
                 // ── Llama family ─────────────────────────────────────────────
-                ("llama",        |c| Box::new(llama::Llama3::new(c))),
-                ("llama3",       |c| Box::new(llama::Llama3::new(c))),
                 ("llama4",       |c| Box::new(llama::Llama4::new(c))),
 
                 // ── Mistral family ───────────────────────────────────────────
-                ("mistral",      |c| Box::new(mistral::Mistral::new(c))),
-                ("mistral3",     |c| Box::new(mistral::Mistral3::new(c))),
                 ("mistral4",     |c| Box::new(mistral::Mistral4::new(c))),
                 ("magistral",    |c| Box::new(mistral::Mistral4::new(c))),
 
-                // ── Phi family ───────────────────────────────────────────────
-                ("phi3",         |c| Box::new(phi::Phi3::new(c))),
-                ("phi4",         |c| Box::new(phi::Phi4::new(c))),
-
                 // ── Qwen family ──────────────────────────────────────────────
-                ("qwen3",        |c| Box::new(qwen::Qwen3::new(c))),
-                ("qwen3moe",     |c| Box::new(qwen::Qwen3Moe::new(c))),
-                ("qwen3next",    |c| Box::new(qwen::QwQ::new(c))),
-                ("qwq",          |c| Box::new(qwen::QwQ::new(c))),
                 ("qwen35",       |c| Box::new(qwen::Qwen3_5::new(c))),
                 ("qwen35moe",    |c| Box::new(qwen::Qwen3_5::new(c))),
-                ("qwen3vl",      |c| Box::new(qwen::Qwen3Vl::new(c))),
                 ("qwen4",        |c| Box::new(qwen::Qwen4::new(c))),
                 ("qwen4exp",     |c| Box::new(qwen::Qwen4::new(c))),
 
                 // ── DeepSeek family ──────────────────────────────────────────
-                ("deepseek2",    |c| Box::new(deepseek::DeepSeekV3::new(c))),
-                ("deepseek32",   |c| Box::new(deepseek::DeepSeekV3::new(c))),
                 ("deepseek4",    |c| Box::new(deepseek::DeepSeekV4::new(c))),
 
                 // ── Gemma family ─────────────────────────────────────────────
-                ("gemma3",       |c| Box::new(gemma::Gemma3::new(c))),
-                ("gemma3n",      |c| Box::new(gemma::Gemma3n::new(c))),
                 ("gemma4",       |c| Box::new(gemma::Gemma4::new(c))),
 
-                // ── Falcon family ────────────────────────────────────────────
-                ("falcon-h1",    |c| Box::new(falcon::FalconH1::new(c))),
-
-                // ── RWKV family ──────────────────────────────────────────────
-                ("rwkv7",        |c| Box::new(rwkv::Rwkv7::new(c))),
-                ("arwkv7",       |c| Box::new(rwkv::ARwkv7::new(c))),
-
-                // ── Mamba family ─────────────────────────────────────────────
-                ("mamba2",       |c| Box::new(mamba::Mamba2::new(c))),
-
                 // ── GLM family ───────────────────────────────────────────────
-                ("glm4",         |c| Box::new(glm::Glm4::new(c))),
-                ("glm4moe",      |c| Box::new(glm::Glm4Moe::new(c))),
                 ("glm-dsa",      |c| Box::new(glm::GlmDsa::new(c))),
                 ("glm5",         |c| Box::new(glm::Glm5::new(c))),
                 ("glm5-next",    |c| Box::new(glm::Glm5::new(c))),
 
-                // ── Granite family ───────────────────────────────────────────
-                ("granitehybrid",  |c| Box::new(granite::GraniteHybrid::new(c))),
-                ("graniteswitch",  |c| Box::new(granite::GraniteSwitch::new(c))),
-                ("granite_swa",    |c| Box::new(granite::GraniteSwa::new(c))),
-
-                // ── Nemotron family ──────────────────────────────────────────
-                ("nemotron",     |c| Box::new(nemotron::Nemotron::new(c))),
-                ("nemotron_h",   |c| Box::new(nemotron::NemotronH::new(c))),
-
-                // ── OLMo family ──────────────────────────────────────────────
-                ("olmo2",        |c| Box::new(olmo::OLMo2::new(c))),
-                ("olmoe",        |c| Box::new(olmo::OLMoE::new(c))),
-
-                // ── Jamba family ─────────────────────────────────────────────
-                ("jamba",        |c| Box::new(jamba::Jamba::new(c))),
-
                 // ── MiniMax family ───────────────────────────────────────────
-                ("minimax-01",   |c| Box::new(minimax::MinimaxText01::new(c))),
-                ("minimax-m2",   |c| Box::new(minimax::MinimaxM2::new(c))),
                 ("minimax-m3",   |c| Box::new(minimax::MinimaxM3::new(c))),
-
-                // ── Encoder / embedding models ───────────────────────────────
-                ("modern-bert",  |c| Box::new(modern_bert::ModernBert::new(c))),
-
-                // ── Cohere family ────────────────────────────────────────────
-                ("cohere2",      |c| Box::new(cohere::CommandR2::new(c))),
-                ("cohere2moe",   |c| Box::new(cohere::CommandR2Moe::new(c))),
-
-                // ── ExaOne family ────────────────────────────────────────────
-                ("exaone4",      |c| Box::new(exaone::ExaOne4::new(c))),
-                ("exaone-moe",   |c| Box::new(exaone::ExaOne4Moe::new(c))),
-
-                // ── Hunyuan family ───────────────────────────────────────────
-                ("hunyuan-dense", |c| Box::new(hunyuan::HunyuanDense::new(c))),
-                ("hunyuan-moe",   |c| Box::new(hunyuan::HunyuanMoe::new(c))),
-
-                // ── ERNIE family ─────────────────────────────────────────────
-                ("ernie4_5",     |c| Box::new(ernie::Ernie4_5::new(c))),
-                ("ernie4_5-moe", |c| Box::new(ernie::Ernie4_5Moe::new(c))),
-
-                // ── LFM family ───────────────────────────────────────────────
-                ("lfm2",         |c| Box::new(lfm::Lfm2::new(c))),
-                ("lfm2moe",      |c| Box::new(lfm::Lfm2Moe::new(c))),
 
                 // ── Kimi family ──────────────────────────────────────────────
                 ("kimi-k3",      |c| Box::new(kimi::KimiK3::new(c))),
-
-                // ── SmolLM family ────────────────────────────────────────────
-                ("smollm3",      |c| Box::new(smollm::SmolLm3::new(c))),
-
-                // ── MiniCPM family ───────────────────────────────────────────
-                ("minicpm3",     |c| Box::new(minicpm::MiniCpm3::new(c))),
-
-                // ── PLaMo family ─────────────────────────────────────────────
-                ("plamo2",       |c| Box::new(plamo::PLaMo2::new(c))),
-                ("plamo3",       |c| Box::new(plamo::PLaMo2::new(c))),
 
                 // ── Draft / speculative ──────────────────────────────────────
                 ("eagle3",       |c| Box::new(eagle::Eagle3::new(c))),

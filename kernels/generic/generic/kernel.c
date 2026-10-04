@@ -19,11 +19,11 @@ int spite_generic_rms_norm(
     SpiteTensor*, const SpiteTensor*, const SpiteTensor*, float, const SpiteCtx*);
 int spite_generic_ffn(
     SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
-    const SpiteTensor*, const SpiteTensor*, const SpiteCtx*);
+    const SpiteTensor*, const SpiteTensor*, SpiteFfnActivation, const SpiteCtx*);
 int spite_generic_attention(
     SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
     const SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
-    SpiteKvCache*, int, float, const SpiteCtx*);
+    SpiteKvCache*, float, const SpiteCtx*);
 
 static const SpiteKernelInfo GENERIC_KERNEL_INFO = {
     .abi_version = SPITE_ABI_VERSION,
@@ -40,6 +40,7 @@ static const SpiteKernelInfo GENERIC_KERNEL_INFO = {
 
     .rms_norm            = spite_generic_rms_norm,
     .attention           = spite_generic_attention,
+    .mla                 = NULL,
     .ffn                 = spite_generic_ffn,
     .layer               = NULL,
     .speculative_verify  = NULL,

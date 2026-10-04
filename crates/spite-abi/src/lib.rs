@@ -183,7 +183,7 @@ pub struct SpiteModelCaps {
     /// 0 = speculative decoding not supported for this model.
     pub max_draft_tokens: u32,
     /// Null-terminated array of compatible draft architecture name pointers.
-    /// e.g. `["llama3-68m\0", "llama3-1b\0", null]`
+    /// e.g. `["llama4-68m\0", "llama4-1b\0", null]`
     pub draft_archs: *const *const c_char,
 }
 

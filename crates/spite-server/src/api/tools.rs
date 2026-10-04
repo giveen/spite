@@ -5,7 +5,7 @@
 //!      expected format (each architecture uses a slightly different schema).
 //!   2. Generate normally with `finish_reason = "stop"` or `"tool_calls"`.
 //!   3. After generation, detect a tool call in the output by looking for
-//!      the model-specific delimiter (e.g. `<tool_call>` for LLaMA-3-Instruct).
+//!      the model-specific delimiter (e.g. `<tool_call>` for LLaMA-4-Instruct).
 //!   4. Parse the JSON arguments and return a `ToolCall` in the response.
 //!
 //! Structured output via `spite-grammar` can constrain the argument JSON
@@ -43,25 +43,25 @@ pub struct ToolCallFunction {
 
 /// Inject tool definitions into the system prompt for a given architecture.
 ///
-/// LLaMA-3-Instruct expects a `<|python_tag|>`-style preamble;
-/// Mistral uses `[TOOL_CALLS]` markers; generic fallback uses a plain
+/// LLaMA-4-Instruct expects a `<|python_tag|>`-style preamble;
+/// Mistral 4 uses `[TOOL_CALLS]` markers; generic fallback uses a plain
 /// "Available functions:" block.
 pub fn inject_tools(arch: &str, system: &mut String, tools: &[ToolDefinition]) {
     if tools.is_empty() { return; }
     match arch {
-        "llama" | "llama3" => inject_llama3(system, tools),
-        "mistral"          => inject_mistral(system, tools),
-        _                  => inject_generic(system, tools),
+        "llama4"                   => inject_llama4(system, tools),
+        "mistral4" | "magistral"   => inject_mistral(system, tools),
+        _                          => inject_generic(system, tools),
     }
 }
 
-fn inject_llama3(system: &mut String, tools: &[ToolDefinition]) {
-    // TODO: format tools as the Llama-3-Instruct tool preamble
+fn inject_llama4(system: &mut String, tools: &[ToolDefinition]) {
+    // TODO: format tools as the Llama-4-Instruct tool preamble
     let _ = (system, tools);
 }
 
 fn inject_mistral(system: &mut String, tools: &[ToolDefinition]) {
-    // TODO: format tools as Mistral function-calling preamble
+    // TODO: format tools as Mistral 4 function-calling preamble
     let _ = (system, tools);
 }
 

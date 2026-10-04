@@ -25,12 +25,14 @@ import random
 
 # ── ABI constants (must match core/abi.h) ────────────────────────────────
 
-SPITE_ABI_VERSION = 2
+SPITE_ABI_VERSION = 3
 
 SPITE_TYPE_F32  = 0
 SPITE_TYPE_F16  = 1
 SPITE_TYPE_Q8_0 = 8
+SPITE_TYPE_Q5_1 = 11
 SPITE_TYPE_Q4_K = 12
+SPITE_TYPE_Q6_K = 14
 
 # ── ctypes struct definitions ─────────────────────────────────────────────
 
@@ -46,6 +48,9 @@ class SpiteCtx(ctypes.Structure):
         ("n_ctx",            ctypes.c_int),
         ("n_batch",          ctypes.c_int),
         ("n_threads",        ctypes.c_int),
+        ("pos",              ctypes.c_int),
+        ("n_heads",          ctypes.c_int),
+        ("n_kv_heads",       ctypes.c_int),
         ("gpu_stream",       ctypes.c_void_p),
         ("scratchpad",       ctypes.c_void_p),
         ("scratchpad_bytes", ctypes.c_size_t),

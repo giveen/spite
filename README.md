@@ -13,7 +13,7 @@ engine adapts — not the other way around.
 - **One Engine** — a single Rust host that loads any GGUF model and runs it.
   No cloud required, no subscription, no data leaving your machine.
 - **Your Model** — any GGUF file works. Download a model once, run it forever.
-  Llama 4, DeepSeek-V4, Qwen 3.5, Mistral 4, Gemma 3 — if it's a `.gguf`, spite loads it.
+  Llama 4, DeepSeek-V4, Qwen 3.5, Mistral 4, Gemma 4, GLM-5 — if it's a `.gguf`, spite loads it.
 - **Your Card** — kernels are written *for* specific GPUs, not against the lowest
   common denominator. RTX 3060, RX 7800 XT, Intel Arc, Apple M-series. If nobody
   has written a tuned kernel for your card yet, the generic fallback runs. When
@@ -47,12 +47,12 @@ cargo build --release
 
 # Run a model
 ./target/release/spite run \
-  --model ~/models/qwen3-8b-instruct.Q4_K_M.gguf \
+  --model ~/models/qwen3.5-8b-instruct.Q4_K_M.gguf \
   --prompt "What is the capital of France?"
 
 # Start an API server (OpenAI-compatible)
 ./target/release/spite-server \
-  --model ~/models/qwen3-8b-instruct.Q4_K_M.gguf \
+  --model ~/models/qwen3.5-8b-instruct.Q4_K_M.gguf \
   --port 8080
 ```
 
@@ -90,13 +90,13 @@ The Rust host runs without GPU kernels (using the generic CPU fallback), but
 for full speed you'll want to compile the kernels for your GPU.
 
 ```bash
-# Find your GPU architecture — the benchmark tool detects and prints it:
-./target/release/spite benchmark --model ~/models/your.gguf
+# Find your GPU architecture first — `spite dispatch` shows it:
+./target/release/spite dispatch -m ~/models/your.gguf --card RTX_4090
 
-# Build GPU kernels for your card
+# Build kernels for your card
 cmake -B build \
-  -DSPITE_MODELS="llama3"    \
-  -DSPITE_GPU_ARCHS="sm_89"  \
+  -DSPITE_MODELS="llama/llama4"  \
+  -DSPITE_GPU_ARCHS="sm_89"      \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 cmake --install build --prefix .
@@ -129,7 +129,7 @@ generic CPU path automatically — slower, but always correct.
 | Ada Lovelace | `sm_89` | RTX 4090, RTX 4080 Super / 4080, RTX 4070 Ti Super / 4070 Ti / 4070 Super / 4070, RTX 4060 Ti / 4060, RTX 4000 / 5000 / 6000 Ada |
 | Ampere | `sm_86` | RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060, RTX A2000–A6000 |
 | Turing | `sm_75` | RTX 2080 Ti / 2080 Super / 2080 / 2070 Super / 2070 / 2060 Super / 2060, GTX 1660 Ti / 1660 Super / 1660 |
-| Blackwell *(planned)* | `sm_120` | RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti |
+| Blackwell | `sm_120` | RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060 |
 
 ### AMD
 
@@ -153,7 +153,7 @@ generic CPU path automatically — slower, but always correct.
 |---|---|---|
 | Metal | `metal` | M1 / M1 Pro / Max / Ultra, M2 / M2 Pro / Max / Ultra, M3 / M3 Pro / Max, M4 / M4 Pro / Max |
 
-Not sure which architecture you have? Run `spite benchmark` — it detects and prints it.
+Not sure which architecture you have? Run `spite dispatch` — it detects and prints it.
 
 ---
 
@@ -165,13 +165,15 @@ That sounds abstract, so here's what it means in practice:
 
 ### Every model is its own module
 
-Llama 4, DeepSeek-V4, Qwen 3.5, Mistral 4, Gemma 3 — each lives in its own folder inside
-`kernels/`. Adding a new model means adding a new folder. Nothing about the
-existing models changes. The dispatcher finds it automatically.
+Kernels are grouped by family and variant: `kernels/llama/llama4/`,
+`kernels/deepseek/v4/`, `kernels/qwen/qwen3_5/`, `kernels/mistral/mistral4/`,
+`kernels/gemma/gemma4/`. Adding a new model variant means adding a new
+`<family>/<model>/` folder. Nothing about the existing models changes. The
+dispatcher finds it automatically.
 
 ### Every GPU is its own module
 
-`kernels/llama3/sm_89/` is completely separate from `kernels/llama3/rdna3/`.
+`kernels/llama/llama4/sm_89/` is completely separate from `kernels/llama/llama4/rdna3/`.
 An RTX 4090 kernel can use FP8 tensor cores. An RX 7900 XTX kernel can exploit
 96 MB of Infinity Cache. An Apple M4 kernel can use the Neural Engine. Each gets
 what makes it fast, not a watered-down kernel that has to work on everything.
@@ -193,7 +195,7 @@ deployment and the scheduler uses it. Nothing needs to be forked.
 
 ```rust
 let engine = EngineBuilder::new()
-    .with_sampler(PluginKey::for_model("llama3"), Box::new(MyGreedySampler))
+    .with_sampler(PluginKey::for_model("llama4"), Box::new(MyGreedySampler))
     .with_cache(PluginKey::default(), Box::new(PagedKvCache::new(vram)))
     .build(ExecutorConfig::default());
 ```
@@ -246,19 +248,29 @@ spite-server --model base.gguf --lora my_adapter.gguf
 ## Benchmarking
 
 ```bash
-./target/release/spite benchmark --model ~/models/your.gguf
+# Show which kernel is active for each operation on your card
+./target/release/spite dispatch -m ~/models/your.gguf --card RTX_4090
+
+# Measure end-to-end model throughput
+./target/release/spite-bench --model ~/models/your.gguf
 ```
 
-Output shows which kernel is active for each operation and how fast it is:
+`spite dispatch` prints the resolved kernel for each operation:
 
 ```
-[dispatch] model: llama3  gpu: sm_86
-  rms_norm  → kernels/generic/generic     12.3 µs
-  attention → kernels/generic/generic    841.2 µs  ← opportunity
-  ffn       → kernels/llama3/sm_86       192.1 µs
+model arch   : llama4
+card         : rtx_4090 (24 GiB)
+gpu arch     : sm_89
+kernels      :
+  rms_norm       → sm_89/kernels/llama/llama4/sm_89
+  attention      → generic/kernels/generic/generic
+  ffn            → sm_89/kernels/llama/llama4/sm_89
+  layer          → generic/kernels/generic/generic
+  spec_verify    → generic/kernels/generic/generic
+  prefill        → generic/kernels/generic/generic
 ```
 
-Lines marked `generic/generic` are running the fallback — a custom kernel
+Entries resolved to `generic/` are running the fallback — a custom kernel
 for that op and GPU would be faster.
 
 ---
@@ -273,26 +285,34 @@ You don't need to understand the scheduler, the tokenizer, the server, or
 anything else. You need:
 - Your GPU
 - One operation to implement (attention, FFN, or rms_norm)
-- The template in `kernels/llama3/sm_89/KERNEL_TEMPLATE.cu`
+- The template in `kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu`
 
 **The steps:**
 
 ```bash
-# 1. Find what's slow
-spite benchmark --model your.gguf
+# 1. Find what's slow on your card
+spite dispatch -m your.gguf --card RTX_5090
 
 # 2. Copy the template for your card
-cp kernels/llama3/sm_89/KERNEL_TEMPLATE.cu kernels/llama3/sm_86/attention.cu
+cp kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu \
+   kernels/llama/llama4/sm_120/attention.cu
 
 # 3. Implement the op (the template has comments for each section)
 
-# 4. Verify correctness — must pass before PR
-spite verify kernels/llama3/sm_86/attention.cu
+# 4. Build the kernels for your card
+cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="sm_120" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 
-# 5. Benchmark and save the output
-spite bench kernels/llama3/sm_86/attention.cu > kernels/llama3/sm_86/attention.bench
+# 5. Verify correctness — must pass before PR
+python3 tools/verify/verify.py \
+  build/kernels/llama/llama4/sm_120/libkernel_llama_llama4_sm_120.so
 
-# 6. Open a PR titled:  kernel: llama3/sm_86 attention
+# 6. Benchmark and save the output
+cargo run --release -p spite-bench -- --model your.gguf \
+  > kernels/llama/llama4/sm_120/attention.bench
+
+# 7. Open a PR titled:  kernel: llama/llama4/sm_120 attention
 ```
 
 You only touch the `kernels/` directory. Nothing else breaks when you add a
@@ -307,113 +327,23 @@ GPU-specific notes (tile sizes, WMMA shapes, memory layout):
 
 ## Supported models
 
-spite loads any `.gguf` file. The architectures below are wired into the
-dispatcher — model layout, tokenizer, and generic CPU fallback are all live.
-GPU kernel contributions are welcome for any row.
+| Model               | Status   |
+|---------------------|----------|
+| llama/llama4        | template |
+| deepseek/v4         | template |
+| qwen/qwen3_5        | template |
+| qwen/qwen4          | template |
+| mistral/mistral4    | template |
+| gemma/gemma4        | template |
+| glm/glm5            | template |
+| glm/glm_dsa         | template |
+| minimax/m3          | template |
+| kimi/k3             | template |
+| eagle/eagle3        | template |
+| mellum/base         | template |
 
-### Meta
-| Model | Common sizes | Status |
-|---|---|---|
-| Llama 3.1 / 3.2 / 3.3 | 1B, 3B, 8B, 70B, 405B | template |
-| Llama 4 Scout | 17B×16E (109B total, MoE) | template |
-| Llama 4 Maverick | 17B×128E (400B total, MoE) | template |
-
-### Mistral AI
-| Model | Common sizes | Status |
-|---|---|---|
-| Mistral 7B v0.3 | 7B | template |
-| Mistral Small 3.1 / 3.2 | 24B | template |
-| Mistral Medium 3 | 123B | template |
-| Devstral Small | 24B | template |
-
-### Google
-| Model | Common sizes | Status |
-|---|---|---|
-| Gemma 3 | 1B, 4B, 12B, 27B | template |
-| Gemma 3n (edge) | E2B, E4B | template |
-| Gemma 4 | 4B, 12B, 27B | template |
-
-### Microsoft
-| Model | Common sizes | Status |
-|---|---|---|
-| Phi-3 Mini / Small / Medium | 3.8B, 7B, 14B | template |
-| Phi-4 | 14B | template |
-| Phi-4-mini | 3.8B | template |
-
-### Alibaba (Qwen)
-| Model | Common sizes | Status |
-|---|---|---|
-| Qwen3 | 0.6B, 1.7B, 4B, 8B, 14B, 32B | template |
-| Qwen3 MoE | 30B-A3B, 235B-A22B | template |
-| Qwen3.5 | 3B, 7B, 14B, 32B, 72B | template |
-| Qwen4 | 7B, 14B, 32B, 72B | template |
-| QwQ (reasoning) | 32B | template |
-
-### DeepSeek
-| Model | Common sizes | Status |
-|---|---|---|
-| DeepSeek-V3 | 671B (37B active, MoE) | template |
-| DeepSeek-V4 | 671B (37B active, MoE) | template |
-
-### NVIDIA
-| Model | Common sizes | Status |
-|---|---|---|
-| Nemotron | 8B, 51B, 340B | template |
-| Nemotron-H (hybrid) | 8B, 47B | template |
-
-### IBM
-| Model | Common sizes | Status |
-|---|---|---|
-| Granite 3.x hybrid (Mamba+Attn) | 2B, 3B, 8B | template |
-| Granite SWA / Switch (MoE) | 3B, 8B | template |
-
-### THUDM
-| Model | Common sizes | Status |
-|---|---|---|
-| GLM-4 | 9B | template |
-| GLM-4 MoE | — | template |
-| GLM-5 | 9B, 32B | template |
-
-### Tencent
-| Model | Common sizes | Status |
-|---|---|---|
-| Hunyuan-Dense | 0.5B, 7B | template |
-| Hunyuan-MoE | ~52B total, 8B active | template |
-
-### AI21 Labs
-| Model | Common sizes | Status |
-|---|---|---|
-| Jamba 1.6 (SSM+Attn hybrid) | 52B (12B active) | template |
-
-### Moonshot AI
-| Model | Common sizes | Status |
-|---|---|---|
-| Kimi K3 | — | template |
-
-### MiniMax
-| Model | Common sizes | Status |
-|---|---|---|
-| MiniMax Text-01 | 456B (45.9B active, MoE) | template |
-| MiniMax M2 / M3 | — | template |
-
-### Other architectures
-| Model | Key sizes | Status |
-|---|---|---|
-| Cohere Command R2 | 35B | template |
-| Falcon H1 (hybrid) | 1.5B, 7B, 34B | template |
-| OLMo 2 / OLMoE (AllenAI) | 1B, 7B, 13B | template |
-| MiniCPM-3 (OpenBMB) | 4B | template |
-| ERNIE 4.5 (Baidu) | 0.3B, 1.8B, 4B | template |
-| EXAONE 4.0 (LG AI Research) | 2.4B, 7.8B | template |
-| LFM-2 (Liquid AI) | 1.2B, 3.1B | template |
-| SmolLM3 (HuggingFace) | 3B | template |
-| PLaMo-2 (Preferred Networks) | 8B, 32B | template |
-| Mellum (JetBrains) | 4B | template |
-| GLM-DSA | — | template |
-| RWKV-7 / ARWKV-7 | 0.4B–7B | template |
-| Mamba 2 | 130M–2.8B | template |
-| ModernBERT | base (149M), large (395M) | template |
-| EAGLE-3 (speculative draft) | — | template |
+"Template" means the model layout and loader are wired up; kernel contributions
+welcome. Running any of these on the generic fallback works today.
 
 ---
 
@@ -446,7 +376,7 @@ dependency graph and data flow.
 - **GGUF only.** One weight format. No conversion step, no format zoo.
 - **Consumer hardware first.** Every decision optimizes for the RTX 3060 and
   RX 7800 XT before it optimizes for the A100.
-- **Your card, your kernel.** Tuned kernels live in `kernels/<model>/<gpu_arch>/`.
+- **Your card, your kernel.** Tuned kernels live in `kernels/<family>/<model>/<gpu_arch>/`.
   Adding yours doesn't require touching anything else.
 - **Fallback always works.** No kernel for your GPU? The generic CPU fallback runs.
   It's slower, not broken.
@@ -465,7 +395,6 @@ dependency graph and data flow.
 - [ ] Vision models (LLaVA, InternVL, Qwen-VL)
 - [ ] Quantization tools (`spite quantize` — convert f16 → Q4_K_M locally)
 - [ ] Windows support
-- [ ] Blackwell (sm_120) and RDNA 4 kernel templates
 
 ---
 

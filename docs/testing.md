@@ -129,18 +129,22 @@ tokio = { workspace = true, features = ["full"] }
 
 ## Kernel tests (hardware required)
 
-Kernel tests run `spite verify` and `spite bench` against real hardware.
-They are not in the Rust test suite — they are CMake test targets:
+Kernel tests run the verify tool and the `spite-bench` harness against real
+hardware. They are not in the Rust test suite — the kernels are built with
+CMake and verified against the generic reference:
 
 ```bash
 # Build kernels for your GPU
-cmake -B build -DSPITE_GPU_ARCHS="sm_89" && cmake --build build
+cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="sm_89" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 
-# Verify correctness
-spite verify kernels/llama3/sm_89/attention.cu
+# Verify correctness (compares the built .so against the generic reference)
+python3 tools/verify/verify.py \
+  build/kernels/llama/llama4/sm_89/libkernel_llama_llama4_sm_89.so
 
 # Benchmark
-spite bench kernels/llama3/sm_89/attention.cu
+cargo run --release -p spite-bench -- --model path/to/model.gguf
 ```
 
 These run only on self-hosted CI runners tagged with the matching GPU

@@ -16,15 +16,15 @@
 //! ```text
 //! Registry resolution order  (higher specificity wins)
 //! ──────────────────────────────────────────────────────
-//!  key { model_arch: "llama3", task: "chat" }   ← most specific
-//!  key { model_arch: "llama3" }
+//!  key { model_arch: "llama4", task: "chat" }   ← most specific
+//!  key { model_arch: "llama4" }
 //!  key { task: "chat" }
 //!  key { }                                       ← wildcard / global default
 //! ```
 //!
 //! This mirrors the kernel dispatch chain:
 //! ```text
-//!  kernels/llama/llama3/sm_89/rtx_4090/Q4_K_M/  ← most specific
+//!  kernels/llama/llama4/sm_89/rtx_4090/Q4_K_M/  ← most specific
 //!  ...
 //!  kernels/generic/generic/                       ← always present
 //! ```
@@ -61,7 +61,7 @@
 /// general registration.
 #[derive(Clone, Default, PartialEq, Eq, Hash, Debug)]
 pub struct PluginKey {
-    /// GGUF model architecture string: "llama3", "mistral", "phi3", …
+    /// GGUF model architecture string: "llama4", "mistral4", "gemma4", …
     pub model_arch: Option<String>,
     /// GPU architecture string: "sm_89", "rdna3", "metal", …
     pub gpu_arch:   Option<String>,

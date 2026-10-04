@@ -43,24 +43,24 @@ model-gemma    = []
 model-qwen     = []
 model-mistral  = []
 model-deepseek = []
-model-phi      = []
-model-falcon   = []
-model-gpt2     = []
+model-glm      = []
+model-minimax  = []
+model-kimi     = []
 # Convenience: all models (useful for development builds)
 model-all = [
     "model-llama", "model-gemma", "model-qwen", "model-mistral",
-    "model-deepseek", "model-phi", "model-falcon", "model-gpt2",
+    "model-deepseek", "model-glm", "model-minimax", "model-kimi",
 ]
 
 # ── Optional capabilities ─────────────────────────────────────────────────
-# Multi-Token Prediction: generate several tokens per step (DeepSeek-V3,
+# Multi-Token Prediction: generate several tokens per step (DeepSeek-V4,
 # Medusa). Requires a model with MTP heads.
 feature-mtp     = []
 # FlashAttention: fused attention kernel (most cards supported).
 feature-dflash  = []
 # FlashAttention-2: Dao-AI-Lab v2 implementation (sm_80+ / cdna3 required).
 feature-dflash2 = ["feature-dflash"]
-# Vision encoder: multimodal image/video input (Gemma 3, LLaVA, Qwen-VL…).
+# Vision encoder: multimodal image/video input (Gemma 4, LLaVA, Qwen-VL…).
 feature-vision  = []
 
 [dependencies]

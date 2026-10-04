@@ -6,13 +6,14 @@
 //! long-chain-of-thought RLHF training with the Mistral architecture.
 //!
 //! Key notes:
-//! - Builds on Mistral 3 dense base (no SWA, full causal attention, GQA)
+//! - Dense base (no SWA, full causal attention, GQA)
 //! - Trained with extended reasoning traces similar to DeepSeek-R1
 //! - Streams `<think>…</think>` reasoning before the answer
 //! - 128K context window; RoPE theta extended accordingly
 //! - Magistral Medium: 128 attention heads; Magistral Small: same as Mistral Small 3.1
 //! - Separate arch string (`mistral4`) to allow different sampling defaults
-//!   (temperature, top-p, thinking budget tokens) without touching `mistral3`
+//!   (temperature, top-p, thinking budget tokens) without touching earlier
+//!   generations
 
 use crate::{ModelArch, ModelConfig, ModelError};
 use spite_abi::SpiteCtx;
@@ -36,7 +37,7 @@ impl ModelArch for Mistral4 {
         _logits_out: &mut [f32],
         _ctx:        &SpiteCtx,
     ) -> Result<(), ModelError> {
-        // TODO: identical forward to mistral3 (standard GQA + SwiGLU, no SWA).
+        // TODO: standard GQA + SwiGLU forward (no SWA).
         // Reasoning behavior is purely a sampling/prompt concern, not architecture.
         Err(ModelError::Forward("not implemented".into()))
     }

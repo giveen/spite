@@ -41,11 +41,11 @@ const char    *spite_gguf_arch(const spite_gguf_t *g);
  * Returns a tensor whose .data points into the mmap'd buffer.
  * Returns a zero tensor (data=NULL) if the name doesn't exist.
  */
-spite_tensor_t spite_gguf_tensor(const spite_gguf_t *g, const char *name);
+SpiteTensor spite_gguf_tensor(const spite_gguf_t *g, const char *name);
 
 /* Total number of tensors in the file */
 int spite_gguf_n_tensors(const spite_gguf_t *g);
 
 /* Iterate tensors by index (for tooling / debugging) */
 const char    *spite_gguf_tensor_name(const spite_gguf_t *g, int i);
-spite_tensor_t spite_gguf_tensor_by_index(const spite_gguf_t *g, int i);
+SpiteTensor spite_gguf_tensor_by_index(const spite_gguf_t *g, int i);
