@@ -39,6 +39,57 @@ You only need to know your GPU — nothing else in the codebase changes.
 
 ---
 
+## Modular by design
+
+spite is built on a single rule: **every layer is replaceable without touching any other layer.**
+
+That sounds abstract, so here's what it means in practice:
+
+### Every model is its own module
+
+Kernels are grouped by family and variant: `kernels/llama/llama4/`,
+`kernels/deepseek/v4/`, `kernels/qwen/qwen3_5/`, `kernels/mistral/mistral4/`,
+`kernels/gemma/gemma4/`. Adding a new model variant means adding a new
+`<family>/<model>/` folder. Nothing about the existing models changes. The
+dispatcher finds it automatically.
+
+### Every GPU is its own module
+
+`kernels/llama/llama4/sm_89/` is completely separate from `kernels/llama/llama4/rdna3/`.
+An RTX 4090 kernel can use FP8 tensor cores. An RX 7900 XTX kernel can exploit
+96 MB of Infinity Cache. An Apple M4 kernel can use the Neural Engine. Each gets
+what makes it fast, not a watered-down kernel that has to work on everything.
+
+### Every operation is independently tunable
+
+Kernels don't have to implement everything. A kernel that only optimizes
+attention leaves FFN and rms_norm to the fallback. You tune the one op that's
+your bottleneck. Later, someone else improves FFN. Both improvements stack
+automatically — the dispatcher picks the best available kernel for each op
+on each GPU.
+
+### Every subsystem is swappable
+
+The sampler, tokenizer, KV cache backend, and offload policy are all
+plugin registries. Register a custom sampler for a specific model or task
+and the engine uses it. Register a custom KV cache for a memory-constrained
+deployment and the scheduler uses it. Nothing needs to be forked.
+
+```rust
+let engine = EngineBuilder::new()
+    .with_sampler(PluginKey::for_model("llama4"), Box::new(MyGreedySampler))
+    .with_cache(PluginKey::default(), Box::new(PagedKvCache::new(vram)))
+    .build(ExecutorConfig::default());
+```
+
+### Every component is usable standalone
+
+spite is a Rust workspace. You can use just the loader, just the scheduler,
+or just the ABI types for kernel development — without pulling in the full
+server stack. Build what you need from the pieces that fit.
+
+---
+
 ## Quick start
 
 ```bash
@@ -111,16 +162,16 @@ generic CPU path automatically — slower, but always correct.
 
 | Architecture | GPU arch | Cards |
 |---|---|---|
-| RDNA 4 *(planned)* | `rdna4` | RX 9070 XT / 9070 / 9060 XT |
+| RDNA 4 | `rdna4` | RX 9070 XT / 9070 / 9070 GRE, RX 9060 XT / 9060 |
 | RDNA 3 | `rdna3` | RX 7900 XTX / 7900 XT / 7900 GRE, RX 7800 XT, RX 7700 XT, RX 7600 XT / 7600 |
-| RDNA 2 | `rdna2` | RX 6950 XT / 6900 XT / 6800 XT / 6800, RX 6700 XT / 6650 XT / 6600 XT / 6600 |
+| RDNA 2 | `rdna2` | RX 6950 XT / 6900 XT / 6800 XT / 6800, RX 6750 XT / 6700 XT / 6650 XT / 6600 XT / 6600 |
 | RDNA 1 *(planned)* | `rdna1` | RX 5700 XT / 5700 / 5600 XT / 5500 XT |
 
 ### Intel
 
 | Architecture | GPU arch | Cards |
 |---|---|---|
-| Arc Battlemage *(planned)* | `arc_battlemage` | Arc B580 / B570 |
+| Arc Battlemage | `arc_battlemage` | Arc B580 / B570 |
 | Arc Alchemist | `arc_alchemist` | Arc A770 / A750 / A580 / A380 / A310 |
 
 ### Apple Silicon
@@ -130,57 +181,6 @@ generic CPU path automatically — slower, but always correct.
 | Metal | `metal` | M1 / M1 Pro / Max / Ultra, M2 / M2 Pro / Max / Ultra, M3 / M3 Pro / Max, M4 / M4 Pro / Max |
 
 Not sure which architecture you have? Run `spite dispatch` — it detects and prints it.
-
----
-
-## Modular by design
-
-spite is built on a single rule: **every layer is replaceable without touching any other layer.**
-
-That sounds abstract, so here's what it means in practice:
-
-### Every model is its own module
-
-Kernels are grouped by family and variant: `kernels/llama/llama4/`,
-`kernels/deepseek/v4/`, `kernels/qwen/qwen3_5/`, `kernels/mistral/mistral4/`,
-`kernels/gemma/gemma4/`. Adding a new model variant means adding a new
-`<family>/<model>/` folder. Nothing about the existing models changes. The
-dispatcher finds it automatically.
-
-### Every GPU is its own module
-
-`kernels/llama/llama4/sm_89/` is completely separate from `kernels/llama/llama4/rdna3/`.
-An RTX 4090 kernel can use FP8 tensor cores. An RX 7900 XTX kernel can exploit
-96 MB of Infinity Cache. An Apple M4 kernel can use the Neural Engine. Each gets
-what makes it fast, not a watered-down kernel that has to work on everything.
-
-### Every operation is independently tunable
-
-Kernels don't have to implement everything. A kernel that only optimizes
-attention leaves FFN and rms_norm to the fallback. You tune the one op that's
-your bottleneck. Later, someone else improves FFN. Both improvements stack
-automatically — the dispatcher picks the best available kernel for each op
-on each GPU.
-
-### Every subsystem is swappable
-
-The sampler, tokenizer, KV cache backend, and offload policy are all
-plugin registries. Register a custom sampler for a specific model or task
-and the engine uses it. Register a custom KV cache for a memory-constrained
-deployment and the scheduler uses it. Nothing needs to be forked.
-
-```rust
-let engine = EngineBuilder::new()
-    .with_sampler(PluginKey::for_model("llama4"), Box::new(MyGreedySampler))
-    .with_cache(PluginKey::default(), Box::new(PagedKvCache::new(vram)))
-    .build(ExecutorConfig::default());
-```
-
-### Every component is usable standalone
-
-spite is a Rust workspace. You can use just the loader, just the scheduler,
-or just the ABI types for kernel development — without pulling in the full
-server stack. Build what you need from the pieces that fit.
 
 ---
 
