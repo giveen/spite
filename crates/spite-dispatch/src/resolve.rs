@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 pub struct KernelSpec {
     /// Model family directory: "llama", "deepseek", "qwen", …
     pub family:   String,
-    /// Model variant directory: "llama3", "v3", "qwen3", …
+    /// Model variant directory: "llama4", "v4", "qwen3_5", …
     pub model:    String,
     /// GPU architecture: "sm_89", "rdna4", "cdna3", "metal", …
     pub gpu_arch: String,
@@ -138,102 +138,30 @@ impl KernelSpec {
 pub fn arch_to_family_model(arch: &str) -> (String, String) {
     let (family, model) = match arch {
         // ── Llama ────────────────────────────────────────────────────────
-        "llama" | "llama3" => ("llama", "llama3"),
-        "llama4"           => ("llama", "llama4"),
+        "llama4" => ("llama", "llama4"),
 
         // ── Mistral ──────────────────────────────────────────────────────
-        "mistral"                      => ("mistral", "base"),
-        "mistral3"                     => ("mistral", "mistral3"),
-        "mistral4" | "magistral"       => ("mistral", "mistral4"),
-
-        // ── Phi ──────────────────────────────────────────────────────────
-        "phi3" => ("phi", "phi3"),
-        "phi4" => ("phi", "phi4"),
+        "mistral4" | "magistral" => ("mistral", "mistral4"),
 
         // ── Qwen ─────────────────────────────────────────────────────────
-        "qwen3"                  => ("qwen", "qwen3"),
-        "qwen3moe"               => ("qwen", "qwen3_moe"),
-        "qwen3next" | "qwq"      => ("qwen", "qwq"),
-        "qwen35" | "qwen35moe"   => ("qwen", "qwen3_5"),
-        "qwen3vl"                => ("qwen", "qwen3_vl"),
-        "qwen4" | "qwen4exp"     => ("qwen", "qwen4"),
+        "qwen35" | "qwen35moe" => ("qwen", "qwen3_5"),
+        "qwen4" | "qwen4exp"   => ("qwen", "qwen4"),
 
         // ── DeepSeek ─────────────────────────────────────────────────────
-        "deepseek2" | "deepseek32" => ("deepseek", "v3"),
-        "deepseek4"                => ("deepseek", "v4"),
+        "deepseek4" => ("deepseek", "v4"),
 
         // ── Gemma ────────────────────────────────────────────────────────
-        "gemma3"  => ("gemma", "gemma3"),
-        "gemma3n" => ("gemma", "gemma3n"),
-        "gemma4"  => ("gemma", "gemma4"),
-
-        // ── Falcon ───────────────────────────────────────────────────────
-        "falcon-h1" => ("falcon", "h1"),
-
-        // ── RWKV ─────────────────────────────────────────────────────────
-        "rwkv7"  => ("rwkv", "v7"),
-        "arwkv7" => ("rwkv", "arwkv7"),
-
-        // ── Mamba ────────────────────────────────────────────────────────
-        "mamba2" => ("mamba", "mamba2"),
+        "gemma4" => ("gemma", "gemma4"),
 
         // ── GLM ──────────────────────────────────────────────────────────
-        "glm4"                   => ("glm", "glm4"),
-        "glm4moe"                => ("glm", "glm4_moe"),
-        "glm-dsa"                => ("glm", "glm_dsa"),
-        "glm5" | "glm5-next"     => ("glm", "glm5"),
-
-        // ── Granite ──────────────────────────────────────────────────────
-        "granitehybrid" => ("granite", "hybrid"),
-        "graniteswitch" => ("granite", "switch"),
-        "granite_swa"   => ("granite", "swa"),
-
-        // ── Nemotron ─────────────────────────────────────────────────────
-        "nemotron"   => ("nemotron", "nemotron"),
-        "nemotron_h" => ("nemotron", "h"),
-
-        // ── OLMo ─────────────────────────────────────────────────────────
-        "olmo2" => ("olmo", "olmo2"),
-        "olmoe" => ("olmo", "olmoe"),
-
-        // ── Jamba ────────────────────────────────────────────────────────
-        "jamba" => ("jamba", "v1"),
+        "glm-dsa"            => ("glm", "glm_dsa"),
+        "glm5" | "glm5-next" => ("glm", "glm5"),
 
         // ── MiniMax ──────────────────────────────────────────────────────
-        "minimax-01" => ("minimax", "text01"),
-        "minimax-m2" => ("minimax", "m2"),
         "minimax-m3" => ("minimax", "m3"),
-
-        // ── Encoder / embedding ──────────────────────────────────────────
-        "modern-bert" => ("modern_bert", "base"),
-
-        // ── Cohere ───────────────────────────────────────────────────────
-        "cohere2" | "cohere2moe" => ("cohere", "command_r2"),
-
-        // ── ExaOne ───────────────────────────────────────────────────────
-        "exaone4" | "exaone-moe" => ("exaone", "exaone4"),
-
-        // ── Hunyuan ──────────────────────────────────────────────────────
-        "hunyuan-dense" => ("hunyuan", "dense"),
-        "hunyuan-moe"   => ("hunyuan", "moe"),
-
-        // ── ERNIE ────────────────────────────────────────────────────────
-        "ernie4_5" | "ernie4_5-moe" => ("ernie", "ernie4_5"),
-
-        // ── LFM ──────────────────────────────────────────────────────────
-        "lfm2" | "lfm2moe" => ("lfm", "lfm2"),
 
         // ── Kimi ─────────────────────────────────────────────────────────
         "kimi-k3" => ("kimi", "k3"),
-
-        // ── SmolLM ───────────────────────────────────────────────────────
-        "smollm3" => ("smollm", "smollm3"),
-
-        // ── MiniCPM ──────────────────────────────────────────────────────
-        "minicpm3" => ("minicpm", "minicpm3"),
-
-        // ── PLaMo ────────────────────────────────────────────────────────
-        "plamo2" | "plamo3" => ("plamo", "plamo2"),
 
         // ── Draft / speculative ──────────────────────────────────────────
         "eagle3" => ("eagle", "eagle3"),
@@ -309,7 +237,7 @@ mod tests {
     fn spec_full() -> KernelSpec {
         KernelSpec {
             family:   "llama".into(),
-            model:    "llama3".into(),
+            model:    "llama4".into(),
             gpu_arch: "sm_89".into(),
             card_id:  "rtx_4090".into(),
             quant:    "Q4_K_M".into(),
@@ -319,7 +247,7 @@ mod tests {
     fn spec_arch_only() -> KernelSpec {
         KernelSpec {
             family:   "deepseek".into(),
-            model:    "v3".into(),
+            model:    "v4".into(),
             gpu_arch: "sm_89".into(),
             ..Default::default()
         }
@@ -329,10 +257,10 @@ mod tests {
     fn model_candidates_full_spec() {
         let root = PathBuf::from("/k");
         let c = spec_full().model_candidates(&root);
-        assert_eq!(c[0], PathBuf::from("/k/llama/llama3/sm_89/rtx_4090/Q4_K_M"));
-        assert_eq!(c[1], PathBuf::from("/k/llama/llama3/sm_89/rtx_4090"));
-        assert_eq!(c[2], PathBuf::from("/k/llama/llama3/sm_89/Q4_K_M"));
-        assert_eq!(c[3], PathBuf::from("/k/llama/llama3/sm_89"));
+        assert_eq!(c[0], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090/Q4_K_M"));
+        assert_eq!(c[1], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090"));
+        assert_eq!(c[2], PathBuf::from("/k/llama/llama4/sm_89/Q4_K_M"));
+        assert_eq!(c[3], PathBuf::from("/k/llama/llama4/sm_89"));
         // generic_cuda before generic/<arch>
         assert_eq!(c[4], PathBuf::from("/k/generic/generic_cuda"));
         assert_eq!(c[5], PathBuf::from("/k/generic/sm_89"));
@@ -343,7 +271,7 @@ mod tests {
     fn model_candidates_arch_only() {
         let root = PathBuf::from("/k");
         let c = spec_arch_only().model_candidates(&root);
-        assert_eq!(c[0], PathBuf::from("/k/deepseek/v3/sm_89"));
+        assert_eq!(c[0], PathBuf::from("/k/deepseek/v4/sm_89"));
         assert_eq!(c[1], PathBuf::from("/k/generic/generic_cuda"));
         assert_eq!(c[2], PathBuf::from("/k/generic/sm_89"));
         assert_eq!(c[3], PathBuf::from("/k/generic/generic"));
@@ -375,7 +303,7 @@ mod tests {
     #[test]
     fn arch_maps_to_family_model() {
         assert_eq!(arch_to_family_model("qwen35"),   ("qwen".into(),     "qwen3_5".into()));
-        assert_eq!(arch_to_family_model("llama"),    ("llama".into(),    "llama3".into()));
+        assert_eq!(arch_to_family_model("qwen4"),    ("qwen".into(),     "qwen4".into()));
         assert_eq!(arch_to_family_model("llama4"),   ("llama".into(),    "llama4".into()));
         assert_eq!(arch_to_family_model("deepseek4"),("deepseek".into(), "v4".into()));
         assert_eq!(arch_to_family_model("gemma4"),   ("gemma".into(),    "gemma4".into()));

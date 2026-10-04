@@ -1,12 +1,12 @@
 //! Zhipu AI GLM-5 Next — GGUF arch `glm5-next`.
 //!
-//! Next-generation GLM after GLM-4 (2025+).
+//! Next-generation GLM after the previous generation.
 //! Architecture details TBD once released publicly.
 //!
 //! Expected to retain:
 //! - Causal decoder (full, not prefix-LM)
 //! - RoPE, GQA
-//! - Likely expands vocabulary and context window from GLM-4
+//! - Likely expands vocabulary and context window from earlier GLM
 //! - May incorporate lessons from GLM-DSA sparse attention
 //!
 //! This stub is registered so GGUF files load without error when weights ship.

@@ -1,22 +1,22 @@
 //! spite — One Engine, Your Model, Your Card.
 //!
 //! Quick start (zero tuning flags required):
-//!   spite run   -m Qwen/Qwen3-27B  --card RTX_5090  -p "Hello"
-//!   spite serve -m Qwen/Qwen3-27B  --card RTX_5090
-//!   spite pull  Qwen/Qwen3-27B     --quant Q4_K_M
+//!   spite run   -m Qwen/Qwen3.5-27B  --card RTX_5090  -p "Hello"
+//!   spite serve -m Qwen/Qwen3.5-27B  --card RTX_5090
+//!   spite pull  Qwen/Qwen3.5-27B     --quant Q4_K_M
 //!
 //! Model features (opt-in):
-//!   spite run   -m DeepSeek-V3 --card RTX_5090 --mtp -p "Hello"
-//!   spite run   -m Qwen3-27B   --card RTX_5090 --dflash2 -p "Hello"
-//!   spite run   -m Gemma3-27B  --card RTX_5090 --vision -p "Describe"
+//!   spite run   -m DeepSeek-V4 --card RTX_5090 --mtp -p "Hello"
+//!   spite run   -m Qwen3.5-27B   --card RTX_5090 --dflash2 -p "Hello"
+//!   spite run   -m Gemma4-27B  --card RTX_5090 --vision -p "Describe"
 //!
 //! Offload (run any model on any GPU):
-//!   spite run   -m Llama-3-70B --card RTX_2080 --offload-ram -p "Hello"
-//!   spite run   -m Llama-3-70B --card RTX_2080 --offload-disk -p "Hello"
+//!   spite run   -m Llama-4-Maverick --card RTX_2080 --offload-ram -p "Hello"
+//!   spite run   -m Llama-4-Maverick --card RTX_2080 --offload-disk -p "Hello"
 //!
 //! Multi-GPU (pipeline parallelism):
-//!   spite run   -m Qwen3-27B --card RTX_5070,RTX_3090 -p "Hello"
-//!   spite run   -m Qwen3-27B --card RTX_4090,RX_7900_XTX -p "Hello"
+//!   spite run   -m Qwen3.5-27B --card RTX_5070,RTX_3090 -p "Hello"
+//!   spite run   -m Qwen3.5-27B --card RTX_4090,RX_7900_XTX -p "Hello"
 
 use std::path::{Path, PathBuf};
 
@@ -129,7 +129,7 @@ struct HardwareArgs {
 #[derive(Args, Clone)]
 struct FeatureArgs {
     /// Multi-Token Prediction: generate several tokens per forward pass.
-    /// Requires a model with MTP heads (DeepSeek-V3, Medusa variants).
+    /// Requires a model with MTP heads (DeepSeek-V4, Medusa variants).
     /// Compile with: cargo xtask compile --mtp
     #[arg(long = "mtp", env = "SPITE_MTP")]
     mtp: bool,
@@ -147,7 +147,7 @@ struct FeatureArgs {
     dflash2: bool,
 
     /// Vision encoder: enable multimodal image/video input.
-    /// Requires a vision-capable model (Gemma 3, LLaVA, Qwen-VL…).
+    /// Requires a vision-capable model (Gemma 4, LLaVA, Qwen-VL…).
     /// Compile with: cargo xtask compile --vision
     #[arg(long = "vision", env = "SPITE_VISION")]
     vision: bool,
@@ -194,9 +194,9 @@ enum Cmd {
     /// Generate tokens from a single prompt and print the output.
     ///
     /// Examples:
-    ///   spite run -m Qwen/Qwen3-27B --card RTX_5090 -p "Hello"
-    ///   spite run -m DeepSeek-V3    --card RTX_5090 --mtp -p "Hello"
-    ///   spite run -m Llama-3-70B   --card RTX_2080 --offload-ram -p "Hello"
+    ///   spite run -m Qwen/Qwen3.5-27B --card RTX_5090 -p "Hello"
+    ///   spite run -m DeepSeek-V4    --card RTX_5090 --mtp -p "Hello"
+    ///   spite run -m Llama-4-Maverick   --card RTX_2080 --offload-ram -p "Hello"
     Run {
         #[command(flatten)]
         model: ModelArgs,
@@ -229,8 +229,8 @@ enum Cmd {
     /// (curl, Python openai SDK, Open WebUI, etc.).
     ///
     /// Examples:
-    ///   spite serve -m Qwen/Qwen3-27B --card RTX_5090
-    ///   spite serve -m Qwen/Qwen3-27B --card RTX_5090 --port 11434
+    ///   spite serve -m Qwen/Qwen3.5-27B --card RTX_5090
+    ///   spite serve -m Qwen/Qwen3.5-27B --card RTX_5090 --port 11434
     Serve {
         #[command(flatten)]
         model: ModelArgs,
@@ -270,8 +270,8 @@ enum Cmd {
     /// Models are saved to ~/.spite/models (override with $SPITE_MODELS_DIR).
     ///
     /// Examples:
-    ///   spite pull Qwen/Qwen3-27B
-    ///   spite pull meta-llama/Llama-3.1-70B --quant Q4_K_M
+    ///   spite pull Qwen/Qwen3.5-27B
+    ///   spite pull meta-llama/Llama-4-Maverick --quant Q4_K_M
     Pull {
         /// Model name in HuggingFace "Org/Name" format.
         model: String,

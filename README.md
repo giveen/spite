@@ -13,7 +13,7 @@ engine adapts — not the other way around.
 - **One Engine** — a single Rust host that loads any GGUF model and runs it.
   No cloud required, no subscription, no data leaving your machine.
 - **Your Model** — any GGUF file works. Download a model once, run it forever.
-  Llama 4, DeepSeek-V4, Qwen 3.5, Mistral 4, Gemma 3 — if it's a `.gguf`, spite loads it.
+  Llama 4, DeepSeek-V4, Qwen 3.5, Mistral 4, Gemma 4, GLM-5 — if it's a `.gguf`, spite loads it.
 - **Your Card** — kernels are written *for* specific GPUs, not against the lowest
   common denominator. RTX 3060, RX 7800 XT, Intel Arc, Apple M-series. If nobody
   has written a tuned kernel for your card yet, the generic fallback runs. When
@@ -47,12 +47,12 @@ cargo build --release
 
 # Run a model
 ./target/release/spite run \
-  --model ~/models/qwen3-8b-instruct.Q4_K_M.gguf \
+  --model ~/models/qwen3.5-8b-instruct.Q4_K_M.gguf \
   --prompt "What is the capital of France?"
 
 # Start an API server (OpenAI-compatible)
 ./target/release/spite-server \
-  --model ~/models/qwen3-8b-instruct.Q4_K_M.gguf \
+  --model ~/models/qwen3.5-8b-instruct.Q4_K_M.gguf \
   --port 8080
 ```
 
@@ -95,7 +95,7 @@ for full speed you'll want to compile the kernels for your GPU.
 
 # Build kernels for your card
 cmake -B build \
-  -DSPITE_MODELS="llama/llama3"  \
+  -DSPITE_MODELS="llama/llama4"  \
   -DSPITE_GPU_ARCHS="sm_89"      \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
@@ -125,7 +125,7 @@ generic CPU path automatically — slower, but always correct.
 | Ada Lovelace | `sm_89` | RTX 4090, RTX 4080 Super / 4080, RTX 4070 Ti Super / 4070 Ti / 4070 Super / 4070, RTX 4060 Ti / 4060, RTX 4000 / 5000 / 6000 Ada |
 | Ampere | `sm_86` | RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060, RTX A2000–A6000 |
 | Turing | `sm_75` | RTX 2080 Ti / 2080 Super / 2080 / 2070 Super / 2070 / 2060 Super / 2060, GTX 1660 Ti / 1660 Super / 1660 |
-| Blackwell *(planned)* | `sm_120` | RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti |
+| Blackwell | `sm_120` | RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti / 5060 |
 
 ### AMD
 
@@ -163,13 +163,13 @@ That sounds abstract, so here's what it means in practice:
 
 Kernels are grouped by family and variant: `kernels/llama/llama4/`,
 `kernels/deepseek/v4/`, `kernels/qwen/qwen3_5/`, `kernels/mistral/mistral4/`,
-`kernels/gemma/gemma3/`. Adding a new model variant means adding a new
+`kernels/gemma/gemma4/`. Adding a new model variant means adding a new
 `<family>/<model>/` folder. Nothing about the existing models changes. The
 dispatcher finds it automatically.
 
 ### Every GPU is its own module
 
-`kernels/llama/llama3/sm_89/` is completely separate from `kernels/llama/llama3/rdna3/`.
+`kernels/llama/llama4/sm_89/` is completely separate from `kernels/llama/llama4/rdna3/`.
 An RTX 4090 kernel can use FP8 tensor cores. An RX 7900 XTX kernel can exploit
 96 MB of Infinity Cache. An Apple M4 kernel can use the Neural Engine. Each gets
 what makes it fast, not a watered-down kernel that has to work on everything.
@@ -191,7 +191,7 @@ deployment and the scheduler uses it. Nothing needs to be forked.
 
 ```rust
 let engine = EngineBuilder::new()
-    .with_sampler(PluginKey::for_model("llama3"), Box::new(MyGreedySampler))
+    .with_sampler(PluginKey::for_model("llama4"), Box::new(MyGreedySampler))
     .with_cache(PluginKey::default(), Box::new(PagedKvCache::new(vram)))
     .build(ExecutorConfig::default());
 ```
@@ -245,7 +245,7 @@ spite-server --model base.gguf --lora my_adapter.gguf
 
 ```bash
 # Show which kernel is active for each operation on your card
-./target/release/spite dispatch -m ~/models/your.gguf --card RTX_3090
+./target/release/spite dispatch -m ~/models/your.gguf --card RTX_4090
 
 # Measure end-to-end model throughput
 ./target/release/spite-bench --model ~/models/your.gguf
@@ -254,13 +254,13 @@ spite-server --model base.gguf --lora my_adapter.gguf
 `spite dispatch` prints the resolved kernel for each operation:
 
 ```
-model arch   : llama
-card         : rtx_3090 (24 GiB)
-gpu arch     : sm_86
+model arch   : llama4
+card         : rtx_4090 (24 GiB)
+gpu arch     : sm_89
 kernels      :
-  rms_norm       → sm_86/kernels/llama/llama3/sm_86
+  rms_norm       → sm_89/kernels/llama/llama4/sm_89
   attention      → generic/kernels/generic/generic
-  ffn            → sm_86/kernels/llama/llama3/sm_86
+  ffn            → sm_89/kernels/llama/llama4/sm_89
   layer          → generic/kernels/generic/generic
   spec_verify    → generic/kernels/generic/generic
   prefill        → generic/kernels/generic/generic
@@ -281,34 +281,34 @@ You don't need to understand the scheduler, the tokenizer, the server, or
 anything else. You need:
 - Your GPU
 - One operation to implement (attention, FFN, or rms_norm)
-- The template in `kernels/llama/llama3/sm_89/KERNEL_TEMPLATE.cu`
+- The template in `kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu`
 
 **The steps:**
 
 ```bash
 # 1. Find what's slow on your card
-spite dispatch -m your.gguf --card RTX_3080
+spite dispatch -m your.gguf --card RTX_5090
 
 # 2. Copy the template for your card
-cp kernels/llama/llama3/sm_89/KERNEL_TEMPLATE.cu \
-   kernels/llama/llama3/sm_86/attention.cu
+cp kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu \
+   kernels/llama/llama4/sm_120/attention.cu
 
 # 3. Implement the op (the template has comments for each section)
 
 # 4. Build the kernels for your card
-cmake -B build -DSPITE_MODELS="llama/llama3" -DSPITE_GPU_ARCHS="sm_86" \
+cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="sm_120" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
 # 5. Verify correctness — must pass before PR
 python3 tools/verify/verify.py \
-  build/kernels/llama/llama3/sm_86/libkernel_llama_llama3_sm_86.so
+  build/kernels/llama/llama4/sm_120/libkernel_llama_llama4_sm_120.so
 
 # 6. Benchmark and save the output
 cargo run --release -p spite-bench -- --model your.gguf \
-  > kernels/llama/llama3/sm_86/attention.bench
+  > kernels/llama/llama4/sm_120/attention.bench
 
-# 7. Open a PR titled:  kernel: llama/llama3/sm_86 attention
+# 7. Open a PR titled:  kernel: llama/llama4/sm_120 attention
 ```
 
 You only touch the `kernels/` directory. Nothing else breaks when you add a
@@ -325,14 +325,18 @@ GPU-specific notes (tile sizes, WMMA shapes, memory layout):
 
 | Model               | Status   |
 |---------------------|----------|
-| llama/llama3        | template |
 | llama/llama4        | template |
-| deepseek/v3         | template |
 | deepseek/v4         | template |
 | qwen/qwen3_5        | template |
+| qwen/qwen4          | template |
 | mistral/mistral4    | template |
-| gemma/gemma3        | template |
+| gemma/gemma4        | template |
 | glm/glm5            | template |
+| glm/glm_dsa         | template |
+| minimax/m3          | template |
+| kimi/k3             | template |
+| eagle/eagle3        | template |
+| mellum/base         | template |
 
 "Template" means the model layout and loader are wired up; kernel contributions
 welcome. Running any of these on the generic fallback works today.
@@ -387,7 +391,6 @@ dependency graph and data flow.
 - [ ] Vision models (LLaVA, InternVL, Qwen-VL)
 - [ ] Quantization tools (`spite quantize` — convert f16 → Q4_K_M locally)
 - [ ] Windows support
-- [ ] Blackwell (sm_120) and RDNA 4 kernel templates
 
 ---
 

@@ -213,7 +213,7 @@ impl EngineRegistries {
 ///
 /// ```rust,ignore
 /// let engine = EngineBuilder::new()
-///     .with_sampler(PluginKey::for_model("llama3"), Box::new(MyGreedySampler))
+///     .with_sampler(PluginKey::for_model("llama4"), Box::new(MyGreedySampler))
 ///     .with_cache(PluginKey::default(),             Box::new(PagedKvCache::new(vram)))
 ///     .build(ExecutorConfig::default());
 /// ```

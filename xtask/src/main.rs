@@ -1,8 +1,8 @@
 //! spite build tool.
 //!
-//!   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_5090
-//!   cargo xtask compile -m DeepSeek-V3    --card RTX_5090 --mtp --dflash2
-//!   cargo xtask compile -m Gemma3-27B     --card RTX_5090 --vision
+//!   cargo xtask compile -m Qwen/Qwen3.5-27B --card RTX_5090
+//!   cargo xtask compile -m DeepSeek-V4    --card RTX_5090 --mtp --dflash2
+//!   cargo xtask compile -m Gemma4-27B     --card RTX_5090 --vision
 //!
 //! Translates model names, a card name, and optional feature flags into a
 //! `cargo build` invocation with the exact Cargo features needed — no dead
@@ -28,18 +28,18 @@ enum Cmd {
     /// Compile spite for a specific card (or cards) and model set.
     ///
     /// Basic:
-    ///   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_5090
-    ///   cargo xtask compile -m meta-llama/Llama-3-70B --card MI300X
-    ///   cargo xtask compile -m meta-llama/Llama-3-8B --card M4_Max
+    ///   cargo xtask compile -m Qwen/Qwen3.5-27B --card RTX_5090
+    ///   cargo xtask compile -m meta-llama/Llama-4-Maverick --card MI300X
+    ///   cargo xtask compile -m meta-llama/Llama-4-Scout --card M4_Max
     ///
     /// With capabilities:
-    ///   cargo xtask compile -m DeepSeek-V3 --card RTX_5090 --mtp --dflash2
-    ///   cargo xtask compile -m Gemma3-27B  --card RTX_5090 --vision
+    ///   cargo xtask compile -m DeepSeek-V4 --card RTX_5090 --mtp --dflash2
+    ///   cargo xtask compile -m Gemma4-27B  --card RTX_5090 --vision
     ///   cargo xtask compile -m Qwen3-27B   --card RTX_5090 --dflash
     ///
     /// Multiple GPUs (pipeline parallelism):
-    ///   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_5070,RTX_3090
-    ///   cargo xtask compile -m Qwen/Qwen3-27B --card RTX_4090,RX_7900_XTX
+    ///   cargo xtask compile -m Qwen/Qwen3.5-27B --card RTX_5070,RTX_3090
+    ///   cargo xtask compile -m Qwen/Qwen3.5-27B --card RTX_4090,RX_7900_XTX
     Compile {
         /// Model(s) to include. One name or "target,draft" for speculative.
         /// Format: "Org/Name" (HuggingFace style) or just "Name".
@@ -51,7 +51,7 @@ enum Cmd {
         #[arg(long = "card", value_name = "CARD[,CARD…]", value_delimiter = ',')]
         cards: Vec<String>,
 
-        /// Enable Multi-Token Prediction (MTP heads: DeepSeek-V3, Medusa).
+        /// Enable Multi-Token Prediction (MTP heads: DeepSeek-V4, Medusa).
         /// Requires a model that ships MTP heads.
         #[arg(long)]
         mtp: bool,
@@ -68,7 +68,7 @@ enum Cmd {
         dflash2: bool,
 
         /// Enable vision encoder for multimodal models.
-        /// Required for Gemma 3, LLaVA, Qwen-VL, and similar vision models.
+        /// Required for Gemma 4, LLaVA, Qwen-VL, and similar vision models.
         #[arg(long)]
         vision: bool,
 
@@ -294,17 +294,14 @@ fn gpu_arch_to_feature(gpu_arch: &str) -> &'static str {
 /// Map a model name (HuggingFace style or plain) to the Cargo feature name.
 fn model_to_feature(name: &str) -> Result<&'static str> {
     let lower = name.to_lowercase();
-    // Try org prefix first, then substring match.
-    if lower.starts_with("qwen") || lower.contains("/qwen")        { return Ok("model-qwen"); }
-    if lower.contains("gemma")                                      { return Ok("model-gemma"); }
-    if lower.contains("llama")                                      { return Ok("model-llama"); }
-    if lower.starts_with("mistral") || lower.contains("/mistral")   { return Ok("model-mistral"); }
-    if lower.contains("deepseek")                                   { return Ok("model-deepseek"); }
-    if lower.contains("phi")                                        { return Ok("model-phi"); }
-    if lower.contains("falcon")                                     { return Ok("model-falcon"); }
-    if lower.contains("gpt2") || lower.starts_with("openai/gpt")   { return Ok("model-gpt2"); }
-    if lower.contains("gemma") || lower.starts_with("google/")     { return Ok("model-gemma"); }
-    if lower.starts_with("meta") || lower.starts_with("meta-llama") { return Ok("model-llama"); }
+    if lower.starts_with("qwen") || lower.contains("/qwen")       { return Ok("model-qwen"); }
+    if lower.contains("gemma") || lower.starts_with("google/")    { return Ok("model-gemma"); }
+    if lower.contains("llama") || lower.starts_with("meta")       { return Ok("model-llama"); }
+    if lower.starts_with("mistral") || lower.contains("/mistral") { return Ok("model-mistral"); }
+    if lower.contains("deepseek")                                 { return Ok("model-deepseek"); }
+    if lower.contains("glm")                                      { return Ok("model-glm"); }
+    if lower.contains("minimax")                                  { return Ok("model-minimax"); }
+    if lower.contains("kimi")                                     { return Ok("model-kimi"); }
     bail!(
         "unknown model family for '{name}'.\n\
          Run `cargo xtask models` to see supported families, \
@@ -332,6 +329,8 @@ fn vendor_label(gpu_arch: &str) -> &'static str {
 
 static KNOWN_CARDS: &[(&str, &str, u32)] = &[
     ("rtx_5090",  "sm_120",  32), ("rtx_5080",  "sm_120",  16),
+    ("rtx_5070_ti","sm_120", 16), ("rtx_5070",  "sm_120",  12),
+    ("rtx_5060_ti","sm_120", 16), ("rtx_5060",  "sm_120",   8),
     ("rtx_4090",  "sm_89",   24), ("rtx_4080",  "sm_89",   16),
     ("rtx_3090",  "sm_86",   24), ("rtx_3080",  "sm_86",   10),
     ("h200",      "sm_90",  141), ("h100",      "sm_90",   80),
@@ -351,20 +350,20 @@ static KNOWN_CARDS: &[(&str, &str, u32)] = &[
 ];
 
 static KNOWN_MODELS: &[(&str, &str, &[&str])] = &[
-    ("LLaMA / LLaMA 2 / LLaMA 3",  "model-llama",
-     &["meta-llama/Llama-3.1-70B", "meta-llama/Llama-3-8B"]),
-    ("Qwen 2 / Qwen 3",            "model-qwen",
-     &["Qwen/Qwen3-27B", "Qwen/Qwen3-1.7B", "Qwen/Qwen2.5-72B"]),
-    ("Gemma / Gemma 2 / Gemma 3",  "model-gemma",
-     &["Google/gemma-3-27b", "Google/gemma-2-9b"]),
-    ("Mistral / Mixtral",          "model-mistral",
-     &["mistralai/Mistral-7B-v0.3", "mistralai/Mixtral-8x7B"]),
-    ("DeepSeek V2 / V3 / R1",      "model-deepseek",
-     &["deepseek-ai/DeepSeek-V3", "deepseek-ai/DeepSeek-R1"]),
-    ("Phi-3 / Phi-4",              "model-phi",
-     &["microsoft/Phi-4", "microsoft/Phi-3.5-mini-instruct"]),
-    ("Falcon / Falcon H1",         "model-falcon",
-     &["tiiuae/Falcon3-10B-Instruct", "tiiuae/falcon-40b"]),
-    ("GPT-2 (legacy)",             "model-gpt2",
-     &["openai/gpt2", "openai/gpt2-xl"]),
+    ("Llama 4",           "model-llama",
+     &["meta-llama/Llama-4-Scout", "meta-llama/Llama-4-Maverick"]),
+    ("Qwen 3.5 / Qwen 4", "model-qwen",
+     &["Qwen/Qwen3.5-27B", "Qwen/Qwen4-72B"]),
+    ("Gemma 4",           "model-gemma",
+     &["Google/gemma-4-27b"]),
+    ("Mistral 4",         "model-mistral",
+     &["mistralai/Mistral-4-24B"]),
+    ("DeepSeek-V4",       "model-deepseek",
+     &["deepseek-ai/DeepSeek-V4"]),
+    ("GLM-5 / GLM-DSA",   "model-glm",
+     &["zai-org/GLM-5", "zai-org/GLM-5-DSA"]),
+    ("MiniMax M3",        "model-minimax",
+     &["MiniMax/MiniMax-M3"]),
+    ("Kimi K3",           "model-kimi",
+     &["moonshotai/Kimi-K3"]),
 ];

@@ -51,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [sm_89, sm_86, sm_75]
+        arch: [sm_89, sm_90, sm_100, sm_120]
 
     steps:
       - uses: actions/checkout@v4
@@ -60,7 +60,7 @@ jobs:
         run: |
           cmake -B build \
             -DSPITE_GPU_ARCHS="${{ matrix.arch }}" \
-            -DSPITE_MODELS="llama/llama3,mistral/mistral4" \
+            -DSPITE_MODELS="llama/llama4,mistral/mistral4" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j$(nproc)
 
@@ -90,7 +90,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [rdna3, rdna2]
+        arch: [rdna3, rdna4]
 
     steps:
       - uses: actions/checkout@v4
@@ -99,7 +99,7 @@ jobs:
         run: |
           cmake -B build \
             -DSPITE_GPU_ARCHS="${{ matrix.arch }}" \
-            -DSPITE_MODELS="llama/llama3" \
+            -DSPITE_MODELS="llama/llama4" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j$(nproc)
 
@@ -127,7 +127,7 @@ jobs:
         run: |
           cmake -B build \
             -DSPITE_GPU_ARCHS="metal" \
-            -DSPITE_MODELS="llama/llama3" \
+            -DSPITE_MODELS="llama/llama4" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
@@ -145,7 +145,7 @@ jobs:
     name: Arc kernel tests
     if: |
       contains(github.event.pull_request.files.*.filename, 'kernels/') &&
-      contains(github.event.pull_request.files.*.filename, '/arc_alchemist/')
+      contains(github.event.pull_request.files.*.filename, '/arc_battlemage/')
     runs-on: [self-hosted, arc]
 
     steps:
@@ -154,8 +154,8 @@ jobs:
       - name: Build kernels
         run: |
           cmake -B build \
-            -DSPITE_GPU_ARCHS="arc_alchemist" \
-            -DSPITE_MODELS="llama/llama3" \
+            -DSPITE_GPU_ARCHS="arc_battlemage" \
+            -DSPITE_MODELS="llama/llama4" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
@@ -165,5 +165,5 @@ jobs:
           while IFS= read -r so; do
             echo "verifying $so"
             python3 tools/verify/verify.py "$so" || fail=1
-          done < <(find build/kernels -type f -name '*.so' -path "*/arc_alchemist/*")
+          done < <(find build/kernels -type f -name '*.so' -path "*/arc_battlemage/*")
           exit $fail

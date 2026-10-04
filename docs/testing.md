@@ -135,13 +135,13 @@ CMake and verified against the generic reference:
 
 ```bash
 # Build kernels for your GPU
-cmake -B build -DSPITE_MODELS="llama/llama3" -DSPITE_GPU_ARCHS="sm_89" \
+cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="sm_89" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
 # Verify correctness (compares the built .so against the generic reference)
 python3 tools/verify/verify.py \
-  build/kernels/llama/llama3/sm_89/libkernel_llama_llama3_sm_89.so
+  build/kernels/llama/llama4/sm_89/libkernel_llama_llama4_sm_89.so
 
 # Benchmark
 cargo run --release -p spite-bench -- --model path/to/model.gguf

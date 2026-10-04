@@ -1,6 +1,6 @@
 [package]
 name        = "spite-models"
-description = "Model architecture implementations: llama3, mistral, phi3 and more"
+description = "Model architecture implementations: llama4, mistral4, qwen4 and more"
 version.workspace    = true
 edition.workspace    = true
 rust-version.workspace = true

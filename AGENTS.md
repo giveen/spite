@@ -62,7 +62,7 @@ the generic fallback from `kernels/generic/generic/`. Example format:
 | operation | kernel | latency (µs) |
 |---|---|---|
 | attention | generic/generic (before) | 841.2 |
-| attention | llama/llama3/sm_86 (after) | 213.7 |
+| attention | llama/llama4/sm_120 (after) | 213.7 |
 ```
 
 **A PR without before/after numbers will not be reviewed.**
@@ -89,7 +89,7 @@ that produces wrong outputs at lower latency is not an improvement.
 ## PR format for kernel contributions
 
 Title: `kernel: <family>/<model>/<arch> <operation>`
-Example: `kernel: llama/llama3/sm_86 attention`
+Example: `kernel: llama/llama4/sm_120 attention`
 
 Description sections (required):
 1. **GPU** — exact card and driver version used for benchmarking

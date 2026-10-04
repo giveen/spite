@@ -2,14 +2,14 @@
 //!
 //! Variant: Gemma 4 (2025). Separate instruct variant uses arch `gemma4-assistant`.
 //!
-//! Builds on Gemma 3's foundation. Expected to retain:
+//! Inherits the Gemma architecture lineage:
 //! - Local + global alternating attention (5:1 ratio)
 //! - GeGLU FFN activation
 //! - Pre- and post-norm around both sublayers
 //! - Logit soft-capping (`final_logit_softcapping`)
 //! - SigLIP vision encoder integration (multimodal)
 //!
-//! Potential additions over Gemma 3:
+//! Notable features:
 //! - Extended context (>32K)
 //! - Updated KV head ratio (GQA n_kv_heads)
 //! - Improved RoPE scaling
@@ -39,7 +39,6 @@ impl ModelArch for Gemma4 {
         _ctx:        &SpiteCtx,
     ) -> Result<(), ModelError> {
         // TODO: implement once Gemma 4 architecture is documented.
-        // See gemma/gemma3.rs for the Gemma 3 forward reference.
         Err(ModelError::Forward("not implemented".into()))
     }
 }

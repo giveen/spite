@@ -18,7 +18,7 @@ spite dispatch -m path/to/model.gguf --card RTX_3090
 Output looks like:
 
 ```
-  rms_norm       → sm_86/kernels/llama/llama3/sm_86
+  rms_norm       → sm_89/kernels/llama/llama4/sm_89
   attention      → generic/kernels/generic/generic
   ffn            → generic/kernels/generic/generic
   layer          → generic/kernels/generic/generic
@@ -32,8 +32,8 @@ your card would be faster.
 ## Step 2 — Copy the template
 
 ```bash
-cp kernels/llama/llama3/sm_89/KERNEL_TEMPLATE.cu \
-   kernels/llama/llama3/sm_86/attention.cu
+cp kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu \
+   kernels/llama/llama4/sm_120/attention.cu
 ```
 
 Edit the `gpu_arch` field in `kernel_info` at the bottom of the file.
@@ -53,12 +53,12 @@ Start with `ffn` or `rms_norm`. Attention is the most complex.
 ## Step 4 — Build and verify correctness
 
 ```bash
-cmake -B build -DSPITE_MODELS="llama/llama3" -DSPITE_GPU_ARCHS="sm_86" \
+cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="sm_120" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
 python3 tools/verify/verify.py \
-  build/kernels/llama/llama3/sm_86/libkernel_llama_llama3_sm_86.so
+  build/kernels/llama/llama4/sm_120/libkernel_llama_llama4_sm_120.so
 ```
 
 This runs your kernel against the generic reference implementation on a set
@@ -79,13 +79,13 @@ kernel achieves on your hardware.
 ```
 kernels/
   llama/
-    llama3/
-      sm_86/
+    llama4/
+      sm_120/
         attention.cu      ← your file
         attention.bench   ← the bench output
 ```
 
-PR title format: `kernel: llama/llama3/sm_86 attention`
+PR title format: `kernel: llama/llama4/sm_120 attention`
 
 That's it. No need to touch anything outside the `kernels/` directory.
 
