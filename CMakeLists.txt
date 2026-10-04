@@ -86,6 +86,13 @@ foreach(_spec ${_model_specs})
             LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/kernels/${_family}/${_model}/${_arch}"
         )
 
+        # `cmake --install build --prefix .` copies the .so into ./kernels/,
+        # which the host checks by default.
+        install(TARGETS ${_target}
+            LIBRARY DESTINATION kernels/${_family}/${_model}/${_arch}
+            RUNTIME DESTINATION kernels/${_family}/${_model}/${_arch}
+        )
+
         message(STATUS "spite kernels: + ${_family}/${_model}/${_arch}")
     endforeach()
 endforeach()
@@ -97,5 +104,9 @@ if(_generic_srcs)
     target_include_directories(kernel_generic PRIVATE "${CMAKE_SOURCE_DIR}")
     set_target_properties(kernel_generic PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/kernels/generic/generic"
+    )
+    install(TARGETS kernel_generic
+        LIBRARY DESTINATION kernels/generic/generic
+        RUNTIME DESTINATION kernels/generic/generic
     )
 endif()

@@ -99,11 +99,15 @@ cmake -B build \
   -DSPITE_GPU_ARCHS="sm_89"      \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
+cmake --install build --prefix .
+```
 
-# Then run with kernels
+The install step copies the compiled kernels into `./kernels/`, which spite
+checks automatically. After that, run normally — no extra flags:
+
+```bash
 ./target/release/spite run \
   --model ~/models/your.gguf \
-  --kernels-dir build/kernels \
   --prompt "Hello"
 ```
 
