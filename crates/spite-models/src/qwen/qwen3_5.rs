@@ -384,7 +384,7 @@ fn linear_attn(
             &qs,
             &kn[kh * s..(kh + 1) * s],
             &v_raw[vh * head_v..(vh + 1) * head_v],
-            gate,
+            &[gate],
             beta,
             &mut o,
         )

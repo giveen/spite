@@ -67,6 +67,24 @@ pub struct ModelHyperparams {
     /// Per-layer SwiGLU clamp limits (0 = no clamp).
     pub swiglu_clamp_exp: Vec<f32>,
     pub swiglu_clamp_shexp: Vec<f32>,
+    /// MLA / KDA geometry (0 = unused).
+    pub q_lora_rank: u32,
+    pub kv_lora_rank: u32,
+    pub key_length: u32,
+    pub value_length: u32,
+    pub rope_dim_count: u32,
+    pub kda_head_dim: u32,
+    pub kda_gate_lower_bound: f32,
+    pub n_layer_dense_lead: u32,
+    pub n_expert_latent: u32,
+    pub expert_weights_norm: bool,
+    pub expert_gating_func: u32,
+    pub attn_res_block_size: u32,
+    pub situ_beta: f32,
+    pub situ_linear_beta: f32,
+    /// Per-layer kv-head counts when stored as an array (kimi-style
+    /// recurrent marking: 0 kv heads = recurrent layer).
+    pub head_count_kv_arr: Vec<u32>,
 }
 
 impl ModelHyperparams {
@@ -203,6 +221,39 @@ impl ModelHyperparams {
             },
             swiglu_clamp_exp: f32_arr(&format!("{arch}.swiglu_clamp_exp")),
             swiglu_clamp_shexp: f32_arr(&format!("{arch}.swiglu_clamp_shexp")),
+            q_lora_rank: u("attention.q_lora_rank"),
+            kv_lora_rank: u("attention.kv_lora_rank"),
+            key_length: u("attention.key_length"),
+            value_length: u("attention.value_length"),
+            rope_dim_count: u("rope.dimension_count"),
+            kda_head_dim: u("kda.head_dim"),
+            kda_gate_lower_bound: {
+                let v = f("kda.gate_lower_bound");
+                if v == 0.0 { f32::NEG_INFINITY } else { v }
+            },
+            n_layer_dense_lead: u("leading_dense_block_count"),
+            n_expert_latent: u("expert_latent_length"),
+            expert_weights_norm: matches!(
+                meta.get(&format!("{arch}.expert_weights_norm")),
+                Some(crate::MetaValue::Bool(true))
+                    | Some(crate::MetaValue::U32(1))
+                    | Some(crate::MetaValue::I32(1))
+            ),
+            expert_gating_func: u("expert_gating_func"),
+            attn_res_block_size: u("attn_res.block_size"),
+            situ_beta: f("activation.situ_beta"),
+            situ_linear_beta: f("activation.situ_linear_beta"),
+            head_count_kv_arr: match meta.get(&format!("{arch}.attention.head_count_kv")) {
+                Some(crate::MetaValue::Array(items)) => items
+                    .iter()
+                    .map(|v| match v {
+                        crate::MetaValue::U32(x) => *x,
+                        crate::MetaValue::I32(x) => *x as u32,
+                        _ => 0,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
         }
     }
 

@@ -4,8 +4,8 @@
 //! build_delta_net_autoregressive` (decode path, one token). Used by hybrid
 //! archs (Qwen3.5) for their recurrent layers.
 //!
-//! Per value-head (S = head dim), with decay `g`, mixing `beta`, and state
-//! `M` (S×S, row-major, persistent across positions):
+//! Per value-head (S = head dim), with log-domain decay, mixing `beta`,
+//! and state `M` (S×S, row-major, persistent across positions):
 //! ```text
 //! M   *= exp(g)                                   (forget)
 //! sk    = Mᵀ k          (sk[s] = Σ_r M[r][s]·k[r])
@@ -19,14 +19,16 @@ use crate::ComputeError;
 
 /// One GDN step for a single value-head.
 ///
-/// `state` is S×S row-major, updated in place. `g`/`beta` are scalars.
-/// `q` must already be scaled by 1/√S.
+/// `state` is S×S row-major, updated in place. `decay` holds the
+/// log-domain forget gate (length 1 or S, broadcast over rows);
+/// the effective multiplier is `exp(decay)`. `q` must already be
+/// scaled by 1/√S.
 pub fn gdn_step(
     state: &mut [f32],
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    g: f32,
+    decay: &[f32],
     beta: f32,
     out: &mut [f32],
 ) -> Result<(), ComputeError> {
@@ -36,9 +38,16 @@ pub fn gdn_step(
             "gdn_step shape mismatch".into(),
         ));
     }
-    let decay = g.exp();
-    for m in state.iter_mut() {
-        *m *= decay;
+    if decay.len() != 1 && decay.len() != s {
+        return Err(ComputeError::ShapeMismatch(
+            "gdn_step decay shape mismatch".into(),
+        ));
+    }
+    let at = |d: &[f32], i: usize| if d.len() == 1 { d[0] } else { d[i] };
+    for r in 0..s {
+        for (ss, m) in state[r * s..(r + 1) * s].iter_mut().enumerate() {
+            *m *= at(decay, ss).exp();
+        }
     }
     // sk = Mᵀk; d = (v − sk)·beta
     let mut d = vec![0f32; s];
@@ -110,7 +119,7 @@ mod tests {
         let k = vec![1.0, 0.5, -0.5, 0.25];
         let v = vec![0.25, 0.75, -0.125, 0.5];
         let mut out = vec![0f32; s];
-        gdn_step(&mut state, &q, &k, &v, 0.0, 1.0, &mut out).unwrap();
+        gdn_step(&mut state, &q, &k, &v, &[0.0], 1.0, &mut out).unwrap();
 
         // Naive: M was zero, so sk=0, d=v, M=k⊗v, o=Mᵀq.
         let dot_qk: f32 = q.iter().zip(k.iter()).map(|(a, b)| a * b).sum();
@@ -119,7 +128,7 @@ mod tests {
         }
         // Second step keeps state across calls (recurrence).
         let mut out2 = vec![0f32; s];
-        gdn_step(&mut state, &q, &k, &v, 0.0, 1.0, &mut out2).unwrap();
+        gdn_step(&mut state, &q, &k, &v, &[0.0], 1.0, &mut out2).unwrap();
         assert!(out2.iter().all(|x| x.is_finite()));
         assert_ne!(out, out2);
     }
