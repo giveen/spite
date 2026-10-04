@@ -20,6 +20,7 @@
 // 2026 model families. Each family keeps only its current-generation
 // variant; older generations were removed. See kernels/<family>/<model>/.
 pub mod deepseek;
+pub mod dense;
 pub mod eagle;
 pub mod gemma;
 pub mod glm;
@@ -120,6 +121,24 @@ impl Default for ModelConfig {
     }
 }
 
+impl From<spite_loader::config::ModelHyperparams> for ModelConfig {
+    fn from(h: spite_loader::config::ModelHyperparams) -> Self {
+        Self {
+            arch: h.arch,
+            n_layers: h.n_layers as usize,
+            n_heads: h.n_heads as usize,
+            n_kv_heads: h.n_kv_heads.max(1) as usize,
+            d_model: h.d_model as usize,
+            d_ffn: h.d_ffn as usize,
+            vocab_size: h.vocab_size as usize,
+            max_seq_len: h.max_seq_len.max(1) as usize,
+            rope_theta: h.rope_theta,
+            norm_eps: h.norm_eps,
+            ..Default::default()
+        }
+    }
+}
+
 /// Every model architecture must implement this trait.
 pub trait ModelArch: Send + Sync {
     fn config(&self) -> &ModelConfig;
@@ -132,6 +151,9 @@ pub trait ModelArch: Send + Sync {
     fn load_weights(&mut self, _model: &spite_loader::GgufModel) -> Result<(), ModelError> {
         Ok(())
     }
+
+    /// Clear cached K/V state. Called when starting a new sequence.
+    fn reset_cache(&self) {}
 
     /// Run one forward pass.
     ///

@@ -445,8 +445,52 @@ fn cmd_run(
     println!("\nprompt       : {prompt}");
     println!("max tokens   : {max_tokens}");
     println!("temperature  : {temperature}");
-    println!("\n(inference not yet implemented — contribute it!)");
+
+    let text = generate(&target_gguf, prompt, max_tokens, temperature, ctx)?;
+    println!("\n{text}");
     Ok(())
+}
+
+/// Shared generate path for `run` (server reuses the same crates).
+/// Tokenize → prefill → decode loop → detokenize.
+pub fn generate(
+    gguf: &GgufModel,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+    ctx_len: Option<usize>,
+) -> Result<String> {
+    use spite_executor::{Executor, ExecutorConfig};
+    use spite_models::{ArchRegistry, ModelConfig};
+    use spite_tokenizer::Tokenizer;
+
+    let hp = spite_loader::config::ModelHyperparams::from_gguf(gguf);
+    let cfg = ModelConfig::from(hp);
+    let mut model = ArchRegistry::default()
+        .build(cfg)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    model
+        .load_weights(gguf)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let tokenizer = Tokenizer::from_gguf(gguf)?;
+    let ids = tokenizer.encode(prompt, true)?;
+
+    let mut exec_cfg = ExecutorConfig::default();
+    if let Some(n) = ctx_len {
+        exec_cfg.ctx_len = n;
+    }
+    let mut exec = Executor::new(exec_cfg);
+    exec.load_model(model);
+
+    let pieces = exec.generate(
+        &tokenizer,
+        &ids,
+        max_tokens,
+        temperature,
+        0x1234_5678_9abc_def0,
+    )?;
+    Ok(pieces.into_iter().map(|(_, s)| s).collect())
 }
 
 fn cmd_serve(
@@ -658,4 +702,21 @@ fn read_total_ram_bytes() -> Option<u64> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_fake_mistral4_produces_text() {
+        let fake = spite_testkit::FakeGguf {
+            arch: "mistral4".to_string(),
+            ..Default::default()
+        };
+        let tmp = fake.write_to_tempfile().unwrap();
+        let gguf = GgufModel::open(tmp.path()).unwrap();
+        let text = generate(&gguf, "AB", 4, 0.0, None).unwrap();
+        assert!(!text.is_empty(), "expected generated text, got empty");
+    }
 }

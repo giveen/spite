@@ -52,14 +52,27 @@ pub struct Usage {
 }
 
 pub async fn create_completion(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<CompletionRequest>,
 ) -> Json<CompletionResponse> {
-    // TODO: tokenize prompt, run inference loop, detokenize
-    let created = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let created = super::chat::unix_now();
+
+    let mut exec = state.executor.lock().unwrap();
+    let ids = match state.tokenizer.encode(&req.prompt, true) {
+        Ok(ids) => ids,
+        Err(e) => {
+            return error_response(&req.model, created, &e.to_string());
+        }
+    };
+    let prompt_tokens = ids.len();
+    let pieces = match exec.generate(&state.tokenizer, &ids, req.max_tokens, req.temperature, 0) {
+        Ok(pieces) => pieces,
+        Err(e) => {
+            return error_response(&req.model, created, &e.to_string());
+        }
+    };
+    let completion_tokens = pieces.len();
+    let text: String = pieces.into_iter().map(|(_, s)| s).collect();
 
     Json(CompletionResponse {
         id: format!("cmpl-{created:x}"),
@@ -67,7 +80,26 @@ pub async fn create_completion(
         created,
         model: req.model,
         choices: vec![CompletionChoice {
-            text: "[inference not yet implemented]".into(),
+            text,
+            index: 0,
+            finish_reason: "stop",
+        }],
+        usage: Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        },
+    })
+}
+
+fn error_response(model: &str, created: u64, err: &str) -> Json<CompletionResponse> {
+    Json(CompletionResponse {
+        id: format!("cmpl-{created:x}"),
+        object: "text_completion",
+        created,
+        model: model.to_owned(),
+        choices: vec![CompletionChoice {
+            text: format!("[spite error: {err}]"),
             index: 0,
             finish_reason: "stop",
         }],

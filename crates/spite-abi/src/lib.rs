@@ -62,6 +62,7 @@ impl SpiteTensor {
 // ── Inference context ──────────────────────────────────────────────────────
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SpiteCtx {
     pub n_ctx: c_int,
     pub n_batch: c_int,

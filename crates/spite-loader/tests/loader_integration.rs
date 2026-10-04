@@ -80,8 +80,8 @@ fn tensor_present_and_correct_shape() {
 
     let gate = model.tensor("blk.0.ffn_gate.weight");
     assert!(!gate.is_null());
-    assert_eq!(gate.ne[0], 256); // d_ffn
-    assert_eq!(gate.ne[1], 64); // d_model
+    assert_eq!(gate.ne[0], 64); // d_model (GGUF stores [in, out])
+    assert_eq!(gate.ne[1], 256); // d_ffn
 }
 
 #[test]

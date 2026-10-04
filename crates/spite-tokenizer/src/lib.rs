@@ -113,7 +113,9 @@ pub enum TokenizerKind {
 pub struct Tokenizer {
     pub vocab: Vocab,
     pub kind: TokenizerKind,
-    // TODO: BPE merge table or SP model trie
+    merges: Option<bpe::BpeMergeTable>,
+    /// token string → id, for BPE byte lookup and merge resolution.
+    vocab_map: std::collections::HashMap<String, u32>,
 }
 
 impl Tokenize for Tokenizer {
@@ -139,32 +141,211 @@ impl Tokenize for Tokenizer {
 
 impl Tokenizer {
     /// Build a Tokenizer from a loaded GGUF model's metadata.
-    pub fn from_gguf(_model: &spite_loader::GgufModel) -> Result<Self, TokenizerError> {
-        // TODO:
-        // 1. Read tokenizer.ggml.model → determine kind
-        // 2. Read tokenizer.ggml.tokens / scores / token_type arrays
-        // 3. Read tokenizer.ggml.bos_token_id / eos_token_id
-        // 4. Build merge table (BPE) or trie (SP)
-        Err(TokenizerError::NoTokenizer)
+    pub fn from_gguf(model: &spite_loader::GgufModel) -> Result<Self, TokenizerError> {
+        let tokens = model
+            .get_array("tokenizer.ggml.tokens")
+            .ok_or(TokenizerError::NoTokenizer)?;
+        let mut vocab_tokens = Vec::with_capacity(tokens.len());
+        for t in tokens {
+            match t {
+                spite_loader::MetaValue::Str(s) => vocab_tokens.push(s.clone()),
+                _ => return Err(TokenizerError::NoTokenizer),
+            }
+        }
+        let scores = model
+            .get_array("tokenizer.ggml.scores")
+            .map(|a| {
+                a.iter()
+                    .map(|v| match v {
+                        spite_loader::MetaValue::F32(f) => *f,
+                        _ => 0.0,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![0.0; vocab_tokens.len()]);
+        if scores.len() != vocab_tokens.len() {
+            return Err(TokenizerError::VocabMismatch {
+                tokens: vocab_tokens.len(),
+                scores: scores.len(),
+            });
+        }
+        let token_types = model
+            .get_array("tokenizer.ggml.token_type")
+            .map(|a| {
+                a.iter()
+                    .map(|v| match v {
+                        spite_loader::MetaValue::I32(i) => *i as u32,
+                        spite_loader::MetaValue::U32(u) => *u,
+                        _ => TokenType::Normal as u32,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![TokenType::Normal as u32; vocab_tokens.len()]);
+        let token_types = token_types
+            .into_iter()
+            .map(|t| match t {
+                1 => TokenType::Normal,
+                2 => TokenType::Unknown,
+                3 => TokenType::Control,
+                4 => TokenType::UserDefined,
+                5 => TokenType::Unused,
+                6 => TokenType::Byte,
+                _ => TokenType::Normal,
+            })
+            .collect();
+
+        let kind_str = model.get_str("tokenizer.ggml.model").unwrap_or("gpt2");
+        let kind = match kind_str {
+            "llama" | "unigram" => TokenizerKind::SentencePiece,
+            "bert" | "wordpiece" => TokenizerKind::WordPiece,
+            _ => TokenizerKind::Bpe,
+        };
+
+        let vocab_map: std::collections::HashMap<String, u32> = vocab_tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+
+        let merges = match kind {
+            TokenizerKind::Bpe => model
+                .get_array("tokenizer.ggml.merges")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| match v {
+                            spite_loader::MetaValue::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map(|raw| bpe::BpeMergeTable::from_merges(&raw, &vocab_map))
+                .transpose()?,
+            _ => None,
+        };
+
+        let u32_id = |key: &str, default: u32| model.get_u32(key).unwrap_or(default);
+        Ok(Self {
+            vocab: Vocab {
+                bos_id: u32_id("tokenizer.ggml.bos_token_id", 0),
+                eos_id: u32_id("tokenizer.ggml.eos_token_id", 1),
+                unk_id: model.get_u32("tokenizer.ggml.unknown_token_id"),
+                pad_id: model.get_u32("tokenizer.ggml.padding_token_id"),
+                tokens: vocab_tokens,
+                scores,
+                token_types,
+            },
+            kind,
+            merges,
+            vocab_map,
+        })
     }
 
     /// Encode text to token ids. Prepends BOS if `add_bos` is true.
-    pub fn encode(&self, _text: &str, _add_bos: bool) -> Result<Vec<u32>, TokenizerError> {
-        // TODO: BPE or SP encode
-        Err(TokenizerError::Encode("not yet implemented".into()))
+    pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>, TokenizerError> {
+        let mut ids = Vec::new();
+        if add_bos {
+            ids.push(self.vocab.bos_id);
+        }
+        match self.kind {
+            TokenizerKind::Bpe => {
+                let table = self
+                    .merges
+                    .as_ref()
+                    .ok_or_else(|| TokenizerError::Encode("no BPE merge table".into()))?;
+                for word in bpe::pretokenize_gpt2(text) {
+                    // Map each byte to its single-byte token id.
+                    let mut bytes = Vec::with_capacity(word.len());
+                    for &b in word.as_bytes() {
+                        let s = (b as char).to_string();
+                        match self.vocab_map.get(&s) {
+                            Some(&id) => bytes.push(id),
+                            None => {
+                                if let Some(unk) = self.vocab.unk_id {
+                                    bytes.push(unk);
+                                } else {
+                                    return Err(TokenizerError::Encode(format!(
+                                        "no byte token for 0x{b:02x}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    ids.extend(table.encode_word(&bytes));
+                }
+            }
+            TokenizerKind::SentencePiece => {
+                return Err(TokenizerError::Encode(
+                    "sentencepiece encode not yet ported".into(),
+                ));
+            }
+            TokenizerKind::WordPiece => {
+                return Err(TokenizerError::Encode(
+                    "wordpiece encode not yet ported".into(),
+                ));
+            }
+        }
+        Ok(ids)
     }
 
     /// Decode token ids to a UTF-8 string.
-    /// Handles byte-fallback tokens (U+2581 → space, <0xNN> → raw byte).
-    pub fn decode(&self, _ids: &[u32], _skip_special: bool) -> String {
-        // TODO: concatenate token strings, apply byte fallback
-        String::new()
+    /// Handles byte-fallback tokens (▁ → space, <0xNN> → raw byte).
+    pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
+        let mut bytes = Vec::new();
+        for &id in ids {
+            if skip_special && self.vocab.is_special(id) {
+                continue;
+            }
+            let Some(tok) = self.vocab.token_to_str(id) else {
+                continue;
+            };
+            if let Some(hex) = tok.strip_prefix("<0x").and_then(|s| s.strip_suffix('>'))
+                && let Ok(b) = u8::from_str_radix(hex, 16)
+            {
+                bytes.push(b);
+                continue;
+            }
+            bytes.extend_from_slice(tok.replace('▁', " ").as_bytes());
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Decode a single token id — used for streaming output.
     pub fn decode_one(&self, id: u32) -> Cow<'_, str> {
-        // TODO: handle byte-fallback tokens (token_type == Byte) by
-        // parsing "<0xNN>" and returning Cow::Owned with the decoded byte.
-        Cow::Borrowed(self.vocab.token_to_str(id).unwrap_or(""))
+        if let Some(tok) = self.vocab.token_to_str(id) {
+            if let Some(hex) = tok.strip_prefix("<0x").and_then(|s| s.strip_suffix('>'))
+                && let Ok(b) = u8::from_str_radix(hex, 16)
+            {
+                return Cow::Owned((b as char).to_string());
+            }
+            return Cow::Borrowed(tok);
+        }
+        Cow::Borrowed("")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spite_loader::GgufModel;
+
+    fn test_tokenizer() -> Tokenizer {
+        let tmp = spite_testkit::FakeGguf::default()
+            .write_to_tempfile()
+            .unwrap();
+        let model = GgufModel::open(tmp.path()).unwrap();
+        Tokenizer::from_gguf(&model).unwrap()
+    }
+
+    #[test]
+    fn bpe_roundtrip_with_merge() {
+        let tok = test_tokenizer();
+        // "AB" merges to one id via the "A B" merge rule.
+        let ids = tok.encode("AB", false).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(tok.decode(&ids, true), "AB");
+        // BOS prepends when asked.
+        let with_bos = tok.encode("AB", true).unwrap();
+        assert_eq!(with_bos[0], tok.vocab.bos_id);
+        assert_eq!(with_bos.len(), 2);
     }
 }

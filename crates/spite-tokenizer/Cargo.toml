@@ -11,3 +11,6 @@ repository.workspace = true
 spite-abi    = { workspace = true }
 spite-loader = { workspace = true }
 thiserror    = { workspace = true }
+
+[dev-dependencies]
+spite-testkit = { workspace = true }

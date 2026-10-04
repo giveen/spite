@@ -2,7 +2,7 @@
 //!
 //! Starts a real axum server bound to a random port, sends HTTP requests
 //! using reqwest, and checks responses. No GPU needed — the fake GGUF model
-//! satisfies the loader; executor calls return stub responses.
+//! satisfies the loader and runs real CPU inference.
 
 use std::sync::Arc;
 
@@ -14,7 +14,11 @@ use tokio::net::TcpListener;
 
 /// Spawn the server on a random OS-assigned port; return the base URL.
 async fn start_server() -> String {
-    let tmp = FakeGguf::default().write_to_tempfile().unwrap();
+    let fake = FakeGguf {
+        arch: "mistral4".to_string(),
+        ..Default::default()
+    };
+    let tmp = fake.write_to_tempfile().unwrap();
     let state = Arc::new(
         spite_server::AppState::load(
             tmp.path(),
@@ -64,7 +68,7 @@ async fn models_list_returns_model_card() {
     );
     assert_eq!(data[0]["object"], "model");
     // model id should be the arch from the fake GGUF
-    assert_eq!(data[0]["id"], "llama4");
+    assert_eq!(data[0]["id"], "mistral4");
 }
 
 #[tokio::test]
@@ -87,8 +91,8 @@ async fn chat_completion_non_stream_returns_400_or_stub() {
     let resp = client
         .post(format!("{base}/v1/chat/completions"))
         .json(&serde_json::json!({
-            "model": "llama4",
-            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "mistral4",
+            "messages": [{"role": "user", "content": "AB"}],
             "stream": false
         }))
         .send()
@@ -99,10 +103,16 @@ async fn chat_completion_non_stream_returns_400_or_stub() {
     // We accept either a well-formed stub response (200) or a
     // 500/stub while the executor isn't implemented — what matters
     // is that the server doesn't panic and returns valid JSON or text.
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
     assert!(
-        resp.status().as_u16() < 600,
-        "status should be a valid HTTP code"
+        !content.is_empty() && !content.contains("not yet implemented"),
+        "expected generated text, got: {content}"
     );
+    assert!(body["usage"]["completion_tokens"].as_u64().unwrap_or(0) > 0);
 }
 
 #[tokio::test]

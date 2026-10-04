@@ -148,13 +148,26 @@ pub async fn create_chat_completion(
     }
 }
 
-async fn blocking_response(_state: Arc<AppState>, req: ChatRequest) -> Json<ChatCompletion> {
-    // TODO: run tokenizer → inference loop → detokenize
-    let reply = format!(
-        "[spite inference not yet implemented — model={}, messages={}]",
-        req.model,
-        req.messages.len()
-    );
+async fn blocking_response(state: Arc<AppState>, req: ChatRequest) -> Json<ChatCompletion> {
+    let prompt: String = req
+        .messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut exec = state.executor.lock().unwrap();
+    let ids = match state.tokenizer.encode(&prompt, true) {
+        Ok(ids) => ids,
+        Err(e) => return error_completion(&req.model, &e.to_string()),
+    };
+    let prompt_tokens = ids.len();
+    let pieces = match exec.generate(&state.tokenizer, &ids, req.max_tokens, req.temperature, 0) {
+        Ok(pieces) => pieces,
+        Err(e) => return error_completion(&req.model, &e.to_string()),
+    };
+    let completion_tokens = pieces.len();
+    let reply: String = pieces.into_iter().map(|(_, s)| s).collect();
 
     Json(ChatCompletion {
         id: new_id(),
@@ -170,6 +183,28 @@ async fn blocking_response(_state: Arc<AppState>, req: ChatRequest) -> Json<Chat
             finish_reason: "stop",
         }],
         usage: Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        },
+    })
+}
+
+fn error_completion(model: &str, err: &str) -> Json<ChatCompletion> {
+    Json(ChatCompletion {
+        id: new_id(),
+        object: "chat.completion",
+        created: unix_now(),
+        model: model.to_owned(),
+        choices: vec![Choice {
+            index: 0,
+            message: Message {
+                role: "assistant".into(),
+                content: format!("[spite error: {err}]"),
+            },
+            finish_reason: "stop",
+        }],
+        usage: Usage {
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
@@ -178,24 +213,35 @@ async fn blocking_response(_state: Arc<AppState>, req: ChatRequest) -> Json<Chat
 }
 
 async fn stream_response(
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     req: ChatRequest,
 ) -> Sse<
     impl tokio_stream::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
 > {
-    // TODO: replace with real token stream from inference loop
     let id = new_id();
     let model = req.model.clone();
 
-    let placeholder = vec![
-        "[spite".to_owned(),
-        " streaming".to_owned(),
-        " not".to_owned(),
-        " yet".to_owned(),
-        " implemented]".to_owned(),
-    ];
+    let prompt: String = req
+        .messages
+        .iter()
+        .map(|m| format!("{}: {}", m.role, m.content))
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    let token_stream = tokio_stream::iter(placeholder);
+    // ponytail: generation runs to completion, then pieces stream; true
+    // token-by-token streaming when the executor supports async steps.
+    let pieces: Vec<String> = {
+        let mut exec = state.executor.lock().unwrap();
+        match state.tokenizer.encode(&prompt, true) {
+            Ok(ids) => exec
+                .generate(&state.tokenizer, &ids, req.max_tokens, req.temperature, 0)
+                .map(|p| p.into_iter().map(|(_, s)| s).collect())
+                .unwrap_or_else(|e| vec![format!("[spite error: {e}]")]),
+            Err(e) => vec![format!("[spite error: {e}]")],
+        }
+    };
+
+    let token_stream = tokio_stream::iter(pieces);
     let sse_stream = crate::sse::token_stream(token_stream, id, model);
 
     Sse::new(sse_stream).keep_alive(axum::response::sse::KeepAlive::default())
@@ -203,7 +249,7 @@ async fn stream_response(
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

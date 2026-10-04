@@ -121,19 +121,67 @@ pub fn apply_temperature(logits: &mut [f32], temperature: f32) {
 }
 
 /// Zero out all but the top-k logits (set others to -inf).
-pub fn apply_top_k(_logits: &mut [f32], _k: usize) {
-    // TODO: partial sort to find kth-largest, then zero below threshold
+pub fn apply_top_k(logits: &mut [f32], k: usize) {
+    if k == 0 || k >= logits.len() {
+        return;
+    }
+    // Threshold = kth-largest logit via linear select.
+    let mut buf = logits.to_vec();
+    buf.select_nth_unstable_by(k - 1, |a, b| {
+        b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let thresh = buf[k - 1];
+    for l in logits.iter_mut() {
+        if *l < thresh {
+            *l = f32::NEG_INFINITY;
+        }
+    }
 }
 
 /// Zero out tokens with probability < p of the cumulative distribution.
-pub fn apply_top_p(_logits: &mut [f32], _p: f32) {
-    // TODO: sort descending, compute cumulative softmax, zero tail
+pub fn apply_top_p(logits: &mut [f32], p: f32) {
+    if p >= 1.0 || logits.is_empty() {
+        return;
+    }
+    // Sort indices by logit desc; keep the smallest prefix with mass >= p.
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    idx.sort_by(|&a, &b| {
+        logits[b]
+            .partial_cmp(&logits[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let max = logits[idx[0]];
+    let total: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
+    let mut cumsum = 0f32;
+    let mut kept = 0usize;
+    for &i in &idx {
+        cumsum += (logits[i] - max).exp();
+        kept += 1;
+        if cumsum / total >= p {
+            break;
+        }
+    }
+    // Always keep at least one token.
+    for (n, &i) in idx.iter().enumerate() {
+        if n >= kept.max(1) {
+            logits[i] = f32::NEG_INFINITY;
+        }
+    }
 }
 
 /// Zero out tokens with probability < min_p * max_probability.
 /// Often better than top-p for maintaining diversity at low temperatures.
-pub fn apply_min_p(_logits: &mut [f32], _min_p: f32) {
-    // TODO: find max logit, compute threshold, zero below it
+pub fn apply_min_p(logits: &mut [f32], min_p: f32) {
+    if min_p <= 0.0 || logits.is_empty() {
+        return;
+    }
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let thresh = max + min_p.ln();
+    for l in logits.iter_mut() {
+        if *l < thresh {
+            *l = f32::NEG_INFINITY;
+        }
+    }
 }
 
 /// Penalise tokens that appear in `context` by dividing their logit by
@@ -167,9 +215,20 @@ pub fn multinomial(logits: &[f32], rng_state: &mut u64) -> Result<u32, SamplingE
     if logits.is_empty() {
         return Err(SamplingError::EmptyLogits);
     }
-    // TODO: softmax → cumulative sum → binary search with LCG random draw
-    let _ = rng_state;
-    greedy(logits) // placeholder until implemented
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut cumsum = 0f32;
+    let u = lcg_f32(rng_state);
+    // Draw against unnormalized masses; rescale u by total.
+    let total: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
+    let target = u * total;
+    for (i, &l) in logits.iter().enumerate() {
+        cumsum += (l - max).exp();
+        if cumsum >= target {
+            return Ok(i as u32);
+        }
+    }
+    // Rounding: fall back to argmax.
+    greedy(logits)
 }
 
 // ── Full pipeline ─────────────────────────────────────────────────────────
@@ -196,9 +255,52 @@ pub fn sample(
 }
 
 /// LCG fast RNG — shared by multinomial, mirostat, and DRY.
+/// Returns a uniform draw in [0, 1): `state >> 33` fills 31 bits.
 pub(crate) fn lcg_f32(state: &mut u64) -> f32 {
     *state = state
         .wrapping_mul(6364136223846793005)
         .wrapping_add(1442695040888963407);
-    ((*state >> 33) as f32) / (u32::MAX as f32)
+    ((*state >> 33) as f32) / 2147483648.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_k_keeps_k_best() {
+        let mut logits = vec![1.0, 5.0, 3.0, 2.0, 4.0];
+        apply_top_k(&mut logits, 2);
+        assert!(logits[1].is_finite() && logits[4].is_finite());
+        assert!(logits[0].is_infinite() && logits[2].is_infinite() && logits[3].is_infinite());
+    }
+
+    #[test]
+    fn top_p_keeps_mass() {
+        // Softmax ≈ [0.66, 0.24, 0.09, 0.01]; p=0.8 keeps first two.
+        let mut logits = vec![2.0, 1.0, 0.0, -2.0];
+        apply_top_p(&mut logits, 0.8);
+        assert!(logits[0].is_finite() && logits[1].is_finite());
+        assert!(logits[2].is_infinite() && logits[3].is_infinite());
+    }
+
+    #[test]
+    fn multinomial_deterministic_seed() {
+        let logits = vec![1.0, 2.0, 3.0];
+        let mut rng_a = 42u64;
+        let mut rng_b = 42u64;
+        let draws_a: Vec<u32> = (0..10)
+            .map(|_| multinomial(&logits, &mut rng_a).unwrap())
+            .collect();
+        let draws_b: Vec<u32> = (0..10)
+            .map(|_| multinomial(&logits, &mut rng_b).unwrap())
+            .collect();
+        assert_eq!(draws_a, draws_b);
+        // Highest-mass token drawn most often over many draws.
+        let mut rng = 1u64;
+        let n3 = (0..200)
+            .filter(|_| multinomial(&logits, &mut rng).unwrap() == 2)
+            .count();
+        assert!(n3 > 100, "expected token 2 to dominate, got {n3}/200");
+    }
 }

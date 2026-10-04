@@ -130,6 +130,13 @@ impl GgufModel {
         }
     }
 
+    pub fn get_array(&self, key: &str) -> Option<&[MetaValue]> {
+        match self.meta.get(key) {
+            Some(MetaValue::Array(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     // ── Tensor access ─────────────────────────────────────────────────────
 
     /// Returns a tensor whose `data` pointer is valid for `'self` lifetime.

@@ -29,6 +29,7 @@ const GGUF_VERSION: u32 = 3;
 const VTYPE_U32: u32 = 4;
 const VTYPE_F32: u32 = 6;
 const VTYPE_STR: u32 = 8;
+const VTYPE_ARRAY: u32 = 9;
 
 // tensor type tag for F32
 const TTYPE_F32: u32 = 0;
@@ -120,6 +121,25 @@ impl FakeGguf {
                     push_u32(&mut buf, VTYPE_STR);
                     push_str(&mut buf, s);
                 }
+                Kv::Arr(items) => {
+                    push_u32(&mut buf, VTYPE_ARRAY);
+                    // Homogeneous element type from the first item.
+                    let elem = match items.first() {
+                        Some(Kv::U32(_)) => VTYPE_U32,
+                        Some(Kv::F32(_)) => VTYPE_F32,
+                        _ => VTYPE_STR,
+                    };
+                    push_u32(&mut buf, elem);
+                    push_u64(&mut buf, items.len() as u64);
+                    for item in items {
+                        match item {
+                            Kv::U32(v) => push_u32(&mut buf, *v),
+                            Kv::F32(v) => push_f32(&mut buf, *v),
+                            Kv::Str(s) => push_str(&mut buf, s),
+                            Kv::Arr(_) => {}
+                        }
+                    }
+                }
             }
         }
 
@@ -175,6 +195,25 @@ impl FakeGguf {
                 "tokenizer.ggml.token_count".into(),
                 Kv::U32(self.vocab_size),
             ),
+            ("tokenizer.ggml.model".into(), Kv::Str("gpt2".into())),
+            (
+                "tokenizer.ggml.tokens".into(),
+                Kv::Arr(fake_tokens(self.vocab_size)),
+            ),
+            (
+                "tokenizer.ggml.scores".into(),
+                Kv::Arr(fake_scores(self.vocab_size)),
+            ),
+            (
+                "tokenizer.ggml.token_type".into(),
+                Kv::Arr(fake_types(self.vocab_size)),
+            ),
+            (
+                "tokenizer.ggml.merges".into(),
+                Kv::Arr(vec![Kv::Str("A B".into())]),
+            ),
+            ("tokenizer.ggml.bos_token_id".into(), Kv::U32(0)),
+            ("tokenizer.ggml.eos_token_id".into(), Kv::U32(1)),
         ]
     }
 
@@ -197,9 +236,9 @@ impl FakeGguf {
             t.push(Tensor::new(format!("{b}.attn_k.weight"), vec![d, d]));
             t.push(Tensor::new(format!("{b}.attn_v.weight"), vec![d, d]));
             t.push(Tensor::new(format!("{b}.attn_output.weight"), vec![d, d]));
-            t.push(Tensor::new(format!("{b}.ffn_gate.weight"), vec![ff, d]));
-            t.push(Tensor::new(format!("{b}.ffn_up.weight"), vec![ff, d]));
-            t.push(Tensor::new(format!("{b}.ffn_down.weight"), vec![d, ff]));
+            t.push(Tensor::new(format!("{b}.ffn_gate.weight"), vec![d, ff]));
+            t.push(Tensor::new(format!("{b}.ffn_up.weight"), vec![d, ff]));
+            t.push(Tensor::new(format!("{b}.ffn_down.weight"), vec![ff, d]));
         }
 
         t
@@ -212,6 +251,43 @@ enum Kv {
     U32(u32),
     F32(f32),
     Str(String),
+    Arr(Vec<Kv>),
+}
+
+/// Tiny test vocabulary: ids 0/1 are BOS/EOS sentinels, then the exact
+/// bytes needed to encode chat-style prompts ("user: AB"), then A-Z
+/// filler, with the last id doubling as the "AB" merge result.
+fn fake_tokens(n: u32) -> Vec<Kv> {
+    let mut toks = vec![
+        Kv::Str("<bos>".into()),
+        Kv::Str("<eos>".into()),
+        Kv::Str("u".into()),
+        Kv::Str("s".into()),
+        Kv::Str("e".into()),
+        Kv::Str("r".into()),
+        Kv::Str(":".into()),
+        Kv::Str(" ".into()),
+        Kv::Str("A".into()),
+        Kv::Str("B".into()),
+    ];
+    for i in toks.len() as u32..n {
+        let b = b'A' + ((i as u8) % 26);
+        toks.push(Kv::Str((b as char).to_string()));
+    }
+    // Last token doubles as the "AB" merge result.
+    if let Some(last) = toks.last_mut() {
+        *last = Kv::Str("AB".into());
+    }
+    toks.truncate(n as usize);
+    toks
+}
+
+fn fake_scores(n: u32) -> Vec<Kv> {
+    (0..n).map(|_| Kv::F32(0.0)).collect()
+}
+
+fn fake_types(n: u32) -> Vec<Kv> {
+    (0..n).map(|_| Kv::U32(1)).collect()
 }
 
 struct Tensor {

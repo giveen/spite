@@ -16,6 +16,8 @@
 //!       let logits = exec.decode_step(token, &ctx)?;    // single-token step
 //!   }
 
+use std::ffi::c_int;
+
 use spite_abi::{ShardStrategy, SpiteCtx};
 use spite_kvcache::{Cache, KvQuantConfig};
 use spite_offload::OffloadConfig;
@@ -72,6 +74,8 @@ pub enum ExecutorError {
     NotInitialized,
     #[error("context length exceeded: {used} > {max}")]
     ContextOverflow { used: usize, max: usize },
+    #[error("sampling failed: {0}")]
+    Sampling(String),
 }
 
 // Re-export so callers only need one import.
@@ -115,16 +119,24 @@ impl Default for ExecutorConfig {
 /// `spite-scheduler` for concurrency.
 pub struct Executor {
     pub cfg: ExecutorConfig,
-    // TODO: model:    Box<dyn spite_models::ModelArch>
-    // TODO: dispatch: spite_dispatch::DispatchTable
-    // TODO: kvcache:  spite_kvcache::RingCache  (or PrefixCache for server mode)
-    // TODO: gpu_bufs: Vec<spite_gpu::DeviceBuffer>  (one activation buffer per layer)
+    model: Option<Box<dyn spite_models::ModelArch>>,
     n_ctx_used: usize,
 }
 
 impl Executor {
     pub fn new(cfg: ExecutorConfig) -> Self {
-        Self { cfg, n_ctx_used: 0 }
+        Self {
+            cfg,
+            model: None,
+            n_ctx_used: 0,
+        }
+    }
+
+    /// Load model weights. Resets KV state; call once before `prefill`.
+    pub fn load_model(&mut self, model: Box<dyn spite_models::ModelArch>) {
+        model.reset_cache();
+        self.model = Some(model);
+        self.n_ctx_used = 0;
     }
 
     /// Prefill: run a batched forward pass over `tokens`, populating the KV cache.
@@ -138,15 +150,20 @@ impl Executor {
                 max,
             });
         }
+        let Some(model) = &self.model else {
+            return Err(ExecutorError::NotInitialized);
+        };
+        model.reset_cache();
+        let vocab = model.config().vocab_size;
+        let mut all = vec![0f32; tokens.len() * vocab];
+        // ponytail: caller ctx only overrides threading/batch; pos runs 0..len.
+        let mut fwd = *ctx;
+        fwd.pos = 0;
+        model
+            .forward(tokens, &mut all, &fwd)
+            .map_err(|e| ExecutorError::Model(e.to_string()))?;
         self.n_ctx_used = tokens.len();
-        let _ = ctx;
-        // TODO:
-        // 1. Upload token embeddings to GPU activation buffer
-        // 2. For each layer 0..n_gpu_layers: call dispatch kernel
-        // 3. For each layer n_gpu_layers..n_layers: call CPU fallback
-        // 4. Apply output norm, project to logits
-        // 5. Download last-position logits to CPU
-        Err(ExecutorError::NotInitialized)
+        Ok(all[(tokens.len() - 1) * vocab..].to_vec())
     }
 
     /// Decode step: run a single-token forward pass (KV cache already populated).
@@ -160,20 +177,78 @@ impl Executor {
                 max,
             });
         }
+        let Some(model) = &self.model else {
+            return Err(ExecutorError::NotInitialized);
+        };
+        let vocab = model.config().vocab_size;
+        let mut out = vec![0f32; vocab];
+        let mut step = *ctx;
+        step.pos = self.n_ctx_used as c_int;
+        model
+            .forward(&[token], &mut out, &step)
+            .map_err(|e| ExecutorError::Model(e.to_string()))?;
         self.n_ctx_used += 1;
-        let _ = (token, ctx);
-        // TODO: same as prefill but seq_len=1, reuse populated KV cache
-        Err(ExecutorError::NotInitialized)
+        Ok(out)
     }
 
     /// Reset the KV cache (start a new conversation without re-loading weights).
     pub fn reset(&mut self) {
+        if let Some(model) = &self.model {
+            model.reset_cache();
+        }
         self.n_ctx_used = 0;
-        // TODO: kvcache.reset()
     }
 
     pub fn n_ctx_used(&self) -> usize {
         self.n_ctx_used
+    }
+
+    /// Full generate loop: encode is done by the caller; this runs
+    /// prefill → sample/decode until `max_tokens` or EOS.
+    ///
+    /// Returns per-token `(id, decoded piece)` pairs; text is their concat.
+    pub fn generate(
+        &mut self,
+        tokenizer: &dyn Tokenize,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+        temperature: f32,
+        seed: u64,
+    ) -> Result<Vec<(u32, String)>, ExecutorError> {
+        use spite_sampling::{SamplerConfig, sample};
+
+        let eos = tokenizer.eos_id();
+        let mut ids = prompt_ids.to_vec();
+        let ctx = SpiteCtx {
+            n_ctx: self.cfg.ctx_len as c_int,
+            n_batch: self.cfg.batch_size as c_int,
+            n_threads: self.cfg.n_threads as c_int,
+            pos: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: std::ptr::null_mut(),
+            scratchpad_bytes: 0,
+        };
+        let sampler_cfg = SamplerConfig {
+            temperature,
+            ..Default::default()
+        };
+        let mut rng = seed;
+        let mut out = Vec::new();
+
+        let mut logits = self.prefill(&ids, &ctx)?;
+        for _ in 0..max_tokens {
+            let tok = sample(&mut logits, &ids, &sampler_cfg, &mut rng)
+                .map_err(|e| ExecutorError::Sampling(e.to_string()))?;
+            ids.push(tok);
+            if tok == eos {
+                break;
+            }
+            out.push((tok, tokenizer.decode_one(tok).into_owned()));
+            logits = self.decode_step(tok, &ctx)?;
+        }
+        Ok(out)
     }
 }
 

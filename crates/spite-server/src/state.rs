@@ -4,9 +4,11 @@ use std::sync::Mutex;
 use anyhow::Result;
 
 use spite_dispatch::{DispatchBuilder, KernelSpec};
-use spite_executor::{EngineBuilder, ExecutorConfig};
+use spite_executor::{EngineBuilder, Executor, ExecutorConfig};
 use spite_loader::GgufModel;
+use spite_models::{ArchRegistry, ModelConfig};
 use spite_scheduler::Scheduler;
+use spite_tokenizer::Tokenizer;
 
 /// Shared server state, held behind Arc<AppState>.
 pub struct AppState {
@@ -15,6 +17,9 @@ pub struct AppState {
     /// The scheduler owns the Engine and all active request slots.
     /// Mutex because axum handlers run concurrently but inference is serial per GPU.
     pub scheduler: Mutex<Scheduler>,
+    pub tokenizer: Tokenizer,
+    /// Direct executor for the chat path (single-GPU serial inference).
+    pub executor: Mutex<Executor>,
 }
 
 impl AppState {
@@ -30,13 +35,23 @@ impl AppState {
         let _spec = KernelSpec::from_arch(&model_arch, gpu_arch);
         let _dispatch = DispatchBuilder::new(kernels_dir, _spec).build()?;
 
+        let hp = spite_loader::config::ModelHyperparams::from_gguf(&model);
+        let mut arch = ArchRegistry::default().build(ModelConfig::from(hp))?;
+        arch.load_weights(&model)?;
+        let tokenizer = Tokenizer::from_gguf(&model)?;
+
         let engine = EngineBuilder::new().build(ExecutorConfig::default());
         let scheduler = Scheduler::new(max_concurrent, engine);
+
+        let mut executor = Executor::new(ExecutorConfig::default());
+        executor.load_model(arch);
 
         Ok(Self {
             model_arch,
             gpu_arch: gpu_arch.to_owned(),
             scheduler: Mutex::new(scheduler),
+            tokenizer,
+            executor: Mutex::new(executor),
         })
     }
 }
