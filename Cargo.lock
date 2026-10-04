@@ -1274,12 +1274,20 @@ name = "spite"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "clap",
  "spite-abi",
  "spite-dispatch",
+ "spite-executor",
  "spite-kvcache",
  "spite-loader",
+ "spite-models",
  "spite-offload",
+ "spite-sampling",
+ "spite-server",
+ "spite-testkit",
+ "spite-tokenizer",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1303,6 +1311,7 @@ dependencies = [
  "spite-loader",
  "spite-models",
  "spite-sampling",
+ "spite-tokenizer",
 ]
 
 [[package]]
@@ -1394,6 +1403,7 @@ dependencies = [
  "spite-dispatch",
  "spite-loader",
  "spite-rope",
+ "spite-testkit",
  "thiserror",
 ]
 
@@ -1483,8 +1493,11 @@ dependencies = [
  "spite-dispatch",
  "spite-executor",
  "spite-loader",
+ "spite-models",
+ "spite-sampling",
  "spite-scheduler",
  "spite-testkit",
+ "spite-tokenizer",
  "thiserror",
  "tokio",
  "tokio-stream",
@@ -1519,6 +1532,7 @@ version = "0.1.0"
 dependencies = [
  "spite-abi",
  "spite-loader",
+ "spite-testkit",
  "thiserror",
 ]
 

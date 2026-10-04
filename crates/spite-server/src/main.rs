@@ -10,7 +10,10 @@ use tracing_subscriber::EnvFilter;
 use spite_server::{AppState, api};
 
 #[derive(Parser)]
-#[command(name = "spite-server", about = "OpenAI-compatible LLM inference server")]
+#[command(
+    name = "spite-server",
+    about = "OpenAI-compatible LLM inference server"
+)]
 struct Cli {
     #[arg(long)]
     model: PathBuf,
@@ -32,14 +35,12 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env()
-            .add_directive("spite_server=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("spite_server=info".parse()?))
         .init();
 
     let cli = Cli::parse();
 
-    let gpu_arch = cli.gpu_arch
-        .unwrap_or_else(spite_dispatch::detect_gpu_arch);
+    let gpu_arch = cli.gpu_arch.unwrap_or_else(spite_dispatch::detect_gpu_arch);
 
     let state = Arc::new(AppState::load(
         &cli.model,

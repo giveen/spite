@@ -8,8 +8,8 @@
 //! Download: https://huggingface.co/datasets/wikitext
 //! Use the raw text variant and pass it as --corpus.
 
-use std::path::Path;
 use crate::EvalError;
+use std::path::Path;
 
 pub struct Dataset {
     pub tokens: Vec<u32>,
@@ -43,7 +43,7 @@ impl Dataset {
     where
         F: FnMut(&str) -> Vec<u32>,
     {
-        let text   = std::fs::read_to_string(path)?;
+        let text = std::fs::read_to_string(path)?;
         let tokens = tokenize(&text);
 
         if tokens.is_empty() {

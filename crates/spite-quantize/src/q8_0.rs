@@ -6,7 +6,7 @@
 //! This is the fastest quantization format — near-lossless, 8.5 bpw.
 
 /// Bytes per block.
-pub const BLOCK_SIZE:  usize = 32;
+pub const BLOCK_SIZE: usize = 32;
 pub const BLOCK_BYTES: usize = 2 + BLOCK_SIZE; // 2 bytes f16 scale + 32 i8
 
 /// Quantize `n_elem` F32 values from `src` into `dst` (Q8_0 blocks).
@@ -16,18 +16,18 @@ pub fn quantize(src: &[f32], dst: &mut [u8], n_elem: usize) {
     let n_blocks = n_elem.div_ceil(BLOCK_SIZE);
     for b in 0..n_blocks {
         let start = b * BLOCK_SIZE;
-        let end   = (start + BLOCK_SIZE).min(n_elem);
+        let end = (start + BLOCK_SIZE).min(n_elem);
         let block = &src[start..end];
 
         // Find abs-max for the block scale.
         let amax = block.iter().cloned().map(f32::abs).fold(0f32, f32::max);
-        let d    = amax / 127.0;
+        let d = amax / 127.0;
         let d_inv = if d > 0.0 { 1.0 / d } else { 0.0 };
 
         let off = b * BLOCK_BYTES;
         let d_bits = f32_to_f16_bits(d);
-        dst[off]     = (d_bits & 0xFF) as u8;
-        dst[off + 1] = (d_bits >> 8)   as u8;
+        dst[off] = (d_bits & 0xFF) as u8;
+        dst[off + 1] = (d_bits >> 8) as u8;
 
         for (i, &x) in block.iter().enumerate() {
             dst[off + 2 + i] = (x * d_inv).round().clamp(-128.0, 127.0) as i8 as u8;
@@ -48,10 +48,14 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     // Fast F32→F16 conversion using bit manipulation.
     let bits = x.to_bits();
     let sign = (bits >> 16) & 0x8000;
-    let exp  = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
     let mant = (bits >> 13) & 0x3FF;
-    if exp <= 0  { return sign as u16; }
-    if exp >= 31 { return (sign | 0x7C00) as u16; }
+    if exp <= 0 {
+        return sign as u16;
+    }
+    if exp >= 31 {
+        return (sign | 0x7C00) as u16;
+    }
     (sign | ((exp as u32) << 10) | mant) as u16
 }
 
@@ -68,7 +72,7 @@ mod tests {
             let d_bits = u16::from_le_bytes([src[off], src[off + 1]]);
             let d = {
                 let sign = ((d_bits >> 15) as u32) << 31;
-                let exp  = ((d_bits >> 10) & 0x1F) as u32;
+                let exp = ((d_bits >> 10) & 0x1F) as u32;
                 let mant = (d_bits & 0x3FF) as u32;
                 f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mant << 13))
             };

@@ -9,10 +9,10 @@ pub fn stage_ranges(n_layers: usize, n_stages: usize) -> Vec<(usize, usize)> {
     if n_stages == 0 || n_stages > n_layers {
         return vec![(0, n_layers)];
     }
-    let base  = n_layers / n_stages;
+    let base = n_layers / n_stages;
     let extra = n_layers % n_stages;
     let mut ranges = Vec::with_capacity(n_stages);
-    let mut start  = 0;
+    let mut start = 0;
     for i in 0..n_stages {
         let count = base + if i < extra { 1 } else { 0 };
         ranges.push((start, start + count));
@@ -28,7 +28,7 @@ mod tests {
     #[test]
     fn even_split() {
         let r = stage_ranges(32, 4);
-        assert_eq!(r, vec![(0,8),(8,16),(16,24),(24,32)]);
+        assert_eq!(r, vec![(0, 8), (8, 16), (16, 24), (24, 32)]);
     }
 
     #[test]

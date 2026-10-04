@@ -23,25 +23,20 @@
 /// `theta`:        base RoPE theta
 /// `factors`:      per-dimension scale factors `[head_dim/2]`
 ///                 frequencies are divided by these values
-pub fn apply_longrope(
-    qk:      &mut [f32],
-    pos:     u32,
-    theta:   f32,
-    factors: &[f32],
-) {
+pub fn apply_longrope(qk: &mut [f32], pos: u32, theta: f32, factors: &[f32]) {
     let head_dim = factors.len() * 2;
-    let n_heads  = qk.len() / head_dim;
+    let n_heads = qk.len() / head_dim;
 
     for h in 0..n_heads {
         let base = h * head_dim;
         for i in 0..head_dim / 2 {
             let lambda = factors[i];
-            let freq  = 1.0 / (theta.powf(2.0 * i as f32 / head_dim as f32) * lambda);
+            let freq = 1.0 / (theta.powf(2.0 * i as f32 / head_dim as f32) * lambda);
             let angle = pos as f32 * freq;
             let (sin, cos) = angle.sin_cos();
             let x0 = qk[base + i];
             let x1 = qk[base + i + head_dim / 2];
-            qk[base + i]               = x0 * cos - x1 * sin;
+            qk[base + i] = x0 * cos - x1 * sin;
             qk[base + i + head_dim / 2] = x0 * sin + x1 * cos;
         }
     }
@@ -51,9 +46,13 @@ pub fn apply_longrope(
 /// on whether the current position exceeds `original_ctx`.
 pub fn select_factors<'a>(
     short_factors: &'a [f32],
-    long_factors:  &'a [f32],
-    pos:           u32,
-    original_ctx:  usize,
+    long_factors: &'a [f32],
+    pos: u32,
+    original_ctx: usize,
 ) -> &'a [f32] {
-    if pos as usize > original_ctx { long_factors } else { short_factors }
+    if pos as usize > original_ctx {
+        long_factors
+    } else {
+        short_factors
+    }
 }

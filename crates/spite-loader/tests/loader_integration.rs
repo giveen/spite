@@ -13,24 +13,31 @@ fn opens_valid_file() {
 fn arch_is_read_from_metadata() {
     let tmp = FakeGguf::default().write_to_tempfile().unwrap();
     let model = GgufModel::open(tmp.path()).unwrap();
-    assert_eq!(model.arch(), "llama");
+    assert_eq!(model.arch(), "llama4");
 }
 
 #[test]
 fn get_u32_returns_metadata_value() {
-    let fake = FakeGguf { d_model: 128, n_layers: 4, ..Default::default() };
+    let fake = FakeGguf {
+        d_model: 128,
+        n_layers: 4,
+        ..Default::default()
+    };
     let tmp = fake.write_to_tempfile().unwrap();
     let model = GgufModel::open(tmp.path()).unwrap();
-    assert_eq!(model.get_u32("llama.embedding_length"), Some(128));
-    assert_eq!(model.get_u32("llama.block_count"),      Some(4));
+    assert_eq!(model.get_u32("llama4.embedding_length"), Some(128));
+    assert_eq!(model.get_u32("llama4.block_count"), Some(4));
 }
 
 #[test]
 fn get_f32_returns_rope_theta() {
-    let fake = FakeGguf { rope_theta: 500_000.0, ..Default::default() };
+    let fake = FakeGguf {
+        rope_theta: 500_000.0,
+        ..Default::default()
+    };
     let tmp = fake.write_to_tempfile().unwrap();
     let model = GgufModel::open(tmp.path()).unwrap();
-    let v = model.get_f32("llama.rope.freq_base").unwrap();
+    let v = model.get_f32("llama4.rope.freq_base").unwrap();
     assert!((v - 500_000.0).abs() < 1.0, "expected 500_000, got {v}");
 }
 
@@ -38,7 +45,7 @@ fn get_f32_returns_rope_theta() {
 fn get_str_returns_architecture() {
     let tmp = FakeGguf::default().write_to_tempfile().unwrap();
     let model = GgufModel::open(tmp.path()).unwrap();
-    assert_eq!(model.get_str("general.architecture"), Some("llama"));
+    assert_eq!(model.get_str("general.architecture"), Some("llama4"));
 }
 
 #[test]
@@ -58,7 +65,11 @@ fn tensor_not_present_returns_null() {
 
 #[test]
 fn tensor_present_and_correct_shape() {
-    let fake = FakeGguf { d_model: 64, d_ffn: 256, ..Default::default() };
+    let fake = FakeGguf {
+        d_model: 64,
+        d_ffn: 256,
+        ..Default::default()
+    };
     let tmp = fake.write_to_tempfile().unwrap();
     let model = GgufModel::open(tmp.path()).unwrap();
 
@@ -69,18 +80,18 @@ fn tensor_present_and_correct_shape() {
 
     let gate = model.tensor("blk.0.ffn_gate.weight");
     assert!(!gate.is_null());
-    assert_eq!(gate.ne[0], 256); // d_ffn
-    assert_eq!(gate.ne[1], 64);  // d_model
+    assert_eq!(gate.ne[0], 64); // d_model (GGUF stores [in, out])
+    assert_eq!(gate.ne[1], 256); // d_ffn
 }
 
 #[test]
 fn hyperparams_parse_from_fake_model() {
     let fake = FakeGguf {
-        d_model:    128,
-        n_layers:   4,
-        n_heads:    4,
+        d_model: 128,
+        n_layers: 4,
+        n_heads: 4,
         n_kv_heads: 2,
-        d_ffn:      512,
+        d_ffn: 512,
         vocab_size: 64,
         max_seq_len: 1024,
         ..Default::default()
@@ -90,13 +101,13 @@ fn hyperparams_parse_from_fake_model() {
 
     // ModelHyperparams::from_meta is the bridge the executor uses
     let hp = ModelHyperparams::from_gguf(&model);
-    assert_eq!(hp.arch,        "llama");
-    assert_eq!(hp.d_model,     128);
-    assert_eq!(hp.n_layers,    4);
-    assert_eq!(hp.n_heads,     4);
-    assert_eq!(hp.n_kv_heads,  2);
-    assert_eq!(hp.d_ffn,       512);
-    assert_eq!(hp.vocab_size,  64);
+    assert_eq!(hp.arch, "llama4");
+    assert_eq!(hp.d_model, 128);
+    assert_eq!(hp.n_layers, 4);
+    assert_eq!(hp.n_heads, 4);
+    assert_eq!(hp.n_kv_heads, 2);
+    assert_eq!(hp.d_ffn, 512);
+    assert_eq!(hp.vocab_size, 64);
     assert_eq!(hp.max_seq_len, 1024);
 }
 

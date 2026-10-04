@@ -55,31 +55,31 @@ pub enum SchedulerError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlotState {
     Free,
-    Prefilling,  // processing the prompt
-    Generating,  // autoregressive decode
+    Prefilling, // processing the prompt
+    Generating, // autoregressive decode
     Done,
 }
 
 pub struct Slot {
-    pub id:          usize,
-    pub state:       SlotState,
-    pub request_id:  Option<u64>,
+    pub id: usize,
+    pub state: SlotState,
+    pub request_id: Option<u64>,
     pub n_generated: usize, // tokens produced so far (not counting prompt)
-    pub max_tokens:  usize,
+    pub max_tokens: usize,
 }
 
 pub struct BatchRequest {
-    pub id:          u64,
-    pub prompt:      Vec<u32>,
-    pub max_tokens:  usize,
+    pub id: u64,
+    pub prompt: Vec<u32>,
+    pub max_tokens: usize,
     pub temperature: f32,
     pub stop_tokens: Vec<u32>,
 }
 
 pub struct BatchOutput {
-    pub request_id:  u64,
-    pub token:       u32,
-    pub done:        bool,
+    pub request_id: u64,
+    pub token: u32,
+    pub done: bool,
     pub finish_reason: FinishReason,
 }
 
@@ -92,21 +92,27 @@ pub enum FinishReason {
 }
 
 pub struct Scheduler {
-    pub slots:      Vec<Slot>,
-    next_req_id:    u64,
-    pub executor:   spite_executor::Engine,
+    pub slots: Vec<Slot>,
+    next_req_id: u64,
+    pub executor: spite_executor::Engine,
 }
 
 impl Scheduler {
     pub fn new(n_slots: usize, executor: spite_executor::Engine) -> Self {
-        let slots = (0..n_slots).map(|i| Slot {
-            id:          i,
-            state:       SlotState::Free,
-            request_id:  None,
-            n_generated: 0,
-            max_tokens:  0,
-        }).collect();
-        Self { slots, next_req_id: 1, executor }
+        let slots = (0..n_slots)
+            .map(|i| Slot {
+                id: i,
+                state: SlotState::Free,
+                request_id: None,
+                n_generated: 0,
+                max_tokens: 0,
+            })
+            .collect();
+        Self {
+            slots,
+            next_req_id: 1,
+            executor,
+        }
     }
 
     /// Assign the next free request ID (monotonically increasing).
@@ -119,13 +125,15 @@ impl Scheduler {
     /// Enqueue a new generation request. Returns its slot index.
     pub fn enqueue(&mut self, req: BatchRequest) -> Result<usize, SchedulerError> {
         let n = self.slots.len();
-        let slot = self.slots.iter_mut()
+        let slot = self
+            .slots
+            .iter_mut()
             .find(|s| s.state == SlotState::Free)
             .ok_or(SchedulerError::NoSlot(n))?;
-        slot.state      = SlotState::Prefilling;
+        slot.state = SlotState::Prefilling;
         slot.request_id = Some(req.id);
         slot.n_generated = 0;
-        slot.max_tokens  = req.max_tokens;
+        slot.max_tokens = req.max_tokens;
         Ok(slot.id)
     }
 
@@ -144,10 +152,16 @@ impl Scheduler {
     }
 
     pub fn n_free(&self) -> usize {
-        self.slots.iter().filter(|s| s.state == SlotState::Free).count()
+        self.slots
+            .iter()
+            .filter(|s| s.state == SlotState::Free)
+            .count()
     }
 
     pub fn n_active(&self) -> usize {
-        self.slots.iter().filter(|s| s.state != SlotState::Free).count()
+        self.slots
+            .iter()
+            .filter(|s| s.state != SlotState::Free)
+            .count()
     }
 }

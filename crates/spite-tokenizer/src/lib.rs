@@ -58,12 +58,12 @@ pub enum TokenizerError {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
-    Normal      = 1,
-    Unknown     = 2,
-    Control     = 3,
+    Normal = 1,
+    Unknown = 2,
+    Control = 3,
     UserDefined = 4,
-    Unused      = 5,
-    Byte        = 6,
+    Unused = 5,
+    Byte = 6,
 }
 
 // ── Vocabulary ────────────────────────────────────────────────────────────
@@ -112,8 +112,24 @@ pub enum TokenizerKind {
 
 pub struct Tokenizer {
     pub vocab: Vocab,
-    pub kind:  TokenizerKind,
-    // TODO: BPE merge table or SP model trie
+    pub kind: TokenizerKind,
+    merges: Option<bpe::BpeMergeTable>,
+    unigram: Option<sentencepiece::UnigramModel>,
+    /// token string → id, for BPE byte lookup and merge resolution.
+    vocab_map: std::collections::HashMap<String, u32>,
+    /// Whether prompts should be prefixed with BOS. Taken from
+    /// `tokenizer.ggml.add_bos_token`; when absent, SentencePiece models
+    /// default to true and byte-level BPE models (GPT-2/Qwen3) to false —
+    /// prepending `<|endoftext|>` to a Qwen3 base prompt measurably degrades
+    /// the next-token distribution.
+    add_bos: bool,
+    /// Whether this BPE vocabulary spells its bytes with the GPT-2
+    /// `bytes_to_unicode` alphabet (Qwen2/Qwen3, GPT-2), where 0x20 is 'Ġ'.
+    /// Raw-byte BPE vocabularies instead list bytes literally, so the
+    /// remapping must be skipped for them. Detected from the vocab itself
+    /// rather than assumed from `tokenizer.ggml.model`, since both spellings
+    /// report `"gpt2"`.
+    byte_level: bool,
 }
 
 impl Tokenize for Tokenizer {
@@ -126,39 +142,302 @@ impl Tokenize for Tokenizer {
     fn decode_one(&self, id: u32) -> Cow<'_, str> {
         self.decode_one(id)
     }
-    fn vocab_size(&self) -> usize { self.vocab.vocab_size() }
-    fn bos_id(&self) -> u32      { self.vocab.bos_id }
-    fn eos_id(&self) -> u32      { self.vocab.eos_id }
+    fn vocab_size(&self) -> usize {
+        self.vocab.vocab_size()
+    }
+    fn bos_id(&self) -> u32 {
+        self.vocab.bos_id
+    }
+    fn eos_id(&self) -> u32 {
+        self.vocab.eos_id
+    }
 }
 
 impl Tokenizer {
     /// Build a Tokenizer from a loaded GGUF model's metadata.
-    pub fn from_gguf(_model: &spite_loader::GgufModel) -> Result<Self, TokenizerError> {
-        // TODO:
-        // 1. Read tokenizer.ggml.model → determine kind
-        // 2. Read tokenizer.ggml.tokens / scores / token_type arrays
-        // 3. Read tokenizer.ggml.bos_token_id / eos_token_id
-        // 4. Build merge table (BPE) or trie (SP)
-        Err(TokenizerError::NoTokenizer)
+    pub fn from_gguf(model: &spite_loader::GgufModel) -> Result<Self, TokenizerError> {
+        let tokens = model
+            .get_array("tokenizer.ggml.tokens")
+            .ok_or(TokenizerError::NoTokenizer)?;
+        let mut vocab_tokens = Vec::with_capacity(tokens.len());
+        for t in tokens {
+            match t {
+                spite_loader::MetaValue::Str(s) => vocab_tokens.push(s.clone()),
+                _ => return Err(TokenizerError::NoTokenizer),
+            }
+        }
+        let scores = model
+            .get_array("tokenizer.ggml.scores")
+            .map(|a| {
+                a.iter()
+                    .map(|v| match v {
+                        spite_loader::MetaValue::F32(f) => *f,
+                        _ => 0.0,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![0.0; vocab_tokens.len()]);
+        if scores.len() != vocab_tokens.len() {
+            return Err(TokenizerError::VocabMismatch {
+                tokens: vocab_tokens.len(),
+                scores: scores.len(),
+            });
+        }
+        let token_types = model
+            .get_array("tokenizer.ggml.token_type")
+            .map(|a| {
+                a.iter()
+                    .map(|v| match v {
+                        spite_loader::MetaValue::I32(i) => *i as u32,
+                        spite_loader::MetaValue::U32(u) => *u,
+                        _ => TokenType::Normal as u32,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec![TokenType::Normal as u32; vocab_tokens.len()]);
+        let token_types = token_types
+            .into_iter()
+            .map(|t| match t {
+                1 => TokenType::Normal,
+                2 => TokenType::Unknown,
+                3 => TokenType::Control,
+                4 => TokenType::UserDefined,
+                5 => TokenType::Unused,
+                6 => TokenType::Byte,
+                _ => TokenType::Normal,
+            })
+            .collect();
+
+        let kind_str = model.get_str("tokenizer.ggml.model").unwrap_or("gpt2");
+        let add_bos_default = matches!(kind_str, "llama" | "unigram");
+        let kind = match kind_str {
+            "llama" | "unigram" => TokenizerKind::SentencePiece,
+            "bert" | "wordpiece" => TokenizerKind::WordPiece,
+            _ => TokenizerKind::Bpe,
+        };
+
+        let vocab_map: std::collections::HashMap<String, u32> = vocab_tokens
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.clone(), i as u32))
+            .collect();
+
+        let merges = match kind {
+            TokenizerKind::Bpe => model
+                .get_array("tokenizer.ggml.merges")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| match v {
+                            spite_loader::MetaValue::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .map(|raw| bpe::BpeMergeTable::from_merges(&raw, &vocab_map))
+                .transpose()?,
+            _ => None,
+        };
+        let unigram = match kind {
+            TokenizerKind::SentencePiece => {
+                Some(sentencepiece::UnigramModel::new(&vocab_tokens, &scores)?)
+            }
+            _ => None,
+        };
+
+        // Look for a *remapped* byte, i.e. one GPT-2 does not keep as
+        // itself: 'Ġ' (0x20) is the canonical marker and is absent from
+        // raw-byte vocabularies. Requiring several keeps a stray literal 'Ġ'
+        // in an unrelated vocab from misfiring.
+        let remapped = [0x20u8, 0x0A, 0x09, 0x00, 0x7F];
+        let byte_level = matches!(kind, TokenizerKind::Bpe)
+            && remapped
+                .iter()
+                .filter(|&&b| vocab_map.contains_key(bpe::byte_level_char(b).to_string().as_str()))
+                .count()
+                >= 3;
+
+        let u32_id = |key: &str, default: u32| model.get_u32(key).unwrap_or(default);
+        Ok(Self {
+            vocab: Vocab {
+                bos_id: u32_id("tokenizer.ggml.bos_token_id", 0),
+                eos_id: u32_id("tokenizer.ggml.eos_token_id", 1),
+                unk_id: model.get_u32("tokenizer.ggml.unknown_token_id"),
+                pad_id: model.get_u32("tokenizer.ggml.padding_token_id"),
+                tokens: vocab_tokens,
+                scores,
+                token_types,
+            },
+            kind,
+            merges,
+            unigram,
+            vocab_map,
+            add_bos: match model.get_u32("tokenizer.ggml.add_bos_token") {
+                Some(v) => v != 0,
+                None => add_bos_default,
+            },
+            byte_level,
+        })
+    }
+
+    /// Whether this BPE vocabulary uses the GPT-2 byte-level alphabet.
+    pub fn is_byte_level(&self) -> bool {
+        self.byte_level
+    }
+
+    /// Whether this tokenizer wants prompts prefixed with BOS. See the
+    /// `add_bos` field; callers should pass this to [`Tokenizer::encode`].
+    pub fn add_bos(&self) -> bool {
+        self.add_bos
     }
 
     /// Encode text to token ids. Prepends BOS if `add_bos` is true.
-    pub fn encode(&self, _text: &str, _add_bos: bool) -> Result<Vec<u32>, TokenizerError> {
-        // TODO: BPE or SP encode
-        Err(TokenizerError::Encode("not yet implemented".into()))
+    pub fn encode(&self, text: &str, add_bos: bool) -> Result<Vec<u32>, TokenizerError> {
+        let mut ids = Vec::new();
+        if add_bos {
+            ids.push(self.vocab.bos_id);
+        }
+        match self.kind {
+            TokenizerKind::Bpe => {
+                let table = self
+                    .merges
+                    .as_ref()
+                    .ok_or_else(|| TokenizerError::Encode("no BPE merge table".into()))?;
+                for word in bpe::pretokenize_gpt2(text) {
+                    // Map each byte to its single-byte token id. Byte-level
+                    // vocabularies (Qwen2/Qwen3, GPT-2) spell bytes as
+                    // printable unicode, e.g. 0x20 is 'Ġ'.
+                    let mut bytes = Vec::with_capacity(word.len());
+                    for &b in word.as_bytes() {
+                        let s = if self.byte_level {
+                            bpe::byte_level_char(b).to_string()
+                        } else {
+                            (b as char).to_string()
+                        };
+                        match self.vocab_map.get(&s) {
+                            Some(&id) => bytes.push(id),
+                            None => {
+                                if let Some(unk) = self.vocab.unk_id {
+                                    bytes.push(unk);
+                                } else {
+                                    return Err(TokenizerError::Encode(format!(
+                                        "no byte token for 0x{b:02x}"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    ids.extend(table.encode_word(&bytes));
+                }
+            }
+            TokenizerKind::SentencePiece => {
+                let model = self
+                    .unigram
+                    .as_ref()
+                    .ok_or_else(|| TokenizerError::Encode("no unigram model".into()))?;
+                // SentencePiece treats the input as-is (no pre-tokenization);
+                // a leading ▁ is handled by the model itself.
+                ids.extend(model.encode(text));
+            }
+            TokenizerKind::WordPiece => {
+                return Err(TokenizerError::Encode(
+                    "wordpiece encode not yet ported".into(),
+                ));
+            }
+        }
+        Ok(ids)
     }
 
     /// Decode token ids to a UTF-8 string.
-    /// Handles byte-fallback tokens (U+2581 → space, <0xNN> → raw byte).
-    pub fn decode(&self, _ids: &[u32], _skip_special: bool) -> String {
-        // TODO: concatenate token strings, apply byte fallback
-        String::new()
+    /// Handles byte-fallback tokens (▁ → space, <0xNN> → raw byte).
+    pub fn decode(&self, ids: &[u32], skip_special: bool) -> String {
+        let mut bytes = Vec::new();
+        for &id in ids {
+            if skip_special && self.vocab.is_special(id) {
+                continue;
+            }
+            let Some(tok) = self.vocab.token_to_str(id) else {
+                continue;
+            };
+            if let Some(hex) = tok.strip_prefix("<0x").and_then(|s| s.strip_suffix('>'))
+                && let Ok(b) = u8::from_str_radix(hex, 16)
+            {
+                bytes.push(b);
+                continue;
+            }
+            if self.byte_level {
+                // Byte-level BPE: every alphabet char is one byte, so decode
+                // char-by-char rather than re-encoding the string. Chars
+                // outside the alphabet (special tokens) pass through as UTF-8.
+                for c in tok.chars() {
+                    match bpe::byte_level_byte(c) {
+                        Some(b) => bytes.push(b),
+                        None => {
+                            let mut buf = [0u8; 4];
+                            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
+                continue;
+            }
+            bytes.extend_from_slice(tok.replace('▁', " ").as_bytes());
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     /// Decode a single token id — used for streaming output.
     pub fn decode_one(&self, id: u32) -> Cow<'_, str> {
-        // TODO: handle byte-fallback tokens (token_type == Byte) by
-        // parsing "<0xNN>" and returning Cow::Owned with the decoded byte.
-        Cow::Borrowed(self.vocab.token_to_str(id).unwrap_or(""))
+        let Some(tok) = self.vocab.token_to_str(id) else {
+            return Cow::Borrowed("");
+        };
+        if let Some(hex) = tok.strip_prefix("<0x").and_then(|s| s.strip_suffix('>'))
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            return Cow::Owned((b as char).to_string());
+        }
+        if self.byte_level {
+            // Byte-level BPE: map each alphabet char back to its byte, same as
+            // `decode`, so streamed text matches the batch path.
+            if tok.chars().any(|c| bpe::byte_level_byte(c).is_some()) {
+                let mut bytes = Vec::with_capacity(tok.len());
+                for c in tok.chars() {
+                    match bpe::byte_level_byte(c) {
+                        Some(b) => bytes.push(b),
+                        None => {
+                            let mut buf = [0u8; 4];
+                            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
+                return Cow::Owned(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        Cow::Borrowed(tok)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spite_loader::GgufModel;
+
+    fn test_tokenizer() -> Tokenizer {
+        let tmp = spite_testkit::FakeGguf::default()
+            .write_to_tempfile()
+            .unwrap();
+        let model = GgufModel::open(tmp.path()).unwrap();
+        Tokenizer::from_gguf(&model).unwrap()
+    }
+
+    #[test]
+    fn bpe_roundtrip_with_merge() {
+        let tok = test_tokenizer();
+        // "AB" merges to one id via the "A B" merge rule.
+        let ids = tok.encode("AB", false).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(tok.decode(&ids, true), "AB");
+        // BOS prepends when asked.
+        let with_bos = tok.encode("AB", true).unwrap();
+        assert_eq!(with_bos[0], tok.vocab.bos_id);
+        assert_eq!(with_bos.len(), 2);
     }
 }

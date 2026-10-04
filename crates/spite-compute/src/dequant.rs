@@ -3,28 +3,30 @@
 //! Each format stores weights in fixed-size blocks with per-block scales.
 //! Reference: ggml/src/ggml-quants.c in the llama.cpp repository.
 
-use spite_abi::SpiteType;
 use crate::{ComputeError, f16_to_f32};
+use spite_abi::SpiteType;
 
 /// Dequantize `n_elem` elements from `src` (packed blocks) into `dst` (F32).
 pub fn dequant_to_f32(
-    src:    &[u8],
-    kind:   SpiteType,
+    src: &[u8],
+    kind: SpiteType,
     n_elem: usize,
-    dst:    &mut [f32],
+    dst: &mut [f32],
 ) -> Result<(), ComputeError> {
-    if dst.len() < n_elem { return Err(ComputeError::ShapeMismatch("dst too small".into())); }
+    if dst.len() < n_elem {
+        return Err(ComputeError::ShapeMismatch("dst too small".into()));
+    }
     match kind {
-        SpiteType::F32  => {
+        SpiteType::F32 => {
             let src_f32 = bytemuck_cast(src, n_elem)?;
             dst[..n_elem].copy_from_slice(src_f32);
             Ok(())
         }
         SpiteType::Q8_0 => dequant_q8_0(src, n_elem, dst),
         SpiteType::Q4_0 => dequant_q4_0(src, n_elem, dst),
-        SpiteType::Q4K  => dequant_q4k(src, n_elem, dst),
-        SpiteType::Q5K  => dequant_q5k(src, n_elem, dst),
-        SpiteType::Q6K  => dequant_q6k(src, n_elem, dst),
+        SpiteType::Q4K => dequant_q4k(src, n_elem, dst),
+        SpiteType::Q5K => dequant_q5k(src, n_elem, dst),
+        SpiteType::Q6K => dequant_q6k(src, n_elem, dst),
         _ => Err(ComputeError::UnsupportedDtype),
     }
 }
@@ -60,8 +62,8 @@ fn dequant_q4_0(src: &[u8], n_elem: usize, dst: &mut [f32]) -> Result<(), Comput
         let d = f16_to_f32(u16::from_le_bytes([src[off], src[off + 1]]));
         for i in 0..16 {
             let byte = src[off + 2 + i];
-            dst[b * BLOCK + i * 2]     = ((byte & 0x0F) as i32 - 8) as f32 * d;
-            dst[b * BLOCK + i * 2 + 1] = ((byte >> 4)  as i32 - 8) as f32 * d;
+            dst[b * BLOCK + i * 2] = ((byte & 0x0F) as i32 - 8) as f32 * d;
+            dst[b * BLOCK + i * 2 + 1] = ((byte >> 4) as i32 - 8) as f32 * d;
         }
     }
     Ok(())
@@ -85,7 +87,9 @@ fn dequant_q6k(_src: &[u8], _n_elem: usize, _dst: &mut [f32]) -> Result<(), Comp
 }
 
 fn bytemuck_cast(src: &[u8], n: usize) -> Result<&[f32], ComputeError> {
-    if src.len() < n * 4 { return Err(ComputeError::ShapeMismatch("f32 src too small".into())); }
+    if src.len() < n * 4 {
+        return Err(ComputeError::ShapeMismatch("f32 src too small".into()));
+    }
     // SAFETY: alignment is caller's responsibility; this is a reference path only.
     let ptr = src.as_ptr() as *const f32;
     Ok(unsafe { std::slice::from_raw_parts(ptr, n) })

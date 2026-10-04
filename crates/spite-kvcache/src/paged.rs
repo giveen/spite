@@ -25,7 +25,7 @@ pub const DEFAULT_BLOCK_SIZE: usize = 16;
 pub struct KvBlock {
     pub block_id: usize,
     /// Number of token positions currently written (0..=block_size).
-    pub filled:   usize,
+    pub filled: usize,
     /// Reference count: how many sequences share this block.
     pub ref_count: usize,
     // TODO: replace with GPU allocation handle (cudaMalloc etc.)
@@ -50,44 +50,51 @@ impl KvBlock {
 /// Pool of all physical KV blocks.
 pub struct BlockPool {
     block_size: usize,
-    n_layers:   usize,
-    n_kv_heads: usize,
-    head_dim:   usize,
-    blocks:     Vec<KvBlock>,
+    blocks: Vec<KvBlock>,
     /// Stack of free block ids.
-    free:       Vec<usize>,
+    free: Vec<usize>,
 }
 
 impl BlockPool {
     /// Allocate `n_blocks` physical blocks.
     pub fn new(
-        n_blocks:   usize,
+        n_blocks: usize,
         block_size: usize,
-        n_layers:   usize,
+        n_layers: usize,
         n_kv_heads: usize,
-        head_dim:   usize,
+        head_dim: usize,
     ) -> Self {
         let bytes_per_block = block_size * n_layers * n_kv_heads * head_dim * 2 /* fp16 */ * 2 /* K+V */;
         let mut blocks = Vec::with_capacity(n_blocks);
-        let mut free   = Vec::with_capacity(n_blocks);
+        let mut free = Vec::with_capacity(n_blocks);
         for i in 0..n_blocks {
             blocks.push(KvBlock::new(i, bytes_per_block));
             free.push(i);
         }
-        Self { block_size, n_layers, n_kv_heads, head_dim, blocks, free }
+        Self {
+            block_size,
+            blocks,
+            free,
+        }
     }
 
-    pub fn n_free(&self) -> usize { self.free.len() }
-    pub fn n_total(&self) -> usize { self.blocks.len() }
+    pub fn n_free(&self) -> usize {
+        self.free.len()
+    }
+    pub fn n_total(&self) -> usize {
+        self.blocks.len()
+    }
 
     /// Allocate one free block; returns its id.
     pub fn alloc(&mut self) -> Result<usize, CacheError> {
-        self.free.pop().ok_or_else(|| CacheError::Alloc("block pool exhausted".into()))
+        self.free
+            .pop()
+            .ok_or_else(|| CacheError::Alloc("block pool exhausted".into()))
     }
 
     /// Return a block to the pool (unconditional — caller manages ref counts).
     pub fn free_block(&mut self, id: usize) {
-        self.blocks[id].filled    = 0;
+        self.blocks[id].filled = 0;
         self.blocks[id].ref_count = 0;
         self.free.push(id);
     }
@@ -95,21 +102,29 @@ impl BlockPool {
 
 /// Per-sequence paged KV cache: a dynamic list of block ids.
 pub struct PagedSeqCache {
-    pub seq_id:     u64,
-    block_table:    Vec<usize>,
+    pub seq_id: u64,
+    block_table: Vec<usize>,
     /// Total token positions written (across all blocks).
-    n_tokens:       usize,
+    n_tokens: usize,
 }
 
 impl PagedSeqCache {
     pub fn new(seq_id: u64) -> Self {
-        Self { seq_id, block_table: Vec::new(), n_tokens: 0 }
+        Self {
+            seq_id,
+            block_table: Vec::new(),
+            n_tokens: 0,
+        }
     }
 
-    pub fn n_tokens(&self) -> usize { self.n_tokens }
+    pub fn n_tokens(&self) -> usize {
+        self.n_tokens
+    }
 
     /// Number of blocks currently allocated for this sequence.
-    pub fn n_blocks(&self) -> usize { self.block_table.len() }
+    pub fn n_blocks(&self) -> usize {
+        self.block_table.len()
+    }
 
     /// Ensure the next token position is covered; allocate a new block if needed.
     pub fn prepare_next(&mut self, pool: &mut BlockPool) -> Result<(), CacheError> {

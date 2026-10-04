@@ -40,5 +40,9 @@ pub fn gpu_count() -> usize {
 /// the runtime to automatically pick tensor parallelism on multi-GPU boxes.
 pub fn gpu_aware_default() -> ShardStrategy {
     let n = gpu_count();
-    if n == 1 { ShardStrategy::None } else { ShardStrategy::Tensor { n_shards: n } }
+    if n == 1 {
+        ShardStrategy::None
+    } else {
+        ShardStrategy::Tensor { n_shards: n }
+    }
 }

@@ -13,8 +13,8 @@
 //! forward pass skips those tokens entirely. Large win when many sessions
 //! share the same system prompt.
 
-pub mod persist;
 pub mod paged;
+pub mod persist;
 
 use spite_abi::{SpiteKvCache, SpiteTensor};
 use thiserror::Error;
@@ -53,32 +53,32 @@ impl KvQuant {
             // q8_0:  { f16 delta, i8[32] }    = 34 bytes / 32 elems = 1.0625
             // q5_1:  { f16 d, f16 m, u32 qh, u8[16] } = 24 bytes / 32 elems = 0.75
             // q4_0:  { f16 delta, u8[16] }    = 18 bytes / 32 elems = 0.5625
-            Self::F32  => 4.0,
-            Self::F16  => 2.0,
-            Self::Q8   => 1.0625,
+            Self::F32 => 4.0,
+            Self::F16 => 2.0,
+            Self::Q8 => 1.0625,
             Self::Q5_1 => 0.75,
-            Self::Q4   => 0.5625,
+            Self::Q4 => 0.5625,
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::F32  => "f32",
-            Self::F16  => "f16",
-            Self::Q8   => "q8_0",
+            Self::F32 => "f32",
+            Self::F16 => "f16",
+            Self::Q8 => "q8_0",
             Self::Q5_1 => "q5_1",
-            Self::Q4   => "q4_0",
+            Self::Q4 => "q4_0",
         }
     }
 
     /// Next tier down the degradation ladder (`None` if already at floor).
     pub fn degrade(self) -> Option<Self> {
         match self {
-            Self::F32  => Some(Self::F16),
-            Self::F16  => Some(Self::Q8),
-            Self::Q8   => Some(Self::Q5_1),
+            Self::F32 => Some(Self::F16),
+            Self::F16 => Some(Self::Q8),
+            Self::Q8 => Some(Self::Q5_1),
             Self::Q5_1 => Some(Self::Q4),
-            Self::Q4   => None,
+            Self::Q4 => None,
         }
     }
 }
@@ -93,11 +93,11 @@ impl std::str::FromStr for KvQuant {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "f32"                => Ok(Self::F32),
-            "f16" | "fp16"       => Ok(Self::F16),
-            "q8" | "q8_0"        => Ok(Self::Q8),
-            "q5_1" | "q5"        => Ok(Self::Q5_1),
-            "q4" | "q4_0"        => Ok(Self::Q4),
+            "f32" => Ok(Self::F32),
+            "f16" | "fp16" => Ok(Self::F16),
+            "q8" | "q8_0" => Ok(Self::Q8),
+            "q5_1" | "q5" => Ok(Self::Q5_1),
+            "q4" | "q4_0" => Ok(Self::Q4),
             other => Err(format!(
                 "unknown KV quant '{other}'; use f16, q8, q5_1, or q4"
             )),
@@ -131,31 +131,32 @@ pub struct KvQuantConfig {
 
 impl Default for KvQuantConfig {
     fn default() -> Self {
-        Self { key: KvQuant::F16, val: KvQuant::F16 }
+        Self {
+            key: KvQuant::F16,
+            val: KvQuant::F16,
+        }
     }
 }
 
-impl KvQuantConfig {
-    /// Parse from a CLI string:
-    ///   "f16"       → both K and V at f16
-    ///   "q8"        → both K and V at q8_0
-    ///   "q5_1"      → both at q5_1
-    ///   "q8,q4"     → K at q8_0, V at q4_0  (K is more attention-sensitive)
-    ///   "q8,q5_1"   → K at q8_0, V at q5_1
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for KvQuantConfig {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
         let parts: Vec<&str> = s.trim().splitn(2, ',').collect();
         let key: KvQuant = parts[0].parse()?;
         let val: KvQuant = parts.get(1).map(|p| p.parse()).transpose()?.unwrap_or(key);
         Ok(Self { key, val })
     }
+}
 
+impl KvQuantConfig {
     /// Estimated VRAM bytes for the KV cache given model dimensions.
     pub fn vram_bytes(
         &self,
-        n_layers:   usize,
+        n_layers: usize,
         n_kv_heads: usize,
-        head_dim:   usize,
-        max_ctx:    usize,
+        head_dim: usize,
+        max_ctx: usize,
     ) -> u64 {
         let elems = (n_layers * max_ctx * n_kv_heads * head_dim) as f64;
         let k_bytes = elems * self.key.bytes_per_elem() as f64;
@@ -210,13 +211,13 @@ pub enum CacheError {
 
 #[derive(Debug, Clone)]
 pub struct CacheConfig {
-    pub n_layers:   usize,
+    pub n_layers: usize,
     pub n_kv_heads: usize,
-    pub head_dim:   usize,
-    pub max_ctx:    usize,
-    pub strategy:   CacheStrategy,
+    pub head_dim: usize,
+    pub max_ctx: usize,
+    pub strategy: CacheStrategy,
     /// KV quantization policy.  Default: both K and V at f16.
-    pub quant:      KvQuantConfig,
+    pub quant: KvQuantConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,16 +231,16 @@ pub enum CacheStrategy {
 // ── Ring cache ────────────────────────────────────────────────────────────
 
 pub struct RingCache {
-    cfg:     CacheConfig,
+    cfg: CacheConfig,
     /// Flat GPU buffer: [n_layers, max_ctx, n_kv_heads, head_dim] × 2 (K+V).
     /// Layout is interleaved by layer so each layer's forward pass touches
     /// a contiguous region.
     // TODO: replace with an actual GPU allocation handle
-    _buf:    Vec<u8>,
+    _buf: Vec<u8>,
     /// Current write head. Wraps at max_ctx.
-    head:    usize,
+    head: usize,
     /// How many token positions are actually populated.
-    len:     usize,
+    len: usize,
 }
 
 impl RingCache {
@@ -252,7 +253,12 @@ impl RingCache {
         // TODO: allocate on GPU (cudaMalloc / hipMalloc / Metal buffer)
         let _buf = vec![0u8; bytes];
 
-        Ok(Self { cfg, _buf, head: 0, len: 0 })
+        Ok(Self {
+            cfg,
+            _buf,
+            head: 0,
+            len: 0,
+        })
     }
 
     /// Returns the SpiteKvCache view for `layer` at the current write head.
@@ -263,8 +269,8 @@ impl RingCache {
         }
         // TODO: compute pointer offset into _buf, wrap SpiteTensor around it
         Ok(SpiteKvCache {
-            k:     SpiteTensor::null(),
-            v:     SpiteTensor::null(),
+            k: SpiteTensor::null(),
+            v: SpiteTensor::null(),
             layer: layer as i32,
         })
     }
@@ -272,11 +278,18 @@ impl RingCache {
     /// Advance the write head after a token is committed.
     pub fn commit(&mut self) {
         self.head = (self.head + 1) % self.cfg.max_ctx;
-        self.len  = (self.len + 1).min(self.cfg.max_ctx);
+        self.len = (self.len + 1).min(self.cfg.max_ctx);
     }
 
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_full(&self) -> bool { self.len == self.cfg.max_ctx }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+    pub fn is_full(&self) -> bool {
+        self.len == self.cfg.max_ctx
+    }
 }
 
 // ── Prefix cache ──────────────────────────────────────────────────────────
@@ -286,21 +299,25 @@ pub struct PrefixEntry {
     /// Hash of the token sequence that produced this cache entry.
     pub token_hash: u64,
     /// Number of tokens in this prefix.
-    pub n_tokens:   usize,
+    pub n_tokens: usize,
     /// KV state for each layer — GPU buffers.
     // TODO: actual GPU allocation handles per layer
-    pub layers:     Vec<()>,
+    pub layers: Vec<()>,
 }
 
 pub struct PrefixCache {
-    cfg:     CacheConfig,
+    cfg: CacheConfig,
     entries: Vec<PrefixEntry>,
     capacity: usize,
 }
 
 impl PrefixCache {
     pub fn new(cfg: CacheConfig, capacity: usize) -> Self {
-        Self { cfg, entries: Vec::new(), capacity }
+        Self {
+            cfg,
+            entries: Vec::new(),
+            capacity,
+        }
     }
 
     /// Look up a cached prefix by token sequence hash.
@@ -322,8 +339,8 @@ impl PrefixCache {
         }
         self.entries.push(PrefixEntry {
             token_hash: hash_tokens(tokens),
-            n_tokens:   tokens.len(),
-            layers:     vec![(); self.cfg.n_layers],
+            n_tokens: tokens.len(),
+            layers: vec![(); self.cfg.n_layers],
         });
         Ok(())
     }
@@ -346,6 +363,7 @@ fn hash_tokens(tokens: &[u32]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     #[test]
     fn kv_quant_parse_symmetric() {
@@ -383,25 +401,28 @@ mod tests {
 
     #[test]
     fn kv_quant_degrade_ladder() {
-        assert_eq!(KvQuant::F16.degrade(),  Some(KvQuant::Q8));
-        assert_eq!(KvQuant::Q8.degrade(),   Some(KvQuant::Q5_1));
+        assert_eq!(KvQuant::F16.degrade(), Some(KvQuant::Q8));
+        assert_eq!(KvQuant::Q8.degrade(), Some(KvQuant::Q5_1));
         assert_eq!(KvQuant::Q5_1.degrade(), Some(KvQuant::Q4));
-        assert_eq!(KvQuant::Q4.degrade(),   None);
+        assert_eq!(KvQuant::Q4.degrade(), None);
     }
 
     #[test]
     fn kv_quant_bytes_per_elem() {
-        assert_eq!(KvQuant::F16.bytes_per_elem(),  2.0);
-        assert_eq!(KvQuant::Q8.bytes_per_elem(),   1.0625);
+        assert_eq!(KvQuant::F16.bytes_per_elem(), 2.0);
+        assert_eq!(KvQuant::Q8.bytes_per_elem(), 1.0625);
         assert_eq!(KvQuant::Q5_1.bytes_per_elem(), 0.75);
-        assert_eq!(KvQuant::Q4.bytes_per_elem(),   0.5625);
+        assert_eq!(KvQuant::Q4.bytes_per_elem(), 0.5625);
     }
 
     #[test]
     fn ring_cache_sizes_with_quant() {
         // 4 layers, 128 ctx, 8 heads, 64 head_dim
         let base_cfg = CacheConfig {
-            n_layers: 4, n_kv_heads: 8, head_dim: 64, max_ctx: 128,
+            n_layers: 4,
+            n_kv_heads: 8,
+            head_dim: 64,
+            max_ctx: 128,
             strategy: CacheStrategy::Ring,
             quant: KvQuantConfig::default(),
         };

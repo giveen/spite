@@ -33,22 +33,22 @@ pub enum LoadError {
 
 // ── GGUF constants ─────────────────────────────────────────────────────────
 
-const GGUF_MAGIC:   u32 = 0x46554747; // "GGUF"
+const GGUF_MAGIC: u32 = 0x46554747; // "GGUF"
 const GGUF_VERSION: u32 = 3;
 
 // ── Internal tensor record ─────────────────────────────────────────────────
 
 struct TensorRecord {
     offset: u64,
-    ne:     [u32; 4],
-    kind:   SpiteType,
+    ne: [u32; 4],
+    kind: SpiteType,
 }
 
 // ── Public model handle ────────────────────────────────────────────────────
 
 pub struct GgufModel {
     _file: File,
-    mmap:  Mmap,
+    mmap: Mmap,
     pub(crate) meta: HashMap<String, MetaValue>,
     tensors: HashMap<String, TensorRecord>,
     data_offset: u64,
@@ -73,7 +73,7 @@ impl GgufModel {
         }
 
         let n_tensors = read_u64(&mmap, &mut cursor) as usize;
-        let n_kv      = read_u64(&mmap, &mut cursor) as usize;
+        let n_kv = read_u64(&mmap, &mut cursor) as usize;
 
         let mut meta = HashMap::with_capacity(n_kv);
         for _ in 0..n_kv {
@@ -89,9 +89,15 @@ impl GgufModel {
 
         // tensor data starts at next 32-byte aligned offset after metadata
         let alignment = 32u64;
-        let data_offset = (cursor as u64 + alignment - 1) / alignment * alignment;
+        let data_offset = (cursor as u64).div_ceil(alignment) * alignment;
 
-        Ok(Self { _file: file, mmap, meta, tensors, data_offset })
+        Ok(Self {
+            _file: file,
+            mmap,
+            meta,
+            tensors,
+            data_offset,
+        })
     }
 
     // ── Metadata access ───────────────────────────────────────────────────
@@ -124,6 +130,13 @@ impl GgufModel {
         }
     }
 
+    pub fn get_array(&self, key: &str) -> Option<&[MetaValue]> {
+        match self.meta.get(key) {
+            Some(MetaValue::Array(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     // ── Tensor access ─────────────────────────────────────────────────────
 
     /// Returns a tensor whose `data` pointer is valid for `'self` lifetime.
@@ -133,11 +146,13 @@ impl GgufModel {
             return SpiteTensor::null();
         };
         let ptr = unsafe {
-            self.mmap.as_ptr().add((self.data_offset + rec.offset) as usize)
+            self.mmap
+                .as_ptr()
+                .add((self.data_offset + rec.offset) as usize)
         };
         SpiteTensor {
             data: ptr as *mut _,
-            ne:   rec.ne,
+            ne: rec.ne,
             kind: rec.kind,
         }
     }
@@ -149,49 +164,85 @@ impl GgufModel {
     pub fn n_tensors(&self) -> usize {
         self.tensors.len()
     }
+
+    /// Root vocabulary size in tokens.
+    ///
+    /// Prefers the standard `tokenizer.ggml.token_count` GGUF key. When that
+    /// key is absent (some quantized files omit it), the size of the
+    /// `token_embd.weight` / `output.weight` tensors is used as a fallback.
+    pub fn vocab_size(&self) -> usize {
+        if let Some(crate::MetaValue::U32(v)) = self.meta.get("tokenizer.ggml.token_count") {
+            return *v as usize;
+        }
+        if !self.tensor("token_embd.weight").is_null() {
+            return self.tensor("token_embd.weight").ne[1] as usize; // ne[1] = rows = vocab
+        }
+        if !self.tensor("output.weight").is_null() {
+            return self.tensor("output.weight").ne[1] as usize; // ne[1] = rows
+        }
+        0
+    }
 }
 
 // ── GGUF parsing helpers ───────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub enum MetaValue {
-    U8(u8), I8(i8), U16(u16), I16(i16),
-    U32(u32), I32(i32), U64(u64), I64(i64),
-    F32(f32), F64(f64),
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    U64(u64),
+    I64(i64),
+    F32(f32),
+    F64(f64),
     Bool(bool),
     Str(String),
     Array(Vec<MetaValue>),
 }
 
 fn read_u8(buf: &[u8], cur: &mut usize) -> u8 {
-    let v = buf[*cur]; *cur += 1; v
+    let v = buf[*cur];
+    *cur += 1;
+    v
 }
 fn read_u16(buf: &[u8], cur: &mut usize) -> u16 {
-    let v = u16::from_le_bytes(buf[*cur..*cur+2].try_into().unwrap());
-    *cur += 2; v
+    let v = u16::from_le_bytes(buf[*cur..*cur + 2].try_into().unwrap());
+    *cur += 2;
+    v
 }
 fn read_u32(buf: &[u8], cur: &mut usize) -> u32 {
-    let v = u32::from_le_bytes(buf[*cur..*cur+4].try_into().unwrap());
-    *cur += 4; v
+    let v = u32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap());
+    *cur += 4;
+    v
 }
 fn read_u64(buf: &[u8], cur: &mut usize) -> u64 {
-    let v = u64::from_le_bytes(buf[*cur..*cur+8].try_into().unwrap());
-    *cur += 8; v
+    let v = u64::from_le_bytes(buf[*cur..*cur + 8].try_into().unwrap());
+    *cur += 8;
+    v
 }
 fn read_f32(buf: &[u8], cur: &mut usize) -> f32 {
-    f32::from_le_bytes(buf[*cur..*cur+4].try_into().unwrap()).also(|_| *cur += 4)
+    f32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap()).also(|_| *cur += 4)
 }
 fn read_gguf_str(buf: &[u8], cur: &mut usize) -> String {
     let len = read_u64(buf, cur) as usize;
-    let s = String::from_utf8_lossy(&buf[*cur..*cur+len]).into_owned();
-    *cur += len; s
+    let s = String::from_utf8_lossy(&buf[*cur..*cur + len]).into_owned();
+    *cur += len;
+    s
 }
 
-trait Also: Sized { fn also(self, f: impl FnOnce(&Self)) -> Self { f(&self); self } }
+trait Also: Sized {
+    fn also(self, f: impl FnOnce(&Self)) -> Self {
+        f(&self);
+        self
+    }
+}
 impl<T> Also for T {}
 
 fn read_kv(buf: &[u8], cur: &mut usize) -> Result<(String, MetaValue), LoadError> {
-    let key   = read_gguf_str(buf, cur);
+    let key = read_gguf_str(buf, cur);
     let vtype = read_u32(buf, cur);
     let value = read_meta_value(buf, cur, vtype)?;
     Ok((key, value))
@@ -199,19 +250,19 @@ fn read_kv(buf: &[u8], cur: &mut usize) -> Result<(String, MetaValue), LoadError
 
 fn read_meta_value(buf: &[u8], cur: &mut usize, vtype: u32) -> Result<MetaValue, LoadError> {
     Ok(match vtype {
-        0  => MetaValue::U8  (read_u8(buf, cur)),
-        1  => MetaValue::I8  (read_u8(buf, cur) as i8),
-        2  => MetaValue::U16 (read_u16(buf, cur)),
-        3  => MetaValue::I16 (read_u16(buf, cur) as i16),
-        4  => MetaValue::U32 (read_u32(buf, cur)),
-        5  => MetaValue::I32 (read_u32(buf, cur) as i32),
-        6  => MetaValue::F32 (read_f32(buf, cur)),
-        7  => MetaValue::Bool(read_u8(buf, cur) != 0),
-        8  => MetaValue::Str (read_gguf_str(buf, cur)),
-        9  => {
+        0 => MetaValue::U8(read_u8(buf, cur)),
+        1 => MetaValue::I8(read_u8(buf, cur) as i8),
+        2 => MetaValue::U16(read_u16(buf, cur)),
+        3 => MetaValue::I16(read_u16(buf, cur) as i16),
+        4 => MetaValue::U32(read_u32(buf, cur)),
+        5 => MetaValue::I32(read_u32(buf, cur) as i32),
+        6 => MetaValue::F32(read_f32(buf, cur)),
+        7 => MetaValue::Bool(read_u8(buf, cur) != 0),
+        8 => MetaValue::Str(read_gguf_str(buf, cur)),
+        9 => {
             let elem_type = read_u32(buf, cur);
-            let count     = read_u64(buf, cur) as usize;
-            let mut arr   = Vec::with_capacity(count);
+            let count = read_u64(buf, cur) as usize;
+            let mut arr = Vec::with_capacity(count);
             for _ in 0..count {
                 arr.push(read_meta_value(buf, cur, elem_type)?);
             }
@@ -219,35 +270,36 @@ fn read_meta_value(buf: &[u8], cur: &mut usize, vtype: u32) -> Result<MetaValue,
         }
         10 => MetaValue::U64(read_u64(buf, cur)),
         11 => MetaValue::I64(read_u64(buf, cur) as i64),
-        12 => MetaValue::F64(f64::from_le_bytes(
-            buf[*cur..*cur+8].try_into().unwrap()).also(|_| *cur += 8)),
-        t  => return Err(LoadError::MalformedKey(format!("unknown value type {t}"))),
+        12 => MetaValue::F64(
+            f64::from_le_bytes(buf[*cur..*cur + 8].try_into().unwrap()).also(|_| *cur += 8),
+        ),
+        t => return Err(LoadError::MalformedKey(format!("unknown value type {t}"))),
     })
 }
 
 fn read_tensor_info(buf: &[u8], cur: &mut usize) -> Result<(String, TensorRecord), LoadError> {
-    let name  = read_gguf_str(buf, cur);
-    let ndim  = read_u32(buf, cur) as usize;
+    let name = read_gguf_str(buf, cur);
+    let ndim = read_u32(buf, cur) as usize;
     let mut ne = [1u32; 4];
-    for i in 0..ndim {
-        ne[i] = read_u64(buf, cur) as u32;
+    for elem in ne.iter_mut().take(ndim) {
+        *elem = read_u64(buf, cur) as u32;
     }
     let type_id = read_u32(buf, cur);
-    let offset  = read_u64(buf, cur);
+    let offset = read_u64(buf, cur);
     let kind = gguf_type(type_id)?;
     Ok((name, TensorRecord { offset, ne, kind }))
 }
 
 fn gguf_type(id: u32) -> Result<SpiteType, LoadError> {
     Ok(match id {
-        0  => SpiteType::F32,
-        1  => SpiteType::F16,
-        2  => SpiteType::Q4_0,
-        8  => SpiteType::Q8_0,
+        0 => SpiteType::F32,
+        1 => SpiteType::F16,
+        2 => SpiteType::Q4_0,
+        8 => SpiteType::Q8_0,
         10 => SpiteType::Q4K,
         11 => SpiteType::Q5K,
         12 => SpiteType::Q6K,
         30 => SpiteType::Bf16,
-        t  => return Err(LoadError::UnknownType(t)),
+        t => return Err(LoadError::UnknownType(t)),
     })
 }

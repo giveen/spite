@@ -54,9 +54,15 @@ pub fn alloc(size: usize) -> Result<*mut u8, GpuError> {
 ///
 /// On real hardware: `hipFree(ptr)`. The stub reconstructs the Vec to let
 /// Rust drop it.
-pub fn free(ptr: *mut u8, size: usize) {
+/// # Safety
+///
+/// `ptr` must have been returned by [`alloc`] and not yet freed, and `size`
+/// must be the same value passed to [`alloc`].
+pub unsafe fn free(ptr: *mut u8, size: usize) {
     // stub: reconstruct and drop
-    unsafe { drop(Vec::from_raw_parts(ptr, size, size)); }
+    unsafe {
+        drop(Vec::from_raw_parts(ptr, size, size));
+    }
 }
 
 /// Upload is a no-op on unified memory — CPU and GPU see the same bytes.
@@ -105,5 +111,7 @@ pub unsafe fn as_slice<'a>(ptr: *const u8, size: usize) -> &'a [u8] {
 /// both are non-zero.
 pub fn is_unified() -> bool {
     // stub: env var override for testing; real detection via HIP device query
-    std::env::var("SPITE_HIP_UNIFIED").map(|v| v == "1").unwrap_or(false)
+    std::env::var("SPITE_HIP_UNIFIED")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }

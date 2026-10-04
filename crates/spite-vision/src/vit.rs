@@ -33,7 +33,7 @@ pub struct ViTLayer {
 
 /// Full ViT encoder.
 pub struct ViTEncoder {
-    pub cfg:    VisionConfig,
+    pub cfg: VisionConfig,
     pub layers: Vec<ViTLayer>,
     // TODO: patch_embed:  [d_vision, patch_dim]   (patch projection)
     // TODO: pos_embed:    [1 + n_patches, d_vision] (CLS + positional)

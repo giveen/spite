@@ -18,15 +18,15 @@ pub const ABI_VERSION: u32 = 3;
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpiteType {
-    F32  = 0,
-    F16  = 1,
+    F32 = 0,
+    F16 = 1,
     Bf16 = 2,
     Q8_0 = 8,
     Q5_1 = 11,
     Q4_0 = 10,
-    Q4K  = 12,
-    Q5K  = 13,
-    Q6K  = 14,
+    Q4K = 12,
+    Q5K = 13,
+    Q6K = 14,
 }
 
 // ── Tensor ─────────────────────────────────────────────────────────────────
@@ -37,7 +37,7 @@ pub enum SpiteType {
 pub struct SpiteTensor {
     pub data: *mut c_void,
     /// Dimensions: ne[0]=cols, ne[1]=rows, ne[2..] for higher dims.
-    pub ne:   [u32; 4],
+    pub ne: [u32; 4],
     pub kind: SpiteType,
 }
 
@@ -49,7 +49,7 @@ impl SpiteTensor {
     pub const fn null() -> Self {
         Self {
             data: core::ptr::null_mut(),
-            ne:   [0; 4],
+            ne: [0; 4],
             kind: SpiteType::F32,
         }
     }
@@ -62,19 +62,20 @@ impl SpiteTensor {
 // ── Inference context ──────────────────────────────────────────────────────
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SpiteCtx {
-    pub n_ctx:            c_int,
-    pub n_batch:          c_int,
-    pub n_threads:        c_int,
+    pub n_ctx: c_int,
+    pub n_batch: c_int,
+    pub n_threads: c_int,
     /// Current token position in the sequence (0-based). Used by RoPE and KV cache.
-    pub pos:              c_int,
+    pub pos: c_int,
     /// Total query heads (n_heads in config).
-    pub n_heads:          c_int,
+    pub n_heads: c_int,
     /// KV heads — may be less than n_heads for GQA/MQA.
-    pub n_kv_heads:       c_int,
+    pub n_kv_heads: c_int,
     /// CUDA stream / HIP stream / Metal command buffer. Null for CPU kernels.
-    pub gpu_stream:       *mut c_void,
-    pub scratchpad:       *mut c_void,
+    pub gpu_stream: *mut c_void,
+    pub scratchpad: *mut c_void,
     pub scratchpad_bytes: usize,
 }
 
@@ -82,51 +83,51 @@ pub struct SpiteCtx {
 
 #[repr(C)]
 pub struct SpiteKvCache {
-    pub k:     SpiteTensor,
-    pub v:     SpiteTensor,
+    pub k: SpiteTensor,
+    pub v: SpiteTensor,
     pub layer: c_int,
 }
 
 // ── Op function pointer types ──────────────────────────────────────────────
 
 pub type RmsNormFn = unsafe extern "C" fn(
-    out:    *mut SpiteTensor,
-    x:      *const SpiteTensor,
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
     weight: *const SpiteTensor,
-    eps:    f32,
-    ctx:    *const SpiteCtx,
+    eps: f32,
+    ctx: *const SpiteCtx,
 ) -> c_int;
 
 pub type AttentionFn = unsafe extern "C" fn(
-    out:            *mut SpiteTensor,
-    x:              *const SpiteTensor,
-    wq:             *const SpiteTensor,
-    wk:             *const SpiteTensor,
-    wv:             *const SpiteTensor,
-    wo:             *const SpiteTensor,
-    kvcache:        *mut SpiteKvCache,
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
+    wq: *const SpiteTensor,
+    wk: *const SpiteTensor,
+    wv: *const SpiteTensor,
+    wo: *const SpiteTensor,
+    kvcache: *mut SpiteKvCache,
     rope_freq_base: f32,
-    ctx:            *const SpiteCtx,  // pos, n_heads, n_kv_heads are in ctx
+    ctx: *const SpiteCtx, // pos, n_heads, n_kv_heads are in ctx
 ) -> c_int;
 
 /// FFN activation function selector.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfnActivation {
-    SiluGate = 0,  // SwiGLU — LLaMA, Mistral, Qwen
-    GeluGate = 1,  // GeGLU  — Gemma
-    Gelu     = 2,  // standard GELU — BERT-family, Phi
-    Relu     = 3,  // ReLU²  — GPT-NeoX variants
+    SiluGate = 0, // SwiGLU — LLaMA, Mistral, Qwen
+    GeluGate = 1, // GeGLU  — Gemma
+    Gelu = 2,     // standard GELU — BERT-family, Phi
+    Relu = 3,     // ReLU²  — GPT-NeoX variants
 }
 
 pub type FfnFn = unsafe extern "C" fn(
-    out:        *mut SpiteTensor,
-    x:          *const SpiteTensor,
-    w_gate:     *const SpiteTensor,
-    w_up:       *const SpiteTensor,
-    w_down:     *const SpiteTensor,
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
+    w_gate: *const SpiteTensor,
+    w_up: *const SpiteTensor,
+    w_down: *const SpiteTensor,
     activation: FfnActivation,
-    ctx:        *const SpiteCtx,
+    ctx: *const SpiteCtx,
 ) -> c_int;
 
 /// Multi-head Latent Attention (DeepSeek MLA).
@@ -135,38 +136,38 @@ pub type FfnFn = unsafe extern "C" fn(
 /// The compressed latent is stored in the KV cache; up-projection
 /// happens during the attention score computation.
 pub type MlaFn = unsafe extern "C" fn(
-    out:     *mut SpiteTensor,
-    x:       *const SpiteTensor,
-    w_dq:    *const SpiteTensor,  // query down-projection (absorbs W_Q)
-    w_uq:    *const SpiteTensor,  // query up-projection
-    w_dkv:   *const SpiteTensor,  // KV down-projection (shared compress)
-    w_ukv:   *const SpiteTensor,  // KV up-projection
-    wo:      *const SpiteTensor,  // output projection
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
+    w_dq: *const SpiteTensor,  // query down-projection (absorbs W_Q)
+    w_uq: *const SpiteTensor,  // query up-projection
+    w_dkv: *const SpiteTensor, // KV down-projection (shared compress)
+    w_ukv: *const SpiteTensor, // KV up-projection
+    wo: *const SpiteTensor,    // output projection
     kvcache: *mut SpiteKvCache,
     rope_freq_base: f32,
-    ctx:     *const SpiteCtx,
+    ctx: *const SpiteCtx,
 ) -> c_int;
 
 /// Optional: fuse rms_norm + attention + ffn for one layer.
 pub type LayerFn = unsafe extern "C" fn(
-    out:       *mut SpiteTensor,
-    x:         *const SpiteTensor,
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
     layer_idx: c_int,
-    kvcache:   *mut SpiteKvCache,
-    pos:       c_int,
-    ctx:       *const SpiteCtx,
+    kvcache: *mut SpiteKvCache,
+    pos: c_int,
+    ctx: *const SpiteCtx,
 ) -> c_int;
 
 /// Verify N draft tokens against main-model logits.
 /// Returns accept mask; first rejection zeroes all subsequent positions.
 /// Returning -1 falls back to the generic scalar implementation.
 pub type SpecVerifyFn = unsafe extern "C" fn(
-    accept_mask:  *mut bool,
+    accept_mask: *mut bool,
     draft_logits: *const SpiteTensor,
-    main_logits:  *const SpiteTensor,
-    temperature:  f32,
-    n_draft:      u32,
-    ctx:          *const SpiteCtx,
+    main_logits: *const SpiteTensor,
+    temperature: f32,
+    n_draft: u32,
+    ctx: *const SpiteCtx,
 ) -> c_int;
 
 // ── Model capability declaration ───────────────────────────────────────────
@@ -194,10 +195,10 @@ impl SpiteModelCaps {
     /// A model that cannot participate in speculative decoding at all.
     pub const fn unsupported() -> Self {
         Self {
-            can_verify:       false,
-            can_draft:        false,
+            can_verify: false,
+            can_draft: false,
             max_draft_tokens: 0,
-            draft_archs:      core::ptr::null(),
+            draft_archs: core::ptr::null(),
         }
     }
 
@@ -212,22 +213,22 @@ impl SpiteModelCaps {
 #[repr(C)]
 pub struct SpiteKernelInfo {
     pub abi_version: u32,
-    pub model_arch:  *const c_char,
-    pub gpu_arch:    *const c_char,
-    pub author:      *const c_char,
+    pub model_arch: *const c_char,
+    pub gpu_arch: *const c_char,
+    pub author: *const c_char,
     /// Null-terminated list of SpiteType values this kernel handles.
     pub supported_quants: [u32; 8],
     /// None = not implemented; dispatcher uses fallback.
-    pub rms_norm:           Option<RmsNormFn>,
-    pub attention:          Option<AttentionFn>,
-    pub mla:                Option<MlaFn>,
-    pub ffn:                Option<FfnFn>,
-    pub layer:              Option<LayerFn>,
+    pub rms_norm: Option<RmsNormFn>,
+    pub attention: Option<AttentionFn>,
+    pub mla: Option<MlaFn>,
+    pub ffn: Option<FfnFn>,
+    pub layer: Option<LayerFn>,
     pub speculative_verify: Option<SpecVerifyFn>,
     /// Chunked prefill: process a prompt in fixed-size chunks rather than all
     /// at once, enabling interleaving with decode steps and bounding peak memory.
     /// Reuses `LayerFn` signature; the caller passes `chunk_idx` via `pos` in ctx.
-    pub prefill:            Option<LayerFn>,
+    pub prefill: Option<LayerFn>,
 }
 
 unsafe impl Send for SpiteKernelInfo {}

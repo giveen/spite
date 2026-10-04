@@ -59,5 +59,7 @@ impl Grammar {
     }
 
     /// Returns `true` when the current FSM state is a valid end-of-sequence.
-    pub fn is_complete(&self) -> bool { false }
+    pub fn is_complete(&self) -> bool {
+        false
+    }
 }

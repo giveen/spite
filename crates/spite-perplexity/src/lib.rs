@@ -20,13 +20,13 @@
 //! PPL alone can look fine while distributions diverge on rare tokens.
 //! KLD catches those cases.
 
+pub mod dataset;
 pub mod kld;
 pub mod ppl;
-pub mod dataset;
 pub mod report;
 
-pub use kld::{KldResult, KldConfig};
-pub use ppl::{PplResult, PplConfig};
+pub use kld::{KldConfig, KldResult};
+pub use ppl::{PplConfig, PplResult};
 pub use report::Report;
 
 use thiserror::Error;
