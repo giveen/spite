@@ -14,3 +14,6 @@ spite-compute  = { workspace = true }
 spite-dispatch = { workspace = true }
 spite-rope     = { workspace = true }
 thiserror      = { workspace = true }
+
+[dev-dependencies]
+spite-testkit = { workspace = true }

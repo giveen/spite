@@ -39,19 +39,19 @@ pub enum VisionError {
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
     /// Input image resolution (e.g. 336 for LLaVA-1.5).
-    pub image_size:       usize,
+    pub image_size: usize,
     /// Patch size (e.g. 14 for CLIP ViT-L/14).
-    pub patch_size:       usize,
+    pub patch_size: usize,
     /// Number of patches: (image_size / patch_size)².
-    pub n_patches:        usize,
+    pub n_patches: usize,
     /// ViT hidden dimension (e.g. 1024 for ViT-L).
-    pub d_vision:         usize,
+    pub d_vision: usize,
     /// Text model hidden dimension the projection maps into.
-    pub d_text:           usize,
+    pub d_text: usize,
     /// MLP hidden dim between fc1 and fc2 in the projector.
-    pub d_proj:           usize,
-    pub n_vision_layers:  usize,
-    pub n_vision_heads:   usize,
+    pub d_proj: usize,
+    pub n_vision_layers: usize,
+    pub n_vision_heads: usize,
 }
 
 impl Default for VisionConfig {
@@ -61,12 +61,12 @@ impl Default for VisionConfig {
         Self {
             image_size,
             patch_size,
-            n_patches:       (image_size / patch_size) * (image_size / patch_size),
-            d_vision:        1024,
-            d_text:          4096,
-            d_proj:          4096,
+            n_patches: (image_size / patch_size) * (image_size / patch_size),
+            d_vision: 1024,
+            d_text: 4096,
+            d_proj: 4096,
             n_vision_layers: 24,
-            n_vision_heads:  16,
+            n_vision_heads: 16,
         }
     }
 }
@@ -86,7 +86,9 @@ impl VisionEncoder {
     pub fn from_gguf(_path: &Path) -> Result<Self, VisionError> {
         // TODO: open with spite-loader, read VisionConfig from metadata,
         //       load all vision_model/* and mm_projector/* tensors
-        Err(VisionError::Load("vision encoder not yet implemented".into()))
+        Err(VisionError::Load(
+            "vision encoder not yet implemented".into(),
+        ))
     }
 
     /// Encode a raw image into text-space token embeddings.
@@ -97,7 +99,7 @@ impl VisionEncoder {
         &self,
         _pixels: &[u8],
         _height: usize,
-        _width:  usize,
+        _width: usize,
     ) -> Result<Vec<f32>, VisionError> {
         // TODO:
         // 1. Resize pixels to cfg.image_size × cfg.image_size (bilinear)

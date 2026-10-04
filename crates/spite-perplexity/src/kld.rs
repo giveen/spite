@@ -32,9 +32,9 @@ pub struct KldConfig {
     pub warn_threshold: f64,
     /// Cap the vocabulary when computing KLD (top-k by reference probability).
     /// 0 = full vocabulary. Capping at 1000 is faster and catches real bugs.
-    pub top_k:          usize,
+    pub top_k: usize,
     /// Maximum number of token positions to evaluate. 0 = all.
-    pub max_positions:  usize,
+    pub max_positions: usize,
 }
 
 impl Default for KldConfig {
@@ -42,8 +42,8 @@ impl Default for KldConfig {
         Self {
             pass_threshold: 0.001,
             warn_threshold: 0.01,
-            top_k:          1000,
-            max_positions:  0,
+            top_k: 1000,
+            max_positions: 0,
         }
     }
 }
@@ -54,7 +54,7 @@ pub struct PositionKld {
     /// The token that was the input at this position.
     pub token_id: u32,
     /// KLD at this position.
-    pub kld:      f64,
+    pub kld: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,13 +77,13 @@ impl std::fmt::Display for KldVerdict {
 /// Results from a KLD comparison run.
 #[derive(Debug, Clone)]
 pub struct KldResult {
-    pub mean_kld:    f64,
-    pub max_kld:     f64,
-    pub p95_kld:     f64,       // 95th percentile — robust to outliers
+    pub mean_kld: f64,
+    pub max_kld: f64,
+    pub p95_kld: f64, // 95th percentile — robust to outliers
     pub n_positions: usize,
-    pub verdict:     KldVerdict,
+    pub verdict: KldVerdict,
     /// Top-10 worst positions for debugging.
-    pub worst:       Vec<PositionKld>,
+    pub worst: Vec<PositionKld>,
 }
 
 impl KldResult {
@@ -99,13 +99,13 @@ impl KldResult {
 ///
 /// Log-probs rather than probs avoids numerical underflow on large vocabs.
 pub fn compute_kld<Ref, Cand>(
-    tokens:    &[u32],
-    cfg:       &KldConfig,
-    mut reference:  Ref,
-    mut candidate:  Cand,
+    tokens: &[u32],
+    cfg: &KldConfig,
+    mut reference: Ref,
+    mut candidate: Cand,
 ) -> KldResult
 where
-    Ref:  FnMut(&[u32]) -> Vec<f32>,
+    Ref: FnMut(&[u32]) -> Vec<f32>,
     Cand: FnMut(&[u32]) -> Vec<f32>,
 {
     let limit = if cfg.max_positions > 0 {
@@ -119,11 +119,14 @@ where
     for i in 1..limit {
         let ctx = &tokens[..i];
 
-        let ref_log_probs  = reference(ctx);
+        let ref_log_probs = reference(ctx);
         let cand_log_probs = candidate(ctx);
 
         let kld = kld_from_logprobs(&ref_log_probs, &cand_log_probs, cfg.top_k);
-        positions.push(PositionKld { token_id: tokens[i], kld });
+        positions.push(PositionKld {
+            token_id: tokens[i],
+            kld,
+        });
     }
 
     summarise(positions, cfg)
@@ -133,18 +136,28 @@ where
 /// P = softmax(ref_log_probs), Q = softmax(cand_log_probs)
 fn kld_from_logprobs(ref_lp: &[f32], cand_lp: &[f32], top_k: usize) -> f64 {
     let len = ref_lp.len().min(cand_lp.len());
-    if len == 0 { return 0.0; }
+    if len == 0 {
+        return 0.0;
+    }
 
     // Numerically stable softmax for P.
-    let ref_max  = ref_lp[..len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let ref_exp: Vec<f64> = ref_lp[..len].iter()
+    let ref_max = ref_lp[..len]
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let ref_exp: Vec<f64> = ref_lp[..len]
+        .iter()
         .map(|&x| ((x - ref_max) as f64).exp())
         .collect();
     let ref_sum: f64 = ref_exp.iter().sum();
 
     // Softmax for Q.
-    let cand_max = cand_lp[..len].iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let cand_exp: Vec<f64> = cand_lp[..len].iter()
+    let cand_max = cand_lp[..len]
+        .iter()
+        .cloned()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let cand_exp: Vec<f64> = cand_lp[..len]
+        .iter()
         .map(|&x| ((x - cand_max) as f64).exp())
         .collect();
     let cand_sum: f64 = cand_exp.iter().sum();
@@ -162,7 +175,7 @@ fn kld_from_logprobs(ref_lp: &[f32], cand_lp: &[f32], top_k: usize) -> f64 {
     let mut kld = 0.0f64;
     let eps = 1e-10;
     for i in indices {
-        let p = ref_exp[i]  / ref_sum;
+        let p = ref_exp[i] / ref_sum;
         let q = cand_exp[i] / cand_sum;
         if p > eps {
             kld += p * (p / (q + eps)).ln();
@@ -175,16 +188,18 @@ fn kld_from_logprobs(ref_lp: &[f32], cand_lp: &[f32], top_k: usize) -> f64 {
 fn summarise(mut positions: Vec<PositionKld>, cfg: &KldConfig) -> KldResult {
     if positions.is_empty() {
         return KldResult {
-            mean_kld: 0.0, max_kld: 0.0, p95_kld: 0.0,
+            mean_kld: 0.0,
+            max_kld: 0.0,
+            p95_kld: 0.0,
             n_positions: 0,
             verdict: KldVerdict::Pass,
             worst: vec![],
         };
     }
 
-    let n        = positions.len();
+    let n = positions.len();
     let mean_kld = positions.iter().map(|p| p.kld).sum::<f64>() / n as f64;
-    let max_kld  = positions.iter().map(|p| p.kld).fold(0.0f64, f64::max);
+    let max_kld = positions.iter().map(|p| p.kld).fold(0.0f64, f64::max);
 
     let mut sorted_klds: Vec<f64> = positions.iter().map(|p| p.kld).collect();
     sorted_klds.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
@@ -202,5 +217,12 @@ fn summarise(mut positions: Vec<PositionKld>, cfg: &KldConfig) -> KldResult {
     positions.sort_unstable_by(|a, b| b.kld.partial_cmp(&a.kld).unwrap());
     let worst = positions.into_iter().take(10).collect();
 
-    KldResult { mean_kld, max_kld, p95_kld, n_positions: n, verdict, worst }
+    KldResult {
+        mean_kld,
+        max_kld,
+        p95_kld,
+        n_positions: n,
+        verdict,
+        worst,
+    }
 }

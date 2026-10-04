@@ -24,27 +24,35 @@
 /// `logits` is modified in-place (excluded tokens set to −∞).
 /// `rng`:  LCG state, consumed for the probability gate.
 pub fn apply_xtc(
-    logits:    &mut [f32],
+    logits: &mut [f32],
     threshold: f32,
     probability: f32,
-    min_keep:  usize,
-    rng:       &mut u64,
+    min_keep: usize,
+    rng: &mut u64,
 ) {
-    if probability <= 0.0 || threshold >= 1.0 { return; }
+    if probability <= 0.0 || threshold >= 1.0 {
+        return;
+    }
 
     // Probability gate: skip XTC this call if random draw > probability.
     let r = crate::lcg_f32(rng);
-    if r > probability { return; }
+    if r > probability {
+        return;
+    }
 
     let n = logits.len();
-    if n <= min_keep { return; }
+    if n <= min_keep {
+        return;
+    }
 
     // Softmax to get probabilities.
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut probs: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
     let sum: f32 = probs.iter().sum();
     let inv = 1.0 / sum.max(1e-30);
-    for p in probs.iter_mut() { *p *= inv; }
+    for p in probs.iter_mut() {
+        *p *= inv;
+    }
 
     // Sort indices by descending probability.
     let mut idx: Vec<usize> = (0..n).collect();
@@ -57,7 +65,9 @@ pub fn apply_xtc(
     for &i in &idx {
         cum += probs[i];
         cut += 1;
-        if cum >= threshold { break; }
+        if cum >= threshold {
+            break;
+        }
     }
 
     // Don't exclude if it would leave fewer than min_keep.
@@ -82,8 +92,11 @@ mod tests {
         let mut rng = 1u64;
         apply_xtc(&mut logits, 0.5, 1.0, 1, &mut rng);
         // Token 0 should be excluded (it holds > 50% of the mass by itself).
-        assert!(logits[0] == f32::NEG_INFINITY || logits[0] < 0.0,
-            "token 0 should be suppressed, got {}", logits[0]);
+        assert!(
+            logits[0] == f32::NEG_INFINITY || logits[0] < 0.0,
+            "token 0 should be suppressed, got {}",
+            logits[0]
+        );
     }
 
     #[test]

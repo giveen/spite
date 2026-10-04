@@ -18,6 +18,7 @@ spite-loader   = { workspace = true }
 spite-executor = { workspace = true }
 spite-sampling = { workspace = true }
 spite-kvcache  = { workspace = true }
+spite-tokenizer = { workspace = true }
 anyhow         = { workspace = true }
 clap           = { workspace = true }
 serde          = { workspace = true }

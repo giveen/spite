@@ -35,9 +35,9 @@
 use std::ops::Range;
 use std::path::Path;
 
-use crate::{DispatchBuilder, DispatchError, DispatchTable};
-use crate::resolve::KernelSpec;
 use super::{card_spec, normalize_card_name};
+use crate::resolve::KernelSpec;
+use crate::{DispatchBuilder, DispatchError, DispatchTable};
 
 // ── GPU node ───────────────────────────────────────────────────────────────
 
@@ -45,13 +45,13 @@ use super::{card_spec, normalize_card_name};
 #[derive(Debug, Clone)]
 pub struct GpuNode {
     /// Normalised card id: "rtx_5090", "mi300x", …
-    pub card_id:  String,
+    pub card_id: String,
     /// GPU arch string used in the kernel directory tree.
     pub gpu_arch: String,
     /// Dedicated VRAM in GiB (0 = unknown / Apple Unified Memory).
     pub vram_gib: u32,
     /// Transformer layers this GPU is responsible for (assigned later).
-    pub layers:   Range<usize>,
+    pub layers: Range<usize>,
     /// How this GPU hands activations to the *next* node in the pipeline.
     pub link_out: CommLink,
 }
@@ -60,12 +60,12 @@ impl GpuNode {
     /// Build a `GpuNode` from a raw card name string.
     pub fn from_card(raw: &str) -> Self {
         let card_id = normalize_card_name(raw);
-        let spec    = card_spec(&card_id);
+        let spec = card_spec(&card_id);
         Self {
             card_id,
             gpu_arch: spec.gpu_arch.to_owned(),
             vram_gib: spec.vram_gib,
-            layers:   0..0,   // filled in by MultiGpuSpec::assign_layers
+            layers: 0..0, // filled in by MultiGpuSpec::assign_layers
             link_out: CommLink::None,
         }
     }
@@ -90,20 +90,20 @@ pub enum CommLink {
 impl CommLink {
     pub fn label(self) -> &'static str {
         match self {
-            Self::None          => "—",
-            Self::DeviceLink    => "NVLink / XGMI",
+            Self::None => "—",
+            Self::DeviceLink => "NVLink / XGMI",
             Self::PcieDirectP2P => "PCIe P2P",
-            Self::HostCopy      => "PCIe via host RAM (cross-vendor)",
+            Self::HostCopy => "PCIe via host RAM (cross-vendor)",
         }
     }
 
     /// Estimated peak bandwidth in GB/s (conservative values for planning).
     pub fn bandwidth_gbs(self) -> f32 {
         match self {
-            Self::None          =>   0.0,
-            Self::DeviceLink    => 900.0,   // NVLink 4.0 / XGMI gen4
-            Self::PcieDirectP2P =>  64.0,   // PCIe 5.0 x16 bidir
-            Self::HostCopy      =>  28.0,   // PCIe 5.0 one-direction (2 legs)
+            Self::None => 0.0,
+            Self::DeviceLink => 900.0,   // NVLink 4.0 / XGMI gen4
+            Self::PcieDirectP2P => 64.0, // PCIe 5.0 x16 bidir
+            Self::HostCopy => 28.0,      // PCIe 5.0 one-direction (2 legs)
         }
     }
 }
@@ -135,14 +135,24 @@ impl MultiGpuSpec {
     /// renormalised so their sum equals `n_layers`.
     pub fn assign_layers(&mut self, n_layers: usize, override_counts: Option<&[u32]>) {
         let n = self.nodes.len();
-        if n == 0 { return; }
+        if n == 0 {
+            return;
+        }
 
         // Build weight vector (VRAM or user-supplied).
         let weights: Vec<f64> = match override_counts {
             Some(w) if w.len() == n => w.iter().map(|&v| v as f64).collect(),
-            _ => self.nodes.iter().map(|g| {
-                if g.vram_gib > 0 { g.vram_gib as f64 } else { 1.0 }
-            }).collect(),
+            _ => self
+                .nodes
+                .iter()
+                .map(|g| {
+                    if g.vram_gib > 0 {
+                        g.vram_gib as f64
+                    } else {
+                        1.0
+                    }
+                })
+                .collect(),
         };
 
         let total_w: f64 = weights.iter().sum();
@@ -162,14 +172,17 @@ impl MultiGpuSpec {
     /// Build one `DispatchTable` per GPU node.
     pub fn build_tables(
         &self,
-        model_arch:  &str,
+        model_arch: &str,
         kernels_dir: &Path,
     ) -> Vec<Result<DispatchTable, DispatchError>> {
-        self.nodes.iter().map(|node| {
-            let mut spec = KernelSpec::from_arch(model_arch, &node.gpu_arch);
-            spec.card_id = node.card_id.clone();
-            DispatchBuilder::new(kernels_dir, spec).build()
-        }).collect()
+        self.nodes
+            .iter()
+            .map(|node| {
+                let mut spec = KernelSpec::from_arch(model_arch, &node.gpu_arch);
+                spec.card_id = node.card_id.clone();
+                DispatchBuilder::new(kernels_dir, spec).build()
+            })
+            .collect()
     }
 
     /// Human-readable summary of this configuration.
@@ -202,14 +215,18 @@ impl MultiGpuSpec {
         if self.has_cross_vendor() {
             println!();
             println!("  note: cross-vendor pair detected — activations transit host");
-            println!("        RAM between those nodes (~{:.0} GB/s limit).",
-                CommLink::HostCopy.bandwidth_gbs());
+            println!(
+                "        RAM between those nodes (~{:.0} GB/s limit).",
+                CommLink::HostCopy.bandwidth_gbs()
+            );
         }
     }
 
     /// `true` if any two adjacent nodes use different GPU backends.
     pub fn has_cross_vendor(&self) -> bool {
-        self.nodes.windows(2).any(|w| vendor(&w[0].gpu_arch) != vendor(&w[1].gpu_arch))
+        self.nodes
+            .windows(2)
+            .any(|w| vendor(&w[0].gpu_arch) != vendor(&w[1].gpu_arch))
     }
 
     /// Collect all unique GPU arch strings across nodes.
@@ -228,15 +245,23 @@ impl MultiGpuSpec {
 
 /// Vendor string derived from GPU arch for topology detection.
 fn vendor(gpu_arch: &str) -> &'static str {
-    if gpu_arch.starts_with("sm_")                           { return "nvidia"; }
-    if gpu_arch.starts_with("rdna") || gpu_arch.starts_with("cdna") { return "amd"; }
-    if gpu_arch == "metal"                                   { return "apple"; }
-    if gpu_arch.starts_with("xe")                            { return "intel"; }
+    if gpu_arch.starts_with("sm_") {
+        return "nvidia";
+    }
+    if gpu_arch.starts_with("rdna") || gpu_arch.starts_with("cdna") {
+        return "amd";
+    }
+    if gpu_arch == "metal" {
+        return "apple";
+    }
+    if gpu_arch.starts_with("xe") {
+        return "intel";
+    }
     "generic"
 }
 
 /// Assign `CommLink` values to every node based on vendor adjacency.
-fn assign_comm_links(nodes: &mut Vec<GpuNode>) {
+fn assign_comm_links(nodes: &mut [GpuNode]) {
     let n = nodes.len();
     for i in 0..n {
         if i == n - 1 {

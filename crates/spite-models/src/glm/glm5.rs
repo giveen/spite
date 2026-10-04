@@ -11,29 +11,63 @@
 //!
 //! This stub is registered so GGUF files load without error when weights ship.
 
-use crate::{ModelArch, ModelConfig, ModelError};
+use std::sync::RwLock;
+
 use spite_abi::SpiteCtx;
+use spite_loader::GgufModel;
+
+use crate::dense::{self, DenseWeights, KvStore};
+use crate::{ModelArch, ModelConfig, ModelError};
 
 pub struct Glm5 {
     config: ModelConfig,
+    weights: Option<DenseWeights>,
+    // ponytail: RwLock, uncontended single-threaded use; sharded locks if parallel decode matters.
+    kv: RwLock<KvStore>,
 }
 
 impl Glm5 {
     pub fn new(config: ModelConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            weights: None,
+            kv: RwLock::new(KvStore::default()),
+        }
     }
 }
 
 impl ModelArch for Glm5 {
-    fn config(&self) -> &ModelConfig { &self.config }
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    fn load_weights(&mut self, model: &GgufModel) -> Result<(), ModelError> {
+        self.weights = Some(DenseWeights::load(model)?);
+        Ok(())
+    }
+
+    fn reset_cache(&self) {
+        if let Ok(mut kv) = self.kv.write() {
+            kv.reset();
+        }
+    }
 
     fn forward(
         &self,
-        _tokens:     &[u32],
-        _logits_out: &mut [f32],
-        _ctx:        &SpiteCtx,
+        tokens: &[u32],
+        logits_out: &mut [f32],
+        ctx: &SpiteCtx,
     ) -> Result<(), ModelError> {
-        // TODO: implement once GLM-5 architecture is documented.
-        Err(ModelError::Forward("not implemented".into()))
+        let Some(w) = &self.weights else {
+            return Err(ModelError::Forward("load_weights not called".into()));
+        };
+        dense::forward(
+            &self.config,
+            w,
+            &self.kv,
+            tokens,
+            ctx.pos as usize,
+            logits_out,
+        )
     }
 }

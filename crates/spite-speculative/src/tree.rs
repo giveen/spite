@@ -22,16 +22,16 @@
 /// A node in the speculation tree.
 pub struct TreeNode {
     pub token_id: u32,
-    pub logit:    f32,
+    pub logit: f32,
     pub children: Vec<TreeNode>,
-    pub depth:    usize,
+    pub depth: usize,
 }
 
 /// Build a draft tree from `n_heads` prediction heads, each keeping `top_k`
 /// candidates.
 pub fn build_tree(
     _logits_per_head: &[Vec<f32>], // [n_heads][vocab_size]
-    _top_k:           usize,
+    _top_k: usize,
 ) -> Vec<TreeNode> {
     // TODO: for each head, take top-k logits and build tree level
     vec![]
@@ -43,19 +43,14 @@ pub fn build_tree(
 /// Returns:
 ///   tokens:  flattened candidate tokens [total_nodes]
 ///   mask:    bool [total_nodes, total_nodes] — which positions can attend
-pub fn flatten_tree(
-    _tree: &[TreeNode],
-) -> (Vec<u32>, Vec<Vec<bool>>) {
+pub fn flatten_tree(_tree: &[TreeNode]) -> (Vec<u32>, Vec<Vec<bool>>) {
     // TODO: BFS flatten + build causal-with-tree mask
     (vec![], vec![])
 }
 
 /// Walk the verified accept mask and find the longest accepted path
 /// in the tree.
-pub fn accepted_path(
-    _tree:        &[TreeNode],
-    _accept_mask: &[bool],
-) -> Vec<u32> {
+pub fn accepted_path(_tree: &[TreeNode], _accept_mask: &[bool]) -> Vec<u32> {
     // TODO: greedy longest-path walk from root following accepted nodes
     vec![]
 }

@@ -98,32 +98,63 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
 fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::Compile { model, cards, mtp, dflash, dflash2, vision, profile, extra_features, dry_run } => {
-            cmd_compile(&model, &cards, mtp, dflash, dflash2, vision, &profile, extra_features.as_deref(), dry_run)
+        Cmd::Compile {
+            model,
+            cards,
+            mtp,
+            dflash,
+            dflash2,
+            vision,
+            profile,
+            extra_features,
+            dry_run,
+        } => {
+            let feats = CompileFeatures {
+                mtp,
+                dflash,
+                dflash2,
+                vision,
+            };
+            cmd_compile(
+                &model,
+                &cards,
+                &feats,
+                &profile,
+                extra_features.as_deref(),
+                dry_run,
+            )
         }
-        Cmd::Cards  => cmd_cards(),
+        Cmd::Cards => cmd_cards(),
         Cmd::Models => cmd_models(),
     }
 }
 
 // ── compile ────────────────────────────────────────────────────────────────
 
+/// Optional capability flags for a compile.
+struct CompileFeatures {
+    mtp: bool,
+    dflash: bool,
+    dflash2: bool,
+    vision: bool,
+}
+
 fn cmd_compile(
-    model_spec:     &str,
-    cards_raw:      &[String],
-    mtp:            bool,
-    dflash:         bool,
-    dflash2:        bool,
-    vision:         bool,
-    profile:        &str,
+    model_spec: &str,
+    cards_raw: &[String],
+    feats: &CompileFeatures,
+    profile: &str,
     extra_features: Option<&str>,
-    dry_run:        bool,
+    dry_run: bool,
 ) -> Result<()> {
     if cards_raw.is_empty() {
         bail!("--card is required");
@@ -134,18 +165,23 @@ fn cmd_compile(
     let mut card_rows: Vec<(String, String, String)> = Vec::new(); // (card_id, arch, label)
 
     for raw in cards_raw {
-        let card_id  = normalize_card_name(raw);
-        let spec     = card_spec(&card_id);
+        let card_id = normalize_card_name(raw);
+        let spec = card_spec(&card_id);
         let gpu_feat = gpu_arch_to_feature(spec.gpu_arch);
         let vram_str = if spec.vram_gib > 0 {
             format!("{} GiB VRAM", spec.vram_gib)
         } else {
             "shared VRAM".into()
         };
-        let label = format!("{} ({}{})",
+        let label = format!(
+            "{} ({}{})",
             spec.gpu_arch,
             backend_label(spec.gpu_arch),
-            if spec.vram_gib > 0 { format!(" · {vram_str}") } else { String::new() }
+            if spec.vram_gib > 0 {
+                format!(" · {vram_str}")
+            } else {
+                String::new()
+            }
         );
         if !gpu_feat.is_empty() && !gpu_feats.contains(&gpu_feat) {
             gpu_feats.push(gpu_feat);
@@ -154,7 +190,10 @@ fn cmd_compile(
     }
 
     // Detect cross-vendor pair
-    let vendors: Vec<&str> = card_rows.iter().map(|(_, arch, _)| vendor_label(arch)).collect();
+    let vendors: Vec<&str> = card_rows
+        .iter()
+        .map(|(_, arch, _)| vendor_label(arch))
+        .collect();
     let cross_vendor = vendors.windows(2).any(|w| w[0] != w[1]);
 
     // ── Resolve models ───────────────────────────────────────────────────
@@ -172,12 +211,21 @@ fn cmd_compile(
     features.extend_from_slice(&gpu_feats);
     features.extend_from_slice(&model_feats);
     // Capability features
-    if mtp              { features.push("feature-mtp"); }
-    if dflash2          { features.push("feature-dflash2"); }
-    else if dflash      { features.push("feature-dflash"); }
-    if vision           { features.push("feature-vision"); }
+    if feats.mtp {
+        features.push("feature-mtp");
+    }
+    if feats.dflash2 {
+        features.push("feature-dflash2");
+    } else if feats.dflash {
+        features.push("feature-dflash");
+    }
+    if feats.vision {
+        features.push("feature-vision");
+    }
     if let Some(extra) = extra_features {
-        for f in extra.split(',') { features.push(f.trim()); }
+        for f in extra.split(',') {
+            features.push(f.trim());
+        }
     }
     let feature_str = features.join(",");
 
@@ -189,7 +237,10 @@ fn cmd_compile(
         let (id, _, label) = &card_rows[0];
         println!("card     : {id}  →  {label}");
     } else {
-        println!("cards    : (pipeline parallelism — {} GPUs)", card_rows.len());
+        println!(
+            "cards    : (pipeline parallelism — {} GPUs)",
+            card_rows.len()
+        );
         for (i, (id, _, label)) in card_rows.iter().enumerate() {
             println!("  [{i}] {id:<20} → {label}");
         }
@@ -200,9 +251,17 @@ fn cmd_compile(
 
     // Capability summary
     let mut caps: Vec<&str> = Vec::new();
-    if mtp     { caps.push("mtp"); }
-    if dflash2 { caps.push("dflash2"); } else if dflash { caps.push("dflash"); }
-    if vision  { caps.push("vision"); }
+    if feats.mtp {
+        caps.push("mtp");
+    }
+    if feats.dflash2 {
+        caps.push("dflash2");
+    } else if feats.dflash {
+        caps.push("dflash");
+    }
+    if feats.vision {
+        caps.push("vision");
+    }
     if !caps.is_empty() {
         println!("features : {}", caps.join(", "));
     }
@@ -248,7 +307,11 @@ fn cmd_compile(
 fn cmd_cards() -> Result<()> {
     println!("known cards (use these with --card):\n");
     for (card, arch, vram) in KNOWN_CARDS {
-        let vram_s = if *vram > 0 { format!("{vram} GiB") } else { "shared".into() };
+        let vram_s = if *vram > 0 {
+            format!("{vram} GiB")
+        } else {
+            "shared".into()
+        };
         println!("  {card:<20}  {arch:<12}  {vram_s}");
     }
     Ok(())
@@ -273,35 +336,51 @@ fn gpu_arch_to_feature(gpu_arch: &str) -> &'static str {
     match gpu_arch {
         "sm_120" => "cuda-sm120",
         "sm_100" => "cuda-sm100",
-        "sm_90"  => "cuda-sm90",
-        "sm_89"  => "cuda-sm89",
-        "sm_86"  => "cuda-sm86",
-        "sm_80"  => "cuda-sm80",
-        "sm_75"  => "cuda-sm75",
-        "sm_70"  => "cuda-sm70",
-        "rdna4"  => "rocm-rdna4",
-        "rdna3"  => "rocm-rdna3",
-        "rdna2"  => "rocm-rdna2",
-        "cdna3"  => "rocm-cdna3",
-        "cdna2"  => "rocm-cdna2",
-        "metal"  => "metal",
-        "xe2"    => "vulkan-xe2",
+        "sm_90" => "cuda-sm90",
+        "sm_89" => "cuda-sm89",
+        "sm_86" => "cuda-sm86",
+        "sm_80" => "cuda-sm80",
+        "sm_75" => "cuda-sm75",
+        "sm_70" => "cuda-sm70",
+        "rdna4" => "rocm-rdna4",
+        "rdna3" => "rocm-rdna3",
+        "rdna2" => "rocm-rdna2",
+        "cdna3" => "rocm-cdna3",
+        "cdna2" => "rocm-cdna2",
+        "metal" => "metal",
+        "xe2" => "vulkan-xe2",
         "xe_hpg" => "vulkan-xe_hpg",
-        _        => "",  // generic — no GPU feature, scalar fallback only
+        _ => "", // generic — no GPU feature, scalar fallback only
     }
 }
 
 /// Map a model name (HuggingFace style or plain) to the Cargo feature name.
 fn model_to_feature(name: &str) -> Result<&'static str> {
     let lower = name.to_lowercase();
-    if lower.starts_with("qwen") || lower.contains("/qwen")       { return Ok("model-qwen"); }
-    if lower.contains("gemma") || lower.starts_with("google/")    { return Ok("model-gemma"); }
-    if lower.contains("llama") || lower.starts_with("meta")       { return Ok("model-llama"); }
-    if lower.starts_with("mistral") || lower.contains("/mistral") { return Ok("model-mistral"); }
-    if lower.contains("deepseek")                                 { return Ok("model-deepseek"); }
-    if lower.contains("glm")                                      { return Ok("model-glm"); }
-    if lower.contains("minimax")                                  { return Ok("model-minimax"); }
-    if lower.contains("kimi")                                     { return Ok("model-kimi"); }
+    if lower.starts_with("qwen") || lower.contains("/qwen") {
+        return Ok("model-qwen");
+    }
+    if lower.contains("gemma") || lower.starts_with("google/") {
+        return Ok("model-gemma");
+    }
+    if lower.contains("llama") || lower.starts_with("meta") {
+        return Ok("model-llama");
+    }
+    if lower.starts_with("mistral") || lower.contains("/mistral") {
+        return Ok("model-mistral");
+    }
+    if lower.contains("deepseek") {
+        return Ok("model-deepseek");
+    }
+    if lower.contains("glm") {
+        return Ok("model-glm");
+    }
+    if lower.contains("minimax") {
+        return Ok("model-minimax");
+    }
+    if lower.contains("kimi") {
+        return Ok("model-kimi");
+    }
     bail!(
         "unknown model family for '{name}'.\n\
          Run `cargo xtask models` to see supported families, \
@@ -310,60 +389,101 @@ fn model_to_feature(name: &str) -> Result<&'static str> {
 }
 
 fn backend_label(gpu_arch: &str) -> &'static str {
-    if gpu_arch.starts_with("sm_")  { return "NVIDIA CUDA"; }
-    if gpu_arch.starts_with("rdna") || gpu_arch.starts_with("cdna") { return "AMD ROCm"; }
-    if gpu_arch == "metal"           { return "Apple Metal"; }
-    if gpu_arch.starts_with("xe")   { return "Intel oneAPI"; }
+    if gpu_arch.starts_with("sm_") {
+        return "NVIDIA CUDA";
+    }
+    if gpu_arch.starts_with("rdna") || gpu_arch.starts_with("cdna") {
+        return "AMD ROCm";
+    }
+    if gpu_arch == "metal" {
+        return "Apple Metal";
+    }
+    if gpu_arch.starts_with("xe") {
+        return "Intel oneAPI";
+    }
     "generic / CPU scalar"
 }
 
 fn vendor_label(gpu_arch: &str) -> &'static str {
-    if gpu_arch.starts_with("sm_")                                   { return "nvidia"; }
-    if gpu_arch.starts_with("rdna") || gpu_arch.starts_with("cdna") { return "amd"; }
-    if gpu_arch == "metal"                                           { return "apple"; }
-    if gpu_arch.starts_with("xe")                                    { return "intel"; }
+    if gpu_arch.starts_with("sm_") {
+        return "nvidia";
+    }
+    if gpu_arch.starts_with("rdna") || gpu_arch.starts_with("cdna") {
+        return "amd";
+    }
+    if gpu_arch == "metal" {
+        return "apple";
+    }
+    if gpu_arch.starts_with("xe") {
+        return "intel";
+    }
     "generic"
 }
 
 // ── Static info tables ─────────────────────────────────────────────────────
 
 static KNOWN_CARDS: &[(&str, &str, u32)] = &[
-    ("rtx_5090",  "sm_120",  32), ("rtx_5080",  "sm_120",  16),
-    ("rtx_5070_ti","sm_120", 16), ("rtx_5070",  "sm_120",  12),
-    ("rtx_5060_ti","sm_120", 16), ("rtx_5060",  "sm_120",   8),
-    ("rtx_4090",  "sm_89",   24), ("rtx_4080",  "sm_89",   16),
-    ("rtx_3090",  "sm_86",   24), ("rtx_3080",  "sm_86",   10),
-    ("h200",      "sm_90",  141), ("h100",      "sm_90",   80),
-    ("a100",      "sm_80",   80), ("a6000",     "sm_86",   48),
-    ("rx_9900_xtx","rdna4",  32), ("rx_9900_xt","rdna4",   32),
-    ("rx_7900_xtx","rdna3",  24), ("rx_7900_xt","rdna3",   20),
-    ("rx_6900_xt","rdna2",   16), ("rx_6800_xt","rdna2",   16),
-    ("mi350x",    "cdna3",  288), ("mi300x",    "cdna3",  192),
-    ("mi250x",    "cdna2",  128),
-    ("m4_max",    "metal",    0), ("m4_pro",    "metal",   0),
-    ("m4",        "metal",    0), ("m3_max",    "metal",   0),
-    ("m3",        "metal",    0), ("m2_max",    "metal",   0),
-    ("m2",        "metal",    0), ("m1_max",    "metal",   0),
-    ("m1",        "metal",    0),
-    ("b770",      "xe2",     16), ("b580",      "xe2",     12),
-    ("a770",      "xe_hpg",  16), ("a750",      "xe_hpg",   8),
+    ("rtx_5090", "sm_120", 32),
+    ("rtx_5080", "sm_120", 16),
+    ("rtx_5070_ti", "sm_120", 16),
+    ("rtx_5070", "sm_120", 12),
+    ("rtx_5060_ti", "sm_120", 16),
+    ("rtx_5060", "sm_120", 8),
+    ("rtx_4090", "sm_89", 24),
+    ("rtx_4080", "sm_89", 16),
+    ("rtx_3090", "sm_86", 24),
+    ("rtx_3080", "sm_86", 10),
+    ("h200", "sm_90", 141),
+    ("h100", "sm_90", 80),
+    ("a100", "sm_80", 80),
+    ("a6000", "sm_86", 48),
+    ("rx_9900_xtx", "rdna4", 32),
+    ("rx_9900_xt", "rdna4", 32),
+    ("rx_7900_xtx", "rdna3", 24),
+    ("rx_7900_xt", "rdna3", 20),
+    ("rx_6900_xt", "rdna2", 16),
+    ("rx_6800_xt", "rdna2", 16),
+    ("mi350x", "cdna3", 288),
+    ("mi300x", "cdna3", 192),
+    ("mi250x", "cdna2", 128),
+    ("m4_max", "metal", 0),
+    ("m4_pro", "metal", 0),
+    ("m4", "metal", 0),
+    ("m3_max", "metal", 0),
+    ("m3", "metal", 0),
+    ("m2_max", "metal", 0),
+    ("m2", "metal", 0),
+    ("m1_max", "metal", 0),
+    ("m1", "metal", 0),
+    ("b770", "xe2", 16),
+    ("b580", "xe2", 12),
+    ("a770", "xe_hpg", 16),
+    ("a750", "xe_hpg", 8),
 ];
 
 static KNOWN_MODELS: &[(&str, &str, &[&str])] = &[
-    ("Llama 4",           "model-llama",
-     &["meta-llama/Llama-4-Scout", "meta-llama/Llama-4-Maverick"]),
-    ("Qwen 3.5 / Qwen 4", "model-qwen",
-     &["Qwen/Qwen3.5-27B", "Qwen/Qwen4-72B"]),
-    ("Gemma 4",           "model-gemma",
-     &["Google/gemma-4-27b"]),
-    ("Mistral 4",         "model-mistral",
-     &["mistralai/Mistral-4-24B"]),
-    ("DeepSeek-V4",       "model-deepseek",
-     &["deepseek-ai/DeepSeek-V4"]),
-    ("GLM-5 / GLM-DSA",   "model-glm",
-     &["zai-org/GLM-5", "zai-org/GLM-5-DSA"]),
-    ("MiniMax M3",        "model-minimax",
-     &["MiniMax/MiniMax-M3"]),
-    ("Kimi K3",           "model-kimi",
-     &["moonshotai/Kimi-K3"]),
+    (
+        "Llama 4",
+        "model-llama",
+        &["meta-llama/Llama-4-Scout", "meta-llama/Llama-4-Maverick"],
+    ),
+    (
+        "Qwen 3.5 / Qwen 4",
+        "model-qwen",
+        &["Qwen/Qwen3.5-27B", "Qwen/Qwen4-72B"],
+    ),
+    ("Gemma 4", "model-gemma", &["Google/gemma-4-27b"]),
+    ("Mistral 4", "model-mistral", &["mistralai/Mistral-4-24B"]),
+    (
+        "DeepSeek-V4",
+        "model-deepseek",
+        &["deepseek-ai/DeepSeek-V4"],
+    ),
+    (
+        "GLM-5 / GLM-DSA",
+        "model-glm",
+        &["zai-org/GLM-5", "zai-org/GLM-5-DSA"],
+    ),
+    ("MiniMax M3", "model-minimax", &["MiniMax/MiniMax-M3"]),
+    ("Kimi K3", "model-kimi", &["moonshotai/Kimi-K3"]),
 ];

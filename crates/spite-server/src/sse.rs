@@ -20,13 +20,12 @@ pub fn token_stream(
 ) -> impl Stream<Item = Result<Event, std::convert::Infallible>> {
     use tokio_stream::StreamExt as _;
 
-    let id    = completion_id;
-    let model = model;
+    let id = completion_id;
 
     tokens
         .map(move |token| {
             let chunk = ChatCompletionChunk::token(&id, &model, &token);
-            let json  = serde_json::to_string(&chunk).unwrap_or_default();
+            let json = serde_json::to_string(&chunk).unwrap_or_default();
             Ok(Event::default().data(json))
         })
         .chain(tokio_stream::once(Ok(Event::default().data("[DONE]"))))

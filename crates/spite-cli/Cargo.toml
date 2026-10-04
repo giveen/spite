@@ -69,7 +69,17 @@ spite-loader       = { workspace = true }
 spite-dispatch     = { workspace = true }
 spite-offload      = { workspace = true }
 spite-kvcache      = { workspace = true }
+spite-models       = { workspace = true }
+spite-executor     = { workspace = true }
+spite-tokenizer    = { workspace = true }
+spite-sampling     = { workspace = true }
+spite-server       = { workspace = true }
+axum               = { workspace = true }
+tokio              = { workspace = true }
 clap               = { workspace = true }
 anyhow             = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+spite-testkit = { workspace = true }

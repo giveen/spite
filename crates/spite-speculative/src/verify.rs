@@ -17,12 +17,10 @@
 //! This preserves the main model's output distribution exactly —
 //! speculative decoding is lossless, not an approximation.
 
-use spite_abi::{SpiteCtx, SpiteTensor};
-
 /// Result of verifying one batch of draft tokens.
 pub struct VerifyResult {
     /// How many leading tokens were accepted (0 ..= n_draft).
-    pub n_accepted:   usize,
+    pub n_accepted: usize,
     /// Logits for the resampled token at the first rejection position.
     /// If all tokens were accepted this holds the logits for the next token.
     pub bonus_logits: Vec<f32>,
@@ -33,20 +31,23 @@ pub struct VerifyResult {
 /// Called when no `SpiteSpecVerifyFn` kernel is available for the
 /// current GPU architecture.
 pub fn scalar_verify(
-    draft_logits: &[Vec<f32>],  // [n_draft][vocab_size]
-    main_logits:  &[Vec<f32>],  // [n_draft][vocab_size]
+    draft_logits: &[Vec<f32>], // [n_draft][vocab_size]
+    main_logits: &[Vec<f32>],  // [n_draft][vocab_size]
     draft_tokens: &[u32],
-    temperature:  f32,
-    rng:          &mut u64,
+    temperature: f32,
+    rng: &mut u64,
 ) -> VerifyResult {
-    let n = draft_logits.len().min(main_logits.len()).min(draft_tokens.len());
+    let n = draft_logits
+        .len()
+        .min(main_logits.len())
+        .min(draft_tokens.len());
     let mut n_accepted = 0;
     let mut bonus_logits = Vec::new();
 
     for i in 0..n {
         let t = draft_tokens[i] as usize;
         let q = softmax_prob(&draft_logits[i], t, temperature);
-        let p = softmax_prob(&main_logits[i],  t, temperature);
+        let p = softmax_prob(&main_logits[i], t, temperature);
 
         let accept_prob = (p / q.max(1e-10)).min(1.0);
         if lcg_f32(rng) < accept_prob {
@@ -64,33 +65,53 @@ pub fn scalar_verify(
         // TODO: return last main_logits row as bonus when all accepted
     }
 
-    VerifyResult { n_accepted, bonus_logits }
+    VerifyResult {
+        n_accepted,
+        bonus_logits,
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn softmax_prob(logits: &[f32], idx: usize, temperature: f32) -> f32 {
     if temperature <= 0.0 {
-        return if logits.iter().enumerate().max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map_or(false, |(i, _)| i == idx) { 1.0 } else { 0.0 };
+        return if logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .is_some_and(|(i, _)| i == idx)
+        {
+            1.0
+        } else {
+            0.0
+        };
     }
     let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp: Vec<f32> = logits.iter().map(|&l| ((l - max) / temperature).exp()).collect();
+    let exp: Vec<f32> = logits
+        .iter()
+        .map(|&l| ((l - max) / temperature).exp())
+        .collect();
     let sum: f32 = exp.iter().sum();
     exp.get(idx).copied().unwrap_or(0.0) / sum.max(1e-10)
 }
 
 /// max(0, p - q) normalized — the distribution to resample from on rejection.
 fn adjusted_logits(main: &[f32], draft: &[f32]) -> Vec<f32> {
-    let mut adj: Vec<f32> = main.iter().zip(draft.iter())
+    let mut adj: Vec<f32> = main
+        .iter()
+        .zip(draft.iter())
         .map(|(&p, &q)| (p - q).max(0.0))
         .collect();
     let sum: f32 = adj.iter().sum();
-    if sum > 0.0 { adj.iter_mut().for_each(|x| *x /= sum); }
+    if sum > 0.0 {
+        adj.iter_mut().for_each(|x| *x /= sum);
+    }
     adj
 }
 
 fn lcg_f32(state: &mut u64) -> f32 {
-    *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-    ((*state >> 33) as f32) / (u32::MAX as f32)
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    ((*state >> 33) as f32) / 2147483648.0
 }

@@ -20,6 +20,9 @@ spite-loader    = { workspace = true }
 spite-dispatch  = { workspace = true }
 spite-executor  = { workspace = true }
 spite-scheduler = { workspace = true }
+spite-models    = { workspace = true }
+spite-tokenizer = { workspace = true }
+spite-sampling  = { workspace = true }
 
 tokio          = { workspace = true }
 axum           = { workspace = true }

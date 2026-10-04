@@ -28,11 +28,11 @@
 ///             [h_end, w_end) width. Remaining dimensions are unrotated.
 ///             Typical for Qwen-VL: sections = [head_dim/6, head_dim/3, head_dim/2].
 pub fn apply_mrope(
-    qk:       &mut [f32],
-    pos_t:    u32,
-    pos_h:    u32,
-    pos_w:    u32,
-    theta:    f32,
+    qk: &mut [f32],
+    pos_t: u32,
+    pos_h: u32,
+    pos_w: u32,
+    theta: f32,
     sections: [usize; 3],
 ) {
     let head_dim = qk.len(); // for single head; caller loops over heads if needed
@@ -42,17 +42,17 @@ pub fn apply_mrope(
         let half = (end - start) / 2;
         for i in 0..half {
             let dim_idx = start + i;
-            let freq    = 1.0 / theta.powf(2.0 * dim_idx as f32 / head_dim as f32);
-            let angle   = pos as f32 * freq;
+            let freq = 1.0 / theta.powf(2.0 * dim_idx as f32 / head_dim as f32);
+            let angle = pos as f32 * freq;
             let (sin, cos) = angle.sin_cos();
             let x0 = qk[start + i];
             let x1 = qk[start + i + half];
-            qk[start + i]        = x0 * cos - x1 * sin;
+            qk[start + i] = x0 * cos - x1 * sin;
             qk[start + i + half] = x0 * sin + x1 * cos;
         }
     };
 
-    apply_section(0,     t_end, pos_t);
+    apply_section(0, t_end, pos_t);
     apply_section(t_end, h_end, pos_h);
     apply_section(h_end, w_end, pos_w);
     // Dimensions [w_end, head_dim) are left unrotated.

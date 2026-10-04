@@ -28,21 +28,24 @@ pub const DEFAULT_POLL_MS: u64 = 500;
 /// A snapshot of one watched file's mtime.
 #[derive(Debug, Clone)]
 struct FileSnapshot {
-    path:  PathBuf,
+    path: PathBuf,
     mtime: SystemTime,
 }
 
 impl FileSnapshot {
     fn of(path: &Path) -> Option<Self> {
         let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
-        Some(Self { path: path.to_owned(), mtime })
+        Some(Self {
+            path: path.to_owned(),
+            mtime,
+        })
     }
 
     fn changed(&self) -> bool {
         std::fs::metadata(&self.path)
             .ok()
             .and_then(|m| m.modified().ok())
-            .map_or(false, |t| t != self.mtime)
+            .is_some_and(|t| t != self.mtime)
     }
 }
 
@@ -61,23 +64,28 @@ pub struct HotReloadHandle {
 pub fn watch(
     kernels_dir: impl AsRef<Path>,
     _table_lock: Arc<RwLock<DispatchTable>>,
-    poll_ms:     u64,
+    poll_ms: u64,
 ) -> HotReloadHandle {
     let kernels_dir = kernels_dir.as_ref().to_owned();
-    let stop        = Arc::new(());
-    let stop_weak   = Arc::downgrade(&stop);
+    let stop = Arc::new(());
+    let stop_weak = Arc::downgrade(&stop);
 
     std::thread::spawn(move || {
         let mut snapshots: Vec<FileSnapshot> = Vec::new();
         loop {
-            if stop_weak.upgrade().is_none() { break; }
+            if stop_weak.upgrade().is_none() {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(poll_ms));
 
             // Collect current .so paths under kernels_dir.
             let current = collect_so_paths(&kernels_dir);
 
             let any_changed = current.iter().any(|p| {
-                snapshots.iter().find(|s| s.path == *p).map_or(true, |s| s.changed())
+                snapshots
+                    .iter()
+                    .find(|s| s.path == *p)
+                    .is_none_or(|s| s.changed())
             });
 
             if any_changed {
@@ -97,12 +105,17 @@ pub fn watch(
 fn collect_so_paths(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let exts = ["so", "dylib", "dll"];
-    let Ok(rd) = std::fs::read_dir(root) else { return out };
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return out;
+    };
     for entry in rd.flatten() {
         let path = entry.path();
         if path.is_dir() {
             out.extend(collect_so_paths(&path));
-        } else if exts.iter().any(|e| path.extension().map_or(false, |x| x == *e)) {
+        } else if exts
+            .iter()
+            .any(|e| path.extension().is_some_and(|x| x == *e))
+        {
             out.push(path);
         }
     }

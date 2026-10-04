@@ -11,13 +11,17 @@ use crate::ComputeError;
 /// `b`: `[k, n]` row-major
 /// `c`: `[m, n]` row-major, zeroed by caller
 pub fn gemm_f32(
-    a: &[f32], b: &[f32], c: &mut [f32],
-    m: usize, k: usize, n: usize,
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
 ) -> Result<(), ComputeError> {
     if a.len() != m * k || b.len() != k * n || c.len() != m * n {
-        return Err(ComputeError::ShapeMismatch(
-            format!("gemm: A[{m},{k}] × B[{k},{n}] → C[{m},{n}]")
-        ));
+        return Err(ComputeError::ShapeMismatch(format!(
+            "gemm: A[{m},{k}] × B[{k},{n}] → C[{m},{n}]"
+        )));
     }
     for i in 0..m {
         for j in 0..n {
@@ -41,7 +45,9 @@ pub fn gemm_quantized(
     _b_raw: &[u8],
     _b_kind: spite_abi::SpiteType,
     _c: &mut [f32],
-    _m: usize, _k: usize, _n: usize,
+    _m: usize,
+    _k: usize,
+    _n: usize,
 ) -> Result<(), ComputeError> {
     // TODO: call dequant::dequant_to_f32(b_raw, b_kind) → temp_f32
     //       then gemm_f32(a, &temp_f32, c, m, k, n)

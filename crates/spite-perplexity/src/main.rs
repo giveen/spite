@@ -1,12 +1,12 @@
-use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 use spite_perplexity::{KldConfig, PplConfig, Report};
 
 #[derive(Parser)]
 #[command(
-    name  = "spite-perplexity",
+    name = "spite-perplexity",
     about = "PPL and KLD quality tests for spite kernels"
 )]
 struct Cli {
@@ -93,19 +93,24 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let gpu_arch = cli.gpu_arch
-        .unwrap_or_else(spite_dispatch::detect_gpu_arch);
+    let gpu_arch = cli.gpu_arch.unwrap_or_else(spite_dispatch::detect_gpu_arch);
 
     let model = spite_loader::GgufModel::open(&cli.model)?;
 
-    let mut report = Report::new(&gpu_arch, model.arch(), "(see subcommand)");
+    let report = Report::new(&gpu_arch, model.arch(), "(see subcommand)");
 
     match &cli.cmd {
-        Cmd::Ppl { corpus, context_len, stride, max_tokens, .. } => {
+        Cmd::Ppl {
+            corpus,
+            context_len,
+            stride,
+            max_tokens,
+            ..
+        } => {
             let cfg = PplConfig {
                 context_len: *context_len,
-                stride:      *stride,
-                max_tokens:  *max_tokens,
+                stride: *stride,
+                max_tokens: *max_tokens,
             };
             // TODO: load tokenizer, tokenize corpus, wire up forward pass
             println!("PPL evaluation not yet wired to inference loop.");
@@ -113,21 +118,39 @@ fn main() -> Result<()> {
             let _ = cfg;
         }
 
-        Cmd::Kld { candidate, pass_threshold, warn_threshold, top_k, max_positions, corpus, .. } => {
+        Cmd::Kld {
+            candidate,
+            pass_threshold,
+            warn_threshold,
+            top_k,
+            max_positions,
+            corpus,
+            ..
+        } => {
             let cfg = KldConfig {
                 pass_threshold: *pass_threshold,
                 warn_threshold: *warn_threshold,
-                top_k:          *top_k,
-                max_positions:  *max_positions,
+                top_k: *top_k,
+                max_positions: *max_positions,
             };
             println!("KLD evaluation not yet wired to inference loop.");
-            println!("candidate={}, corpus={}", candidate.display(), corpus.display());
+            println!(
+                "candidate={}, corpus={}",
+                candidate.display(),
+                corpus.display()
+            );
             let _ = cfg;
         }
 
-        Cmd::All { candidate, corpus, .. } => {
+        Cmd::All {
+            candidate, corpus, ..
+        } => {
             println!("Full eval (PPL + KLD) not yet wired to inference loop.");
-            println!("candidate={}, corpus={}", candidate.display(), corpus.display());
+            println!(
+                "candidate={}, corpus={}",
+                candidate.display(),
+                corpus.display()
+            );
         }
     }
 
