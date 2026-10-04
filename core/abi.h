@@ -21,7 +21,7 @@
 #  define SPITE_NODISCARD
 #endif
 
-#define SPITE_ABI_VERSION 3
+#define SPITE_ABI_VERSION 4
 
 /* ── Quant type tag ───────────────────────────────────────────────────── */
 
@@ -37,13 +37,87 @@ typedef enum {
     SPITE_TYPE_Q6_K  = 14,
 } SpiteType;
 
+/*
+ * Byte size of the atomic storage unit for each type.
+ *
+ * For full-precision types this is bytes-per-element.
+ * For block-quantised types this is bytes-per-block; the number of
+ * elements per block is given by spite_type_block_elements().
+ * Use byte strides (nb), never element strides — block-quant elements
+ * do not have an integer byte size.
+ */
+static inline uint64_t spite_type_block_bytes(SpiteType t) {
+    switch (t) {
+        case SPITE_TYPE_F32:  return 4;
+        case SPITE_TYPE_F16:  return 2;
+        case SPITE_TYPE_BF16: return 2;
+        case SPITE_TYPE_Q8_0: return 34;   /* 32-elem block: f16 scale + 32×i8 */
+        case SPITE_TYPE_Q5_1: return 24;   /* 32-elem block: f16 d + f16 m + u32 qh + 16×u8 */
+        case SPITE_TYPE_Q4_0: return 18;   /* 32-elem block: f16 scale + 16×u8 */
+        case SPITE_TYPE_Q4_K: return 144;  /* 256-elem super-block */
+        case SPITE_TYPE_Q5_K: return 176;  /* 256-elem super-block */
+        case SPITE_TYPE_Q6_K: return 210;  /* 256-elem super-block */
+        default:              return 0;
+    }
+}
+
+/* Elements per atomic storage block (1 for full-precision types). */
+static inline uint32_t spite_type_block_elements(SpiteType t) {
+    switch (t) {
+        case SPITE_TYPE_Q8_0:
+        case SPITE_TYPE_Q5_1:
+        case SPITE_TYPE_Q4_0: return 32;
+        case SPITE_TYPE_Q4_K:
+        case SPITE_TYPE_Q5_K:
+        case SPITE_TYPE_Q6_K: return 256;
+        default:              return 1;
+    }
+}
+
 /* ── Tensor ───────────────────────────────────────────────────────────── */
 
+/*
+ * Tensor view. `data` may point into a mmap'd GGUF buffer (weights) or a
+ * GPU/CPU activation buffer. Kernels must not free it.
+ *
+ * nb[] are BYTE strides per dimension:
+ *   nb[0] = spite_type_block_bytes(kind)          (bytes per block/element)
+ *   nb[1] = nb[0] * (ne[0] / block_elements)      (bytes per row)
+ *   nb[2] = nb[1] * ne[1]                         (bytes per matrix)
+ *   nb[3] = nb[2] * ne[2]                         (bytes per batch)
+ *
+ * A contiguous tensor satisfies the above equalities for every dimension
+ * where ne[i] > 1. The executor guarantees that all tensors passed to
+ * external kernel .so files are contiguous; use spite_tensor_is_contiguous()
+ * to assert this at kernel entry during development.
+ */
 typedef struct {
-    void*    data;      /* pointer into mmap'd GGUF buffer — do not free */
-    uint32_t ne[4];     /* ne[0]=cols, ne[1]=rows, ... */
+    void*     data;     /* pointer into GGUF buffer or activation buffer */
+    uint32_t  ne[4];    /* ne[0]=cols, ne[1]=rows, ne[2]=matrices, ne[3]=batch */
+    uint64_t  nb[4];    /* byte strides — see comment above */
     SpiteType kind;
 } SpiteTensor;
+
+/* True iff the tensor's strides are tightly packed (no padding, no transposition). */
+static inline bool spite_tensor_is_contiguous(const SpiteTensor* t) {
+    if (t->nb[0] == 0) return true;
+    uint64_t blk  = (uint64_t)spite_type_block_elements(t->kind);
+    uint64_t row  = t->nb[0] * ((uint64_t)t->ne[0] / blk);
+    if (t->ne[1] > 1 && t->nb[1] != row)                            return false;
+    if (t->ne[2] > 1 && t->nb[2] != t->nb[1] * (uint64_t)t->ne[1]) return false;
+    if (t->ne[3] > 1 && t->nb[3] != t->nb[2] * (uint64_t)t->ne[2]) return false;
+    return true;
+}
+
+/* Compute contiguous strides for a freshly-allocated tensor. */
+static inline void spite_contiguous_strides(SpiteType kind, const uint32_t ne[4],
+                                             uint64_t nb_out[4]) {
+    uint64_t blk = (uint64_t)spite_type_block_elements(kind);
+    nb_out[0] = spite_type_block_bytes(kind);
+    nb_out[1] = nb_out[0] * ((uint64_t)ne[0] / blk > 0 ? (uint64_t)ne[0] / blk : 1);
+    nb_out[2] = nb_out[1] * (uint64_t)ne[1];
+    nb_out[3] = nb_out[2] * (uint64_t)ne[2];
+}
 
 /* ── Inference context ────────────────────────────────────────────────── */
 

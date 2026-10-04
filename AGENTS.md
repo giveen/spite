@@ -122,7 +122,7 @@ in the root `Cargo.toml` and reference it with `{ workspace = true }` in the cra
 kernel. If you change any `#[repr(C)]` type, any function pointer signature in
 `SpiteKernelInfo`, or add/remove a field from `SpiteCtx`:
 
-1. Increment `ABI_VERSION` (currently `3`).
+1. Increment `ABI_VERSION` (currently `4`).
 2. List in the PR description which kernel `.so` files will silently break if not recompiled.
 3. Kernel CI jobs run on the same PR to catch this automatically when path filters match.
 
