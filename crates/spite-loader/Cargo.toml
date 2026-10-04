@@ -10,3 +10,6 @@ repository.workspace = true
 spite-abi  = { workspace = true }
 memmap2    = { workspace = true }
 thiserror  = { workspace = true }
+
+[dev-dependencies]
+spite-testkit = { workspace = true }

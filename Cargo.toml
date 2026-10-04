@@ -25,6 +25,7 @@ members = [
     "crates/spite-parallel",
     "crates/spite-plugin",
     "crates/spite-offload",
+    "crates/spite-testkit",
     "xtask",
 ]
 
@@ -60,7 +61,9 @@ spite-bench       = { path = "crates/spite-bench" }
 spite-parallel    = { path = "crates/spite-parallel" }
 spite-plugin      = { path = "crates/spite-plugin" }
 spite-offload     = { path = "crates/spite-offload" }
+spite-testkit     = { path = "crates/spite-testkit" }
 
+tempfile    = "3"
 memmap2     = "0.9"
 libloading  = "0.8"
 clap        = { version = "4", features = ["derive", "env"] }

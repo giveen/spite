@@ -84,4 +84,9 @@ impl ModelHyperparams {
             norm_eps,
         }
     }
+
+    /// Convenience: extract hyperparams directly from an open `GgufModel`.
+    pub fn from_gguf(model: &crate::GgufModel) -> Self {
+        Self::from_meta(model.arch(), &model.meta)
+    }
 }

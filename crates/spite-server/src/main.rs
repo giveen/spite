@@ -7,11 +7,7 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-mod api;
-mod state;
-mod sse;
-
-pub use state::AppState;
+use spite_server::{AppState, api};
 
 #[derive(Parser)]
 #[command(name = "spite-server", about = "OpenAI-compatible LLM inference server")]

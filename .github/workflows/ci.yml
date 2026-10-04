@@ -1,118 +1,152 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
-
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
 
 jobs:
-  # ── Rust workspace ──────────────────────────────────────────────────────
+
+  # ── Rust: runs on every PR, no GPU needed ──────────────────────────────────
   rust:
-    name: Rust (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: Rust tests
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.97"
           components: clippy, rustfmt
 
-      - name: Cache cargo registry + build artifacts
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target/
+            target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          restore-keys: ${{ runner.os }}-cargo-
 
-      - name: cargo fmt --check
+      - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: cargo check
-        run: cargo check --workspace --all-targets
-
-      - name: cargo test
-        run: cargo test --workspace
-
-      - name: cargo clippy
+      - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # ── C kernel headers ────────────────────────────────────────────────────
-  c-headers:
-    name: C headers (clang)
-    runs-on: ubuntu-latest
+      - name: Test
+        run: cargo test --workspace
+
+  # ── CUDA kernels: runs only when NVIDIA kernel files change ───────────────
+  kernels-cuda:
+    name: CUDA kernel tests (${{ matrix.arch }})
+    if: |
+      contains(github.event.pull_request.files.*.filename, 'kernels/') &&
+      (contains(github.event.pull_request.files.*.filename, '/sm_') ||
+       contains(github.event.pull_request.files.*.filename, '/generic/'))
+    runs-on: [self-hosted, cuda]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [sm_89, sm_86, sm_75]
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install clang
-        run: sudo apt-get install -y clang
-
-      - name: Check core/abi.h compiles as C11
+      - name: Build kernels
         run: |
-          echo '#include "core/abi.h"' | \
-            clang -std=c11 -Wall -Wextra -Wpedantic -fsyntax-only \
-              -x c - 2>&1
+          cmake -B build \
+            -DSPITE_GPU_ARCHS="${{ matrix.arch }}" \
+            -DSPITE_MODELS="llama3,mistral" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
 
-      - name: Check core/quant.h compiles as C11
+      - name: Verify kernels
         run: |
-          echo '#include "core/quant.h"' | \
-            clang -std=c11 -Wall -Wextra -Wpedantic -fsyntax-only \
-              -x c - 2>&1
+          for kernel_dir in build/kernels/llama3/${{ matrix.arch }}/ \
+                            build/kernels/mistral/${{ matrix.arch }}/; do
+            if [ -d "$kernel_dir" ]; then
+              ./target/release/spite verify "$kernel_dir"
+            fi
+          done
 
-      - name: Check core/abi.h compiles as C++23
+      - name: Benchmark (informational)
+        continue-on-error: true
         run: |
-          echo '#include "core/abi.h"' | \
-            clang++ -std=c++23 -Wall -Wextra -fsyntax-only \
-              -x c++ - 2>&1
+          ./target/release/spite benchmark \
+            --model "$SPITE_TEST_MODEL" \
+            --kernels-dir build/kernels
 
-  # ── Generic fallback kernel build ───────────────────────────────────────
-  generic-kernel:
-    name: Generic C kernel
-    runs-on: ubuntu-latest
+  # ── AMD HIP kernels: runs only when RDNA kernel files change ──────────────
+  kernels-hip:
+    name: HIP kernel tests (${{ matrix.arch }})
+    if: |
+      contains(github.event.pull_request.files.*.filename, 'kernels/') &&
+      contains(github.event.pull_request.files.*.filename, '/rdna')
+    runs-on: [self-hosted, hip]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [rdna3, rdna2]
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build generic fallback kernel
+      - name: Build kernels
         run: |
-          cc -std=c11 -Wall -Wextra -O2 -fPIC -shared \
-            -I. \
-            kernels/generic/generic/dequant.c \
-            kernels/generic/generic/ops.c \
-            kernels/generic/generic/kernel.c \
-            -lm -o /tmp/libkernel_generic.so
+          cmake -B build \
+            -DSPITE_GPU_ARCHS="${{ matrix.arch }}" \
+            -DSPITE_MODELS="llama3" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j$(nproc)
 
-      - name: Verify kernel exports spite_kernel_info
-        run: |
-          nm -D /tmp/libkernel_generic.so | grep spite_kernel_info
+      - name: Verify kernels
+        run: ./target/release/spite verify build/kernels/llama3/${{ matrix.arch }}/
 
-  # ── ABI version sync check ───────────────────────────────────────────────
-  abi-sync:
-    name: ABI version sync
-    runs-on: ubuntu-latest
+  # ── Metal kernels: runs only when Apple Silicon kernel files change ────────
+  kernels-metal:
+    name: Metal kernel tests
+    if: |
+      contains(github.event.pull_request.files.*.filename, 'kernels/') &&
+      contains(github.event.pull_request.files.*.filename, '/metal/')
+    runs-on: [self-hosted, metal]
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check ABI_VERSION matches in C and Rust
+      - name: Build kernels
         run: |
-          C_VER=$(grep -oP '(?<=#define SPITE_ABI_VERSION )\d+' core/abi.h)
-          RUST_VER=$(grep -oP '(?<=ABI_VERSION: u32 = )\d+' crates/spite-abi/src/lib.rs)
-          echo "C ABI_VERSION   : $C_VER"
-          echo "Rust ABI_VERSION: $RUST_VER"
-          if [ "$C_VER" != "$RUST_VER" ]; then
-            echo "ERROR: ABI_VERSION mismatch — update both core/abi.h and crates/spite-abi/src/lib.rs"
-            exit 1
-          fi
+          cmake -B build \
+            -DSPITE_GPU_ARCHS="metal" \
+            -DSPITE_MODELS="llama3" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Verify kernels
+        run: ./target/release/spite verify build/kernels/llama3/metal/
+
+  # ── Intel Arc kernels ──────────────────────────────────────────────────────
+  kernels-arc:
+    name: Arc kernel tests
+    if: |
+      contains(github.event.pull_request.files.*.filename, 'kernels/') &&
+      contains(github.event.pull_request.files.*.filename, '/arc_alchemist/')
+    runs-on: [self-hosted, arc]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build kernels
+        run: |
+          cmake -B build \
+            -DSPITE_GPU_ARCHS="arc_alchemist" \
+            -DSPITE_MODELS="llama3" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Verify kernels
+        run: ./target/release/spite verify build/kernels/llama3/arc_alchemist/

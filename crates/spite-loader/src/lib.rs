@@ -49,7 +49,7 @@ struct TensorRecord {
 pub struct GgufModel {
     _file: File,
     mmap:  Mmap,
-    meta:  HashMap<String, MetaValue>,
+    pub(crate) meta: HashMap<String, MetaValue>,
     tensors: HashMap<String, TensorRecord>,
     data_offset: u64,
 }
