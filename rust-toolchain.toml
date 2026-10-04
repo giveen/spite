@@ -1,3 +1,7 @@
 [toolchain]
 channel  = "1.97"
 profile  = "minimal"
+# `minimal` omits rustfmt and clippy, and this file overrides the components
+# requested by CI's rust-toolchain action -- leaving `cargo fmt`/clippy
+# unavailable and failing every run at the format-check step.
+components = ["rustfmt", "clippy"]
