@@ -35,6 +35,9 @@ pub struct FlashAttnConfig {
     pub scale: f32,
     /// Causal mask (lower-triangular): each query attends only to earlier KV.
     pub causal: bool,
+    /// Per-head attention sinks (llama.cpp `attn_sinks`): an extra logit
+    /// with zero value mass. None = no sinks.
+    pub sinks: Option<Vec<f32>>,
 }
 
 impl FlashAttnConfig {
@@ -53,6 +56,7 @@ impl FlashAttnConfig {
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
             causal: true,
+            sinks: None,
         }
     }
 }
@@ -79,6 +83,7 @@ pub fn scalar_attention(
         head_dim,
         scale,
         causal,
+        ..
     } = cfg;
 
     let kv_groups = n_heads / n_kv_heads; // GQA group size
@@ -114,9 +119,14 @@ pub fn scalar_attention(
                 *s = dot * scale;
             }
 
-            // Softmax over scores.
-            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum = 0f32;
+            // Softmax over scores (+ sink logit with zero value mass).
+            let sink = cfg
+                .sinks
+                .as_ref()
+                .map(|s| s[h])
+                .unwrap_or(f32::NEG_INFINITY);
+            let max = scores.iter().cloned().fold(sink, f32::max);
+            let mut sum = (sink - max).exp();
             for s in scores.iter_mut() {
                 *s = (*s - max).exp();
                 sum += *s;

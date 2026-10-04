@@ -59,25 +59,33 @@ pub fn apply_rope(qk: &mut [f32], pos: u32, cfg: &RopeConfig) -> Result<(), Rope
     if !d.is_multiple_of(2) {
         return Err(RopeError::OddHeadDim(d));
     }
-    let n_heads = qk.len() / d;
     let theta_scale = match cfg.variant {
         RopeVariant::Linear { scale } => scale,
         RopeVariant::Yarn { scale, .. } => scale,
         _ => 1.0,
     };
-    for h in 0..n_heads {
-        let base = h * d;
-        for i in 0..d / 2 {
-            let freq = 1.0 / (cfg.theta * theta_scale).powf(2.0 * i as f32 / d as f32);
-            let angle = pos as f32 * freq;
-            let (sin, cos) = angle.sin_cos();
-            let x0 = qk[base + i];
-            let x1 = qk[base + i + d / 2];
-            qk[base + i] = x0 * cos - x1 * sin;
-            qk[base + i + d / 2] = x0 * sin + x1 * cos;
-        }
-    }
+    rope_range(qk, pos, 0, d, cfg.theta * theta_scale, false);
     Ok(())
+}
+
+/// Rotate pairs in `[offset, offset+n_dims)` by `pos`-dependent angles
+/// (neox half-split layout: pairs are `(i, i+n_dims/2)`); pairs outside
+/// the range are untouched. `invert` rotates back (llama.cpp
+/// `rope_ext_back`, used to derope MLA outputs).
+pub fn rope_range(x: &mut [f32], pos: u32, offset: usize, n_dims: usize, theta: f32, invert: bool) {
+    let half = n_dims / 2;
+    for i in 0..half {
+        let freq = 1.0 / theta.powf(2.0 * i as f32 / n_dims as f32);
+        let mut angle = pos as f32 * freq;
+        if invert {
+            angle = -angle;
+        }
+        let (sin, cos) = angle.sin_cos();
+        let x0 = x[offset + i];
+        let x1 = x[offset + i + half];
+        x[offset + i] = x0 * cos - x1 * sin;
+        x[offset + i + half] = x0 * sin + x1 * cos;
+    }
 }
 
 /// Interleaved RoPE (llama.cpp `IMROPE`, Qwen3.5/Qwen4-style).
@@ -104,9 +112,10 @@ pub fn apply_irope(
     let s2 = sections[2] as usize;
     let s0 = sections[0] as usize;
     let n_heads = x.len() / head_dim;
+    let half = n_dims / 2;
     for h in 0..n_heads {
         let base = h * head_dim;
-        for p in 0..n_dims / 2 {
+        for p in 0..half {
             let sector = p % sect;
             // Interleaved sector → position mapping (ggml mrope cache init).
             let position = if sector % 3 == 1 && sector < 3 * s1 {
@@ -121,9 +130,9 @@ pub fn apply_irope(
             let freq = 1.0 / theta.powf(2.0 * p as f32 / n_dims as f32);
             let (sin, cos) = (position as f32 * freq).sin_cos();
             let x0 = x[base + p];
-            let x1 = x[base + p + n_dims / 2];
+            let x1 = x[base + p + half];
             x[base + p] = x0 * cos - x1 * sin;
-            x[base + p + n_dims / 2] = x0 * sin + x1 * cos;
+            x[base + p + half] = x0 * sin + x1 * cos;
         }
     }
 }

@@ -27,6 +27,8 @@ pub enum GatingFunc {
     #[default]
     Sigmoid,
     Softmax,
+    /// `sqrt(softplus(x))` — DeepSeek V4.
+    SqrtSoftplus,
 }
 
 /// Expert FFN activation.
@@ -132,6 +134,9 @@ pub fn moe_forward(
                     let exps: Vec<f32> = biased.iter().map(|&l| (l - max).exp()).collect();
                     let sum: f32 = exps.iter().sum();
                     exps.iter().map(|&e| e / sum.max(1e-30)).collect()
+                }
+                GatingFunc::SqrtSoftplus => {
+                    biased.iter().map(|&l| l.ln_1p().exp().sqrt()).collect()
                 }
             };
             let mut idx: Vec<usize> = (0..n_expert).collect();

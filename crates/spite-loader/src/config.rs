@@ -85,6 +85,18 @@ pub struct ModelHyperparams {
     /// Per-layer kv-head counts when stored as an array (kimi-style
     /// recurrent marking: 0 kv heads = recurrent layer).
     pub head_count_kv_arr: Vec<u32>,
+    /// DeepSeek-V4 hyper-connections (0 = unused).
+    pub hc_mult: u32,
+    pub hc_eps: f32,
+    pub hc_sinkhorn_iters: u32,
+    /// Grouped MLA output projection.
+    pub o_group_count: u32,
+    pub o_lora_rank: u32,
+    /// Per-layer sparse compression ratios (0 = dense raw attention).
+    pub compress_ratios: Vec<u32>,
+    pub compress_rope_base: f32,
+    /// Shared experts (deepseek4-style fine-grained MoE).
+    pub n_expert_shared: u32,
 }
 
 impl ModelHyperparams {
@@ -254,6 +266,24 @@ impl ModelHyperparams {
                     .collect(),
                 _ => Vec::new(),
             },
+            hc_mult: u("hyper_connection.count"),
+            hc_eps: f("hyper_connection.epsilon"),
+            hc_sinkhorn_iters: u("hyper_connection.sinkhorn_iterations"),
+            o_group_count: u("attention.output_group_count"),
+            o_lora_rank: u("attention.output_lora_rank"),
+            compress_ratios: match meta.get(&format!("{arch}.attention.compress_ratios")) {
+                Some(crate::MetaValue::Array(items)) => items
+                    .iter()
+                    .map(|v| match v {
+                        crate::MetaValue::U32(x) => *x,
+                        crate::MetaValue::I32(x) => *x as u32,
+                        _ => 0,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+            compress_rope_base: f("attention.compress_rope_freq_base"),
+            n_expert_shared: u("expert_shared_count"),
         }
     }
 

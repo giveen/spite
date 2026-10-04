@@ -103,6 +103,14 @@ pub struct ModelConfig {
     pub situ_beta: f32,
     pub situ_linear_beta: f32,
     pub head_count_kv_arr: Vec<usize>,
+    pub hc_mult: usize,
+    pub hc_eps: f32,
+    pub hc_sinkhorn_iters: usize,
+    pub o_group_count: usize,
+    pub o_lora_rank: usize,
+    pub compress_ratios: Vec<usize>,
+    pub compress_rope_base: f32,
+    pub n_expert_shared: usize,
 
     // ── RoPE scaling (YaRN / linear / NTK) ───────────────────────────────
     /// Multiplicative rope scale factor. 1.0 = no scaling (default).
@@ -181,6 +189,14 @@ impl Default for ModelConfig {
             situ_beta: 0.0,
             situ_linear_beta: 0.0,
             head_count_kv_arr: Vec::new(),
+            hc_mult: 0,
+            hc_eps: 0.0,
+            hc_sinkhorn_iters: 0,
+            o_group_count: 0,
+            o_lora_rank: 0,
+            compress_ratios: Vec::new(),
+            compress_rope_base: 0.0,
+            n_expert_shared: 0,
             rope_scale_factor: 1.0,
             rope_original_ctx: 0,
             yarn_beta_fast: 32.0,
@@ -233,6 +249,14 @@ impl From<spite_loader::config::ModelHyperparams> for ModelConfig {
             situ_beta: h.situ_beta,
             situ_linear_beta: h.situ_linear_beta,
             head_count_kv_arr: h.head_count_kv_arr.iter().map(|&x| x as usize).collect(),
+            hc_mult: h.hc_mult as usize,
+            hc_eps: h.hc_eps,
+            hc_sinkhorn_iters: h.hc_sinkhorn_iters as usize,
+            o_group_count: h.o_group_count as usize,
+            o_lora_rank: h.o_lora_rank as usize,
+            compress_ratios: h.compress_ratios.iter().map(|&x| x as usize).collect(),
+            compress_rope_base: h.compress_rope_base,
+            n_expert_shared: h.n_expert_shared as usize,
             ..Default::default()
         }
     }
