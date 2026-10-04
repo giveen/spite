@@ -104,19 +104,93 @@ the combination you actually use. The fallback covers everything else.
 
 ---
 
-## GPU architecture reference
+## Supported hardware
 
-| Architecture  | Cards                               | Build flag         |
-|---------------|-------------------------------------|--------------------|
-| sm_89         | RTX 4060–4090, RTX 4000 Ada         | `sm_89`            |
-| sm_86         | RTX 3060–3090, RTX A series         | `sm_86`            |
-| sm_75         | RTX 2060–2080 Ti, GTX 1660 Ti+      | `sm_75`            |
-| rdna3         | RX 7600–7900 XTX                    | `rdna3`            |
-| rdna2         | RX 6600–6950 XT                     | `rdna2`            |
-| arc_alchemist | Intel Arc A series                  | `arc_alchemist`    |
-| metal         | Apple M1 / M2 / M3 / M4             | `metal`            |
+Every card listed here runs today via the generic fallback. Tuned kernels exist
+where the community has contributed them; all other cards fall back to the
+generic CPU path automatically — slower, but always correct.
 
-Not sure which you have? Run `spite benchmark` — it detects and prints it.
+### NVIDIA
+
+| Architecture | Build flag | Cards |
+|---|---|---|
+| Ada Lovelace | `sm_89` | RTX 4090, RTX 4080 Super / 4080, RTX 4070 Ti Super / 4070 Ti / 4070 Super / 4070, RTX 4060 Ti / 4060, RTX 4000 / 5000 / 6000 Ada |
+| Ampere | `sm_86` | RTX 3090 Ti / 3090 / 3080 Ti / 3080 / 3070 Ti / 3070 / 3060 Ti / 3060, RTX A2000–A6000 |
+| Turing | `sm_75` | RTX 2080 Ti / 2080 Super / 2080 / 2070 Super / 2070 / 2060 Super / 2060, GTX 1660 Ti / 1660 Super / 1660 |
+| Blackwell *(planned)* | `sm_120` | RTX 5090 / 5080 / 5070 Ti / 5070 / 5060 Ti |
+
+### AMD
+
+| Architecture | Build flag | Cards |
+|---|---|---|
+| RDNA 4 *(planned)* | `rdna4` | RX 9070 XT / 9070 / 9060 XT |
+| RDNA 3 | `rdna3` | RX 7900 XTX / 7900 XT / 7900 GRE, RX 7800 XT, RX 7700 XT, RX 7600 XT / 7600 |
+| RDNA 2 | `rdna2` | RX 6950 XT / 6900 XT / 6800 XT / 6800, RX 6700 XT / 6650 XT / 6600 XT / 6600 |
+| RDNA 1 *(planned)* | `rdna1` | RX 5700 XT / 5700 / 5600 XT / 5500 XT |
+
+### Intel
+
+| Architecture | Build flag | Cards |
+|---|---|---|
+| Arc Battlemage *(planned)* | `arc_battlemage` | Arc B580 / B570 |
+| Arc Alchemist | `arc_alchemist` | Arc A770 / A750 / A580 / A380 / A310 |
+
+### Apple Silicon
+
+| Architecture | Build flag | Chips |
+|---|---|---|
+| Metal | `metal` | M1 / M1 Pro / Max / Ultra, M2 / M2 Pro / Max / Ultra, M3 / M3 Pro / Max, M4 / M4 Pro / Max |
+
+Not sure which architecture you have? Run `spite benchmark` — it detects and prints it.
+
+---
+
+## Modular by design
+
+spite is built on a single rule: **every layer is replaceable without touching any other layer.**
+
+That sounds abstract, so here's what it means in practice:
+
+### Every model is its own module
+
+Llama 3, Mistral, Phi-3, Qwen, DeepSeek — each lives in its own folder inside
+`kernels/`. Adding a new model means adding a new folder. Nothing about the
+existing models changes. The dispatcher finds it automatically.
+
+### Every GPU is its own module
+
+`kernels/llama3/sm_89/` is completely separate from `kernels/llama3/rdna3/`.
+An RTX 4090 kernel can use FP8 tensor cores. An RX 7900 XTX kernel can exploit
+96 MB of Infinity Cache. An Apple M4 kernel can use the Neural Engine. Each gets
+what makes it fast, not a watered-down kernel that has to work on everything.
+
+### Every operation is independently tunable
+
+Kernels don't have to implement everything. A kernel that only optimizes
+attention leaves FFN and rms_norm to the fallback. You tune the one op that's
+your bottleneck. Later, someone else improves FFN. Both improvements stack
+automatically — the dispatcher picks the best available kernel for each op
+on each GPU.
+
+### Every subsystem is swappable
+
+The sampler, tokenizer, KV cache backend, and offload policy are all
+plugin registries. Register a custom sampler for a specific model or task
+and the engine uses it. Register a custom KV cache for a memory-constrained
+deployment and the scheduler uses it. Nothing needs to be forked.
+
+```rust
+let engine = EngineBuilder::new()
+    .with_sampler(PluginKey::for_model("llama3"), Box::new(MyGreedySampler))
+    .with_cache(PluginKey::default(), Box::new(PagedKvCache::new(vram)))
+    .build(ExecutorConfig::default());
+```
+
+### Every component is usable standalone
+
+spite is a Rust workspace. You can use just the loader, just the scheduler,
+or just the ABI types for kernel development — without pulling in the full
+server stack. Build what you need from the pieces that fit.
 
 ---
 
@@ -251,7 +325,8 @@ spite run / spite-server
 
 Every component is an independent crate. You can use the scheduler without
 the server, the loader without the executor, or just the ABI types for kernel
-development.
+development. See [docs/architecture.md](docs/architecture.md) for the full
+dependency graph and data flow.
 
 ---
 
@@ -266,6 +341,8 @@ development.
   It's slower, not broken.
 - **No cloud, no telemetry.** spite doesn't phone home. It runs on your hardware,
   reads your files, and that's it.
+- **Replace anything.** Sampler, tokenizer, KV cache, offload policy — every
+  subsystem is a plugin registry. Swap out any piece without forking the project.
 
 ---
 
@@ -277,9 +354,10 @@ development.
 - [ ] Vision models (LLaVA, InternVL, Qwen-VL)
 - [ ] Quantization tools (`spite quantize` — convert f16 → Q4_K_M locally)
 - [ ] Windows support
+- [ ] Blackwell (sm_120) and RDNA 4 kernel templates
 
 ---
 
 ## License
 
-MIT OR Apache-2.0 — your choice.
+Apache 2.0. See [LICENSE](LICENSE).
