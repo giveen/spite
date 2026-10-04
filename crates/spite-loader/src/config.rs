@@ -57,6 +57,16 @@ pub struct ModelHyperparams {
     /// `full_attention_interval` (every Nth layer is full attention).
     pub recurrent_layers: Vec<bool>,
     pub full_attention_interval: u32,
+    /// MoE geometry (0 experts = dense arch).
+    pub n_expert: u32,
+    pub n_expert_used: u32,
+    pub moe_layer_step: u32,
+    pub expert_weights_scale: f32,
+    /// Per-layer SWA flags (llama4-style chunked pattern fallback).
+    pub swa_layers: Vec<bool>,
+    /// Per-layer SwiGLU clamp limits (0 = no clamp).
+    pub swiglu_clamp_exp: Vec<f32>,
+    pub swiglu_clamp_shexp: Vec<f32>,
 }
 
 impl ModelHyperparams {
@@ -99,6 +109,19 @@ impl ModelHyperparams {
             if v == 0.0 { 1e-5 } else { v }
         };
 
+        let f32_arr = |key: &String| -> Vec<f32> {
+            match meta.get(key) {
+                Some(crate::MetaValue::Array(items)) => items
+                    .iter()
+                    .map(|v| match v {
+                        crate::MetaValue::F32(x) => *x,
+                        crate::MetaValue::F64(x) => *x as f32,
+                        _ => 0.0,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
         let arr4 = |suffix: &str| -> [u32; 4] {
             let key = format!("{arch}.{suffix}");
             let mut out = [0u32; 4];
@@ -155,6 +178,31 @@ impl ModelHyperparams {
             rope_sections: arr4("rope.dimension_sections"),
             recurrent_layers,
             full_attention_interval: u("full_attention_interval"),
+            n_expert: u("expert_count"),
+            n_expert_used: u("expert_used_count"),
+            moe_layer_step: u("interleave_moe_layer_step"),
+            expert_weights_scale: f("expert_weights_scale"),
+            swa_layers: {
+                let key = format!("{arch}.attention.sliding_window_pattern");
+                match meta.get(&key) {
+                    Some(crate::MetaValue::Array(items)) => items
+                        .iter()
+                        .map(|v| match v {
+                            crate::MetaValue::Bool(b) => *b,
+                            crate::MetaValue::U32(x) => *x != 0,
+                            crate::MetaValue::I32(x) => *x != 0,
+                            _ => false,
+                        })
+                        .collect(),
+                    _ => {
+                        // Chunked pattern fallback (llama4): 3 SWA + 1 full.
+                        let sw = u("attention.sliding_window") > 0;
+                        (0..n_layers).map(|i| sw && i % 4 < 3).collect()
+                    }
+                }
+            },
+            swiglu_clamp_exp: f32_arr(&format!("{arch}.swiglu_clamp_exp")),
+            swiglu_clamp_shexp: f32_arr(&format!("{arch}.swiglu_clamp_shexp")),
         }
     }
 

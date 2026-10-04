@@ -29,6 +29,7 @@ pub mod llama;
 pub mod mellum;
 pub mod minimax;
 pub mod mistral;
+pub mod moe;
 pub mod qwen;
 
 use spite_abi::SpiteCtx;
@@ -76,6 +77,16 @@ pub struct ModelConfig {
     pub rope_sections: [u32; 4],
     /// Per-layer recurrent flags for hybrid archs.
     pub recurrent_layers: Vec<bool>,
+    /// MoE geometry (0 experts = dense arch).
+    pub n_expert: usize,
+    pub n_expert_used: usize,
+    pub moe_layer_step: usize,
+    pub expert_weights_scale: f32,
+    /// Per-layer SWA flags (llama4-style chunked pattern fallback).
+    pub swa_layers: Vec<bool>,
+    /// Per-layer SwiGLU clamp limits (empty = no clamp).
+    pub swiglu_clamp_exp: Vec<f32>,
+    pub swiglu_clamp_shexp: Vec<f32>,
 
     // ── RoPE scaling (YaRN / linear / NTK) ───────────────────────────────
     /// Multiplicative rope scale factor. 1.0 = no scaling (default).
@@ -132,6 +143,13 @@ impl Default for ModelConfig {
             ssm_n_group: 0,
             rope_sections: [0; 4],
             recurrent_layers: Vec::new(),
+            n_expert: 0,
+            n_expert_used: 0,
+            moe_layer_step: 0,
+            expert_weights_scale: 0.0,
+            swa_layers: Vec::new(),
+            swiglu_clamp_exp: Vec::new(),
+            swiglu_clamp_shexp: Vec::new(),
             rope_scale_factor: 1.0,
             rope_original_ctx: 0,
             yarn_beta_fast: 32.0,
@@ -162,6 +180,13 @@ impl From<spite_loader::config::ModelHyperparams> for ModelConfig {
             ssm_n_group: h.ssm_n_group as usize,
             rope_sections: h.rope_sections,
             recurrent_layers: h.recurrent_layers,
+            n_expert: h.n_expert as usize,
+            n_expert_used: h.n_expert_used as usize,
+            moe_layer_step: h.moe_layer_step as usize,
+            expert_weights_scale: h.expert_weights_scale,
+            swa_layers: h.swa_layers,
+            swiglu_clamp_exp: h.swiglu_clamp_exp,
+            swiglu_clamp_shexp: h.swiglu_clamp_shexp,
             ..Default::default()
         }
     }
