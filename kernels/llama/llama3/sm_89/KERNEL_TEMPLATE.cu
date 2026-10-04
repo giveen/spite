@@ -3,14 +3,20 @@
 //
 // HOW TO USE THIS FILE
 // ────────────────────
-// 1. cp kernels/llama3/sm_89/KERNEL_TEMPLATE.cu \
-//       kernels/llama3/<your_gpu>/<op_name>.cu
+// 1. cp kernels/llama/llama3/sm_89/KERNEL_TEMPLATE.cu \
+//       kernels/llama/llama3/<your_gpu>/<op_name>.cu
 // 2. Change gpu_arch in KERNEL_INFO at the bottom.
 // 3. Implement one op. Leave the rest returning -1 — the dispatcher
 //    uses the fallback for those.
-// 4. spite verify kernels/llama3/<arch>/your_file.cu
-// 5. spite bench   kernels/llama3/<arch>/your_file.cu
-// 6. Paste bench output in your PR description.
+// 4. Build the kernels for your card:
+//      cmake -B build -DSPITE_MODELS="llama/llama3" -DSPITE_GPU_ARCHS="<your_gpu>" \
+//        && cmake --build build
+// 5. Verify the built .so against the generic reference:
+//      python3 tools/verify/verify.py \
+//        build/kernels/llama/llama3/<your_gpu>/libkernel_llama_llama3_<your_gpu>.so
+// 6. Benchmark:
+//      cargo run --release -p spite-bench -- --model path/to/model.gguf
+// 7. Paste bench output in your PR description.
 //
 // GPU ARCHITECTURE NOTES — sm_89 (Ada Lovelace)
 // ───────────────────────────────────────────────
@@ -40,8 +46,8 @@
 #include <cuda/std/span>
 #include <cuda/std/expected>
 #include <cuda/std/cstdint>
-#include "../../../core/abi.h"
-#include "../../../core/quant.h"
+#include "../../../../core/abi.h"
+#include "../../../../core/quant.h"
 
 // ── C++23 / libcudacxx conveniences ───────────────────────────────────────
 
@@ -122,10 +128,11 @@ static int ffn(
     const SpiteTensor* w_gate,
     const SpiteTensor* w_up,
     const SpiteTensor* w_down,
+    SpiteFfnActivation activation,
     const SpiteCtx*    ctx
 ) {
     // TODO: implement Q4_K matmul + SiLU fusion
-    (void)out; (void)x; (void)w_gate; (void)w_up; (void)w_down; (void)ctx;
+    (void)out; (void)x; (void)w_gate; (void)w_up; (void)w_down; (void)activation; (void)ctx;
     return -1;
 }
 
@@ -149,13 +156,12 @@ static int attention(
     const SpiteTensor* wv,
     const SpiteTensor* wo,
     SpiteKvCache*      kvcache,
-    int                pos,
     float              rope_freq_base,
     const SpiteCtx*    ctx
 ) {
     // TODO: implement
     (void)out; (void)x; (void)wq; (void)wk; (void)wv; (void)wo;
-    (void)kvcache; (void)pos; (void)rope_freq_base; (void)ctx;
+    (void)kvcache; (void)rope_freq_base; (void)ctx;
     return -1;
 }
 
@@ -178,6 +184,7 @@ static constexpr SpiteKernelInfo KERNEL_INFO {
 
     .rms_norm         = nullptr,   // set to rms_norm once implemented
     .attention        = nullptr,
+    .mla              = nullptr,   // DeepSeek-style latent attention (optional)
     .ffn              = nullptr,
     .layer            = nullptr,   // optional: fuse the whole layer
 };

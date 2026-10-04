@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-tools/benchmark/bench.py — wrapper around `spite bench`
+tools/benchmark/bench.py — wrapper around the `spite-bench` binary
 
 Usage:
     python3 tools/benchmark/bench.py --kernel <kernel.so> --model <model.gguf>
                                       [--n-runs 10] [--json out.json]
 
-Invokes `spite bench` and pretty-prints the results.
-Also compares against the generic reference kernel automatically.
-
+Invokes `spite-bench` and pretty-prints the results.
+The --kernel argument is accepted for interface compatibility but is not
+yet forwarded (the harness currently benchmarks whole-model throughput).
 Exit code 0 = benchmark completed successfully.
 """
 
@@ -20,21 +20,20 @@ import sys
 import time
 
 
-def run_bench(kernel: str, model: str, n_runs: int) -> dict:
-    """Invoke `spite bench` for the given kernel and return parsed results."""
-    cmd = ["cargo", "run", "-p", "spite", "--", "bench",
-           kernel, "--model", model]
+def run_bench(model: str, n_runs: int) -> dict:
+    """Invoke `spite-bench` for the given model and return parsed results."""
+    cmd = ["cargo", "run", "--release", "-p", "spite-bench", "--",
+           "--model", model, "--n-runs", str(n_runs)]
     start = time.monotonic()
     result = subprocess.run(cmd, capture_output=True, text=True)
     elapsed = time.monotonic() - start
 
     if result.returncode != 0:
-        print("ERROR running spite bench:", file=sys.stderr)
+        print("ERROR running spite-bench:", file=sys.stderr)
         print(result.stderr, file=sys.stderr)
         sys.exit(1)
 
     return {
-        "kernel": kernel,
         "model":  model,
         "n_runs": n_runs,
         "elapsed_s": round(elapsed, 2),
@@ -55,7 +54,7 @@ def main():
     print(f"Runs:         {args.n_runs}")
     print()
 
-    result = run_bench(args.kernel, args.model, args.n_runs)
+    result = run_bench(args.model, args.n_runs)
     print(result["stdout"])
     print(f"Elapsed: {result['elapsed_s']}s")
 

@@ -60,25 +60,24 @@ jobs:
         run: |
           cmake -B build \
             -DSPITE_GPU_ARCHS="${{ matrix.arch }}" \
-            -DSPITE_MODELS="llama3,mistral" \
+            -DSPITE_MODELS="llama/llama3,mistral/mistral4" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j$(nproc)
 
       - name: Verify kernels
         run: |
-          for kernel_dir in build/kernels/llama3/${{ matrix.arch }}/ \
-                            build/kernels/mistral/${{ matrix.arch }}/; do
-            if [ -d "$kernel_dir" ]; then
-              ./target/release/spite verify "$kernel_dir"
-            fi
-          done
+          fail=0
+          while IFS= read -r so; do
+            echo "verifying $so"
+            python3 tools/verify/verify.py "$so" || fail=1
+          done < <(find build/kernels -type f -name '*.so' -path "*/${{ matrix.arch }}/*")
+          exit $fail
 
       - name: Benchmark (informational)
         continue-on-error: true
         run: |
-          ./target/release/spite benchmark \
-            --model "$SPITE_TEST_MODEL" \
-            --kernels-dir build/kernels
+          cargo build --release -p spite-bench
+          ./target/release/spite-bench --model "$SPITE_TEST_MODEL"
 
   # ── AMD HIP kernels: runs only when RDNA kernel files change ──────────────
   kernels-hip:
@@ -100,12 +99,18 @@ jobs:
         run: |
           cmake -B build \
             -DSPITE_GPU_ARCHS="${{ matrix.arch }}" \
-            -DSPITE_MODELS="llama3" \
+            -DSPITE_MODELS="llama/llama3" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j$(nproc)
 
       - name: Verify kernels
-        run: ./target/release/spite verify build/kernels/llama3/${{ matrix.arch }}/
+        run: |
+          fail=0
+          while IFS= read -r so; do
+            echo "verifying $so"
+            python3 tools/verify/verify.py "$so" || fail=1
+          done < <(find build/kernels -type f -name '*.so' -path "*/${{ matrix.arch }}/*")
+          exit $fail
 
   # ── Metal kernels: runs only when Apple Silicon kernel files change ────────
   kernels-metal:
@@ -122,12 +127,18 @@ jobs:
         run: |
           cmake -B build \
             -DSPITE_GPU_ARCHS="metal" \
-            -DSPITE_MODELS="llama3" \
+            -DSPITE_MODELS="llama/llama3" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
       - name: Verify kernels
-        run: ./target/release/spite verify build/kernels/llama3/metal/
+        run: |
+          fail=0
+          while IFS= read -r so; do
+            echo "verifying $so"
+            python3 tools/verify/verify.py "$so" || fail=1
+          done < <(find build/kernels -type f \( -name '*.so' -o -name '*.dylib' \) -path "*/metal/*")
+          exit $fail
 
   # ── Intel Arc kernels ──────────────────────────────────────────────────────
   kernels-arc:
@@ -144,9 +155,15 @@ jobs:
         run: |
           cmake -B build \
             -DSPITE_GPU_ARCHS="arc_alchemist" \
-            -DSPITE_MODELS="llama3" \
+            -DSPITE_MODELS="llama/llama3" \
             -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
       - name: Verify kernels
-        run: ./target/release/spite verify build/kernels/llama3/arc_alchemist/
+        run: |
+          fail=0
+          while IFS= read -r so; do
+            echo "verifying $so"
+            python3 tools/verify/verify.py "$so" || fail=1
+          done < <(find build/kernels -type f -name '*.so' -path "*/arc_alchemist/*")
+          exit $fail

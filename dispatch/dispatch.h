@@ -5,11 +5,12 @@
  * and builds a dispatch table: for each (model_arch, quant_type, op)
  * triple, which kernel implementation wins.
  *
- * Fallback chain:
- *   kernels/<model>/<exact_gpu_arch>/  (e.g. sm_89)
- *   kernels/<model>/generic_cuda/
- *   kernels/<model>/generic/
- *   kernels/generic/<exact_gpu_arch>/
+ * Fallback chain (see crates/spite-dispatch/src/resolve.rs):
+ *   kernels/<family>/<model>/<arch>/<card>/<quant>/
+ *   kernels/<family>/<model>/<arch>/<card>/
+ *   kernels/<family>/<model>/<arch>/<quant>/
+ *   kernels/<family>/<model>/<arch>/  (e.g. sm_89)
+ *   kernels/generic/<arch>/
  *   kernels/generic/generic/           (always present, always correct)
  */
 

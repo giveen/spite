@@ -21,7 +21,7 @@
 #  define SPITE_NODISCARD
 #endif
 
-#define SPITE_ABI_VERSION 2
+#define SPITE_ABI_VERSION 3
 
 /* ── Quant type tag ───────────────────────────────────────────────────── */
 
@@ -30,6 +30,7 @@ typedef enum {
     SPITE_TYPE_F16   = 1,
     SPITE_TYPE_BF16  = 2,
     SPITE_TYPE_Q8_0  = 8,
+    SPITE_TYPE_Q5_1  = 11,
     SPITE_TYPE_Q4_0  = 10,
     SPITE_TYPE_Q4_K  = 12,
     SPITE_TYPE_Q5_K  = 13,
@@ -50,6 +51,9 @@ typedef struct {
     int     n_ctx;
     int     n_batch;
     int     n_threads;
+    int     pos;              /* current token position in the sequence (0-based) */
+    int     n_heads;          /* total query heads */
+    int     n_kv_heads;       /* KV heads — may be < n_heads for GQA/MQA */
     void*   gpu_stream;       /* CUDA stream / HIP stream / MTLCommandBuffer */
     void*   scratchpad;
     size_t  scratchpad_bytes;
@@ -82,17 +86,45 @@ typedef int (*SpiteAttentionFn)(
     const SpiteTensor* wv,
     const SpiteTensor* wo,
     SpiteKvCache*      kvcache,
-    int                pos,
     float              rope_freq_base,
-    const SpiteCtx*    ctx
+    const SpiteCtx*    ctx              /* pos, n_heads, n_kv_heads live in ctx */
 );
 
+/* FFN activation function selector. */
+typedef enum {
+    SPITE_FFN_SILU_GATE = 0,  /* SwiGLU — LLaMA, Mistral, Qwen */
+    SPITE_FFN_GELU_GATE = 1,  /* GeGLU  — Gemma */
+    SPITE_FFN_GELU      = 2,  /* standard GELU — BERT-family, Phi */
+    SPITE_FFN_RELU      = 3,  /* ReLU²  — GPT-NeoX variants */
+} SpiteFfnActivation;
+
 typedef int (*SpiteFfnFn)(
+    SpiteTensor*        out,
+    const SpiteTensor*  x,
+    const SpiteTensor*  w_gate,
+    const SpiteTensor*  w_up,
+    const SpiteTensor*  w_down,
+    SpiteFfnActivation  activation,
+    const SpiteCtx*     ctx
+);
+
+/*
+ * Multi-head Latent Attention (DeepSeek MLA).
+ *
+ * KV is compressed through low-rank projections before caching. The
+ * compressed latent is stored in the KV cache; up-projection happens
+ * during the attention score computation.
+ */
+typedef int (*SpiteMlaFn)(
     SpiteTensor*       out,
     const SpiteTensor* x,
-    const SpiteTensor* w_gate,
-    const SpiteTensor* w_up,
-    const SpiteTensor* w_down,
+    const SpiteTensor* w_dq,       /* query down-projection (absorbs W_Q) */
+    const SpiteTensor* w_uq,       /* query up-projection */
+    const SpiteTensor* w_dkv,      /* KV down-projection (shared compress) */
+    const SpiteTensor* w_ukv,      /* KV up-projection */
+    const SpiteTensor* wo,         /* output projection */
+    SpiteKvCache*      kvcache,
+    float              rope_freq_base,
     const SpiteCtx*    ctx
 );
 
@@ -164,6 +196,7 @@ typedef struct {
     /* NULL = not implemented; dispatcher uses fallback. */
     SpiteRmsNormFn   rms_norm;
     SpiteAttentionFn attention;
+    SpiteMlaFn       mla;
     SpiteFfnFn       ffn;
     SpiteLayerFn     layer;
     SpiteSpecVerifyFn speculative_verify; /* NULL if no optimized impl */

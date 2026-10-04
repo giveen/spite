@@ -1,4 +1,4 @@
-//! `spite benchmark` — kernel throughput and latency harness.
+//! `spite-bench` — kernel throughput and latency harness.
 //!
 //! Usage:
 //!   spite-bench --model path/to/model.gguf [--n-tokens 512] [--n-runs 5]

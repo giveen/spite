@@ -82,7 +82,7 @@ impl LoadedKernel {
 
 // ── Dispatch table ─────────────────────────────────────────────────────────
 
-/// Source label for each resolved op — shown by `spite benchmark --verbose`.
+/// Source label for each resolved op — shown by `spite dispatch`.
 #[derive(Debug, Clone)]
 pub struct OpSource {
     pub gpu_arch: String,

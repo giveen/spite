@@ -90,13 +90,13 @@ The Rust host runs without GPU kernels (using the generic CPU fallback), but
 for full speed you'll want to compile the kernels for your GPU.
 
 ```bash
-# Find your GPU architecture first — the benchmark tool shows it:
-./target/release/spite benchmark --model ~/models/your.gguf
+# Find your GPU architecture first — `spite dispatch` shows it:
+./target/release/spite dispatch -m ~/models/your.gguf --card RTX_4090
 
 # Build kernels for your card
 cmake -B build \
-  -DSPITE_MODELS="llama3"    \
-  -DSPITE_GPU_ARCHS="sm_89"  \
+  -DSPITE_MODELS="llama/llama3"  \
+  -DSPITE_GPU_ARCHS="sm_89"      \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
@@ -149,7 +149,7 @@ generic CPU path automatically — slower, but always correct.
 |---|---|---|
 | Metal | `metal` | M1 / M1 Pro / Max / Ultra, M2 / M2 Pro / Max / Ultra, M3 / M3 Pro / Max, M4 / M4 Pro / Max |
 
-Not sure which architecture you have? Run `spite benchmark` — it detects and prints it.
+Not sure which architecture you have? Run `spite dispatch` — it detects and prints it.
 
 ---
 
@@ -161,13 +161,15 @@ That sounds abstract, so here's what it means in practice:
 
 ### Every model is its own module
 
-Llama 4, DeepSeek-V4, Qwen 3.5, Mistral 4, Gemma 3 — each lives in its own folder inside
-`kernels/`. Adding a new model means adding a new folder. Nothing about the
-existing models changes. The dispatcher finds it automatically.
+Kernels are grouped by family and variant: `kernels/llama/llama4/`,
+`kernels/deepseek/v4/`, `kernels/qwen/qwen3_5/`, `kernels/mistral/mistral4/`,
+`kernels/gemma/gemma3/`. Adding a new model variant means adding a new
+`<family>/<model>/` folder. Nothing about the existing models changes. The
+dispatcher finds it automatically.
 
 ### Every GPU is its own module
 
-`kernels/llama3/sm_89/` is completely separate from `kernels/llama3/rdna3/`.
+`kernels/llama/llama3/sm_89/` is completely separate from `kernels/llama/llama3/rdna3/`.
 An RTX 4090 kernel can use FP8 tensor cores. An RX 7900 XTX kernel can exploit
 96 MB of Infinity Cache. An Apple M4 kernel can use the Neural Engine. Each gets
 what makes it fast, not a watered-down kernel that has to work on everything.
@@ -242,19 +244,29 @@ spite-server --model base.gguf --lora my_adapter.gguf
 ## Benchmarking
 
 ```bash
-./target/release/spite benchmark --model ~/models/your.gguf
+# Show which kernel is active for each operation on your card
+./target/release/spite dispatch -m ~/models/your.gguf --card RTX_3090
+
+# Measure end-to-end model throughput
+./target/release/spite-bench --model ~/models/your.gguf
 ```
 
-Output shows which kernel is active for each operation and how fast it is:
+`spite dispatch` prints the resolved kernel for each operation:
 
 ```
-[dispatch] model: llama3  gpu: sm_86
-  rms_norm  → kernels/generic/generic     12.3 µs
-  attention → kernels/generic/generic    841.2 µs  ← opportunity
-  ffn       → kernels/llama3/sm_86       192.1 µs
+model arch   : llama
+card         : rtx_3090 (24 GiB)
+gpu arch     : sm_86
+kernels      :
+  rms_norm       → sm_86/kernels/llama/llama3/sm_86
+  attention      → generic/kernels/generic/generic
+  ffn            → sm_86/kernels/llama/llama3/sm_86
+  layer          → generic/kernels/generic/generic
+  spec_verify    → generic/kernels/generic/generic
+  prefill        → generic/kernels/generic/generic
 ```
 
-Lines marked `generic/generic` are running the fallback — a custom kernel
+Entries resolved to `generic/` are running the fallback — a custom kernel
 for that op and GPU would be faster.
 
 ---
@@ -269,26 +281,34 @@ You don't need to understand the scheduler, the tokenizer, the server, or
 anything else. You need:
 - Your GPU
 - One operation to implement (attention, FFN, or rms_norm)
-- The template in `kernels/llama3/sm_89/KERNEL_TEMPLATE.cu`
+- The template in `kernels/llama/llama3/sm_89/KERNEL_TEMPLATE.cu`
 
 **The steps:**
 
 ```bash
-# 1. Find what's slow
-spite benchmark --model your.gguf
+# 1. Find what's slow on your card
+spite dispatch -m your.gguf --card RTX_3080
 
 # 2. Copy the template for your card
-cp kernels/llama3/sm_89/KERNEL_TEMPLATE.cu kernels/llama3/sm_86/attention.cu
+cp kernels/llama/llama3/sm_89/KERNEL_TEMPLATE.cu \
+   kernels/llama/llama3/sm_86/attention.cu
 
 # 3. Implement the op (the template has comments for each section)
 
-# 4. Verify correctness — must pass before PR
-spite verify kernels/llama3/sm_86/attention.cu
+# 4. Build the kernels for your card
+cmake -B build -DSPITE_MODELS="llama/llama3" -DSPITE_GPU_ARCHS="sm_86" \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 
-# 5. Benchmark and save the output
-spite bench kernels/llama3/sm_86/attention.cu > kernels/llama3/sm_86/attention.bench
+# 5. Verify correctness — must pass before PR
+python3 tools/verify/verify.py \
+  build/kernels/llama/llama3/sm_86/libkernel_llama_llama3_sm_86.so
 
-# 6. Open a PR titled:  kernel: llama3/sm_86 attention
+# 6. Benchmark and save the output
+cargo run --release -p spite-bench -- --model your.gguf \
+  > kernels/llama/llama3/sm_86/attention.bench
+
+# 7. Open a PR titled:  kernel: llama/llama3/sm_86 attention
 ```
 
 You only touch the `kernels/` directory. Nothing else breaks when you add a
@@ -303,14 +323,16 @@ GPU-specific notes (tile sizes, WMMA shapes, memory layout):
 
 ## Supported models
 
-| Model       | Status   |
-|-------------|----------|
-| llama4      | template |
-| deepseek4   | template |
-| qwen35      | template |
-| mistral4    | template |
-| gemma3      | template |
-| glm5        | template |
+| Model               | Status   |
+|---------------------|----------|
+| llama/llama3        | template |
+| llama/llama4        | template |
+| deepseek/v3         | template |
+| deepseek/v4         | template |
+| qwen/qwen3_5        | template |
+| mistral/mistral4    | template |
+| gemma/gemma3        | template |
+| glm/glm5            | template |
 
 "Template" means the model layout and loader are wired up; kernel contributions
 welcome. Running any of these on the generic fallback works today.
@@ -346,7 +368,7 @@ dependency graph and data flow.
 - **GGUF only.** One weight format. No conversion step, no format zoo.
 - **Consumer hardware first.** Every decision optimizes for the RTX 3060 and
   RX 7800 XT before it optimizes for the A100.
-- **Your card, your kernel.** Tuned kernels live in `kernels/<model>/<gpu_arch>/`.
+- **Your card, your kernel.** Tuned kernels live in `kernels/<family>/<model>/<gpu_arch>/`.
   Adding yours doesn't require touching anything else.
 - **Fallback always works.** No kernel for your GPU? The generic CPU fallback runs.
   It's slower, not broken.
