@@ -474,7 +474,7 @@ pub fn generate(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let tokenizer = Tokenizer::from_gguf(gguf)?;
-    let ids = tokenizer.encode(prompt, true)?;
+    let ids = tokenizer.encode(prompt, tokenizer.add_bos())?;
 
     let mut exec_cfg = ExecutorConfig::default();
     if let Some(n) = ctx_len {

@@ -73,6 +73,7 @@ impl ModelArch for Gemma4 {
             activation: Activation::GeGlu,
             sliding_window: self.config.sliding_window,
             rope_stride: 1,
+            apply_qk_norm: false,
         };
         dense::forward_with(
             &self.config,

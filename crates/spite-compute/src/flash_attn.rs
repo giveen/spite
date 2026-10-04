@@ -102,14 +102,20 @@ pub fn scalar_attention(
     }
 
     let mut scores = vec![0f32; n_kv];
+    // Queries address the *tail* of the KV cache: query `qi` sits at absolute
+    // KV index `n_kv - n_q + qi`. Single-token decode passes n_q = 1 against
+    // the whole cache, so this must offset by n_kv - 1 rather than compare
+    // against `qi` directly — otherwise every token attends only to j = 0.
+    let q_start = n_kv.saturating_sub(n_q);
 
     for qi in 0..n_q {
+        let q_pos = q_start + qi;
         for h in 0..n_heads {
             let kvh = h / kv_groups;
 
             // Compute raw attention scores: Q[qi,h] · K[j,kvh] for all j.
             for (j, s) in scores.iter_mut().enumerate() {
-                if causal && j > qi {
+                if causal && j > q_pos {
                     *s = f32::NEG_INFINITY;
                     continue;
                 }

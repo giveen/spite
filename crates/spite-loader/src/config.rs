@@ -97,6 +97,14 @@ pub struct ModelHyperparams {
     pub compress_rope_base: f32,
     /// Shared experts (deepseek4-style fine-grained MoE).
     pub n_expert_shared: u32,
+    /// Indexer geometry for sparse attention (0 = unused).
+    pub indexer_n_head: u32,
+    pub indexer_head_size: u32,
+    pub indexer_top_k: u32,
+    /// Per-layer full-indexer flags (empty = all full).
+    pub indexer_types: Vec<bool>,
+    pub key_length_mla: u32,
+    pub value_length_mla: u32,
 }
 
 impl ModelHyperparams {
@@ -284,11 +292,38 @@ impl ModelHyperparams {
             },
             compress_rope_base: f("attention.compress_rope_freq_base"),
             n_expert_shared: u("expert_shared_count"),
+            indexer_n_head: u("attention.indexer_head_count"),
+            indexer_head_size: u("attention.indexer_key_length"),
+            indexer_top_k: u("attention.indexer_top_k"),
+            indexer_types: match meta.get(&format!("{arch}.attention.indexer.types")) {
+                Some(crate::MetaValue::Array(items)) => items
+                    .iter()
+                    .map(|v| match v {
+                        crate::MetaValue::Bool(b) => *b,
+                        crate::MetaValue::U32(x) => *x != 0,
+                        crate::MetaValue::I32(x) => *x != 0,
+                        _ => true,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            },
+            key_length_mla: u("attention.key_length_mla"),
+            value_length_mla: u("attention.value_length_mla"),
         }
     }
 
     /// Convenience: extract hyperparams directly from an open `GgufModel`.
+    ///
+    /// Also repairs `vocab_size`: some quantized files omit
+    /// `tokenizer.ggml.token_count`, in which case the vocabulary size is
+    /// inferred from the embedding / output projection tensors. Without this
+    /// the LM head matvec gets a zero-width output and every consumer
+    /// (CLI, server, bench) fails with a shape mismatch.
     pub fn from_gguf(model: &crate::GgufModel) -> Self {
-        Self::from_meta(model.arch(), &model.meta)
+        let mut hp = Self::from_meta(model.arch(), &model.meta);
+        if hp.vocab_size == 0 {
+            hp.vocab_size = model.vocab_size() as u32;
+        }
+        hp
     }
 }

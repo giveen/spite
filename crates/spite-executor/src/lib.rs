@@ -232,6 +232,11 @@ impl Executor {
         };
         let sampler_cfg = SamplerConfig {
             temperature,
+            // Base 8B models fall into verbatim repetition loops under plain
+            // top-p sampling; a mild penalty keeps generations moving without
+            // distorting the distribution. Callers wanting the raw library
+            // default can still override it.
+            repetition_penalty: 1.1,
             ..Default::default()
         };
         let mut rng = seed;

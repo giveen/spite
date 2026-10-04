@@ -133,6 +133,9 @@ pub struct DenseOptions {
     /// Apply RoPE every `rope_stride`-th layer starting at 0. 1 = every
     /// layer; 2 = even layers only (LLaMA-4-style iRoPE NoPE layers).
     pub rope_stride: usize,
+    /// Apply per-head QK RMSNorm (`attn_q_norm`/`attn_k_norm`) before RoPE.
+    /// Enable for Qwen3/Qwen3.5-style decoders that have QK norms.
+    pub apply_qk_norm: bool,
 }
 
 impl Default for DenseOptions {
@@ -141,6 +144,7 @@ impl Default for DenseOptions {
             activation: Activation::SwiGlu,
             sliding_window: None,
             rope_stride: 1,
+            apply_qk_norm: false,
         }
     }
 }
@@ -160,18 +164,85 @@ pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
 }
 
 /// `out[r] = Σ_c w[c*rows + r] * x[c]` — GGUF weights are `[cols, rows]`.
+/// Rows processed per accumulator block. Blocking over rows keeps each
+/// column read contiguous (`w[c*rows + r0 .. r0 + n]`) instead of striding by
+/// `rows`, which is what made the original row-at-a-time loop cache-bound.
+const ROW_BLOCK: usize = 64;
+
+/// `out[j] = Σ_c w[(row0 + j)*cols + c] * x[c]` for `j` in `0..out.len()`.
+///
+/// GGUF/ggml packs a tensor with `ne[0]` contiguous, so the row feeding output
+/// index `r` starts at `r*ne[0]` and walks `c` linearly. Reading it as
+/// `c*rows + r` instead transposes every non-square weight (attn_k, ffn_down,
+/// the LM head) and silently produces plausible-looking garbage.
+///
+/// Accumulates over `c` in ascending order, exactly like the naive
+/// row-at-a-time loop, so blocking does not change the floating-point result.
+#[inline]
+fn matvec_rows(w_data: &[f32], cols: usize, x: &[f32], out: &mut [f32], row0: usize) {
+    let n = out.len();
+    let mut acc = [0f32; ROW_BLOCK];
+    acc[..n].fill(0.0);
+    for (j, slot) in acc[..n].iter_mut().enumerate() {
+        let base = (row0 + j) * cols;
+        let mut a = 0f32;
+        for (c, &xv) in x.iter().enumerate() {
+            a += w_data[base + c] * xv;
+        }
+        *slot = a;
+    }
+    out.copy_from_slice(&acc[..n]);
+}
+
+/// Worker thread count for CPU matvec. GGUF weights are dequantized to F32 at
+/// load, so every matvec is a dense pass over tens of MB; saturating the
+/// available cores is worth the spawn cost.
+fn matvec_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
+}
+
 pub(crate) fn matvec(w: &Weight, x: &[f32], out: &mut [f32]) -> Result<(), ModelError> {
     let (rows, cols) = (w.rows(), w.cols());
     if x.len() != cols || out.len() != rows || w.data.len() != rows * cols {
         return Err(ModelError::Forward("matvec shape mismatch".into()));
     }
-    for (r, o) in out.iter_mut().enumerate() {
-        let mut acc = 0f32;
-        for (c, &xv) in x.iter().enumerate() {
-            acc += w.data[c * rows + r] * xv;
-        }
-        *o = acc;
+    if rows == 0 {
+        return Ok(());
     }
+    let n_blocks = rows.div_ceil(ROW_BLOCK);
+    let threads = matvec_threads().min(n_blocks);
+    if threads <= 1 {
+        for b in 0..n_blocks {
+            let r0 = b * ROW_BLOCK;
+            let r1 = (r0 + ROW_BLOCK).min(rows);
+            matvec_rows(&w.data, cols, x, &mut out[r0..r1], r0);
+        }
+        return Ok(());
+    }
+
+    // Split the output into one contiguous slice per worker. The split size is
+    // a whole number of row blocks so each worker's slice lines up with the
+    // blocked inner loop.
+    let per = n_blocks.div_ceil(threads) * ROW_BLOCK;
+    let mut chunks: Vec<&mut [f32]> = out.chunks_mut(per).collect();
+    let data = &w.data;
+    std::thread::scope(|scope| {
+        for (i, chunk) in chunks.iter_mut().enumerate() {
+            let row0 = i * per;
+            let len = chunk.len();
+            scope.spawn(move || {
+                let mut j = 0;
+                while j < len {
+                    let n = ROW_BLOCK.min(len - j);
+                    matvec_rows(data, cols, x, &mut chunk[j..j + n], row0 + j);
+                    j += n;
+                }
+            });
+        }
+    });
     Ok(())
 }
 
@@ -263,6 +334,35 @@ pub fn forward_with(
             matvec(w_q, &n, &mut q)?;
             matvec(w_k, &n, &mut k)?;
             matvec(w_v, &n, &mut v)?;
+            // Qwen3/Qwen3.5 style per-head QK RMSNorm (`attn_q_norm`/`attn_k_norm`).
+            // Enabled when `apply_qk_norm` is set AND the weights exist.
+            if opts.apply_qk_norm
+                && let (Ok(w_qn), Ok(w_kn)) = (
+                    weights.get(&format!("{b}.attn_q_norm.weight")),
+                    weights.get(&format!("{b}.attn_k_norm.weight")),
+                )
+            {
+                for h in 0..n_heads {
+                    let mut out = vec![0.0; head_dim];
+                    rmsnorm(
+                        &q[h * head_dim..(h + 1) * head_dim],
+                        &w_qn.data,
+                        cfg.norm_eps,
+                        &mut out,
+                    );
+                    q[h * head_dim..(h + 1) * head_dim].copy_from_slice(&out);
+                }
+                for h in 0..n_kv_heads {
+                    let mut out = vec![0.0; head_dim];
+                    rmsnorm(
+                        &k[h * head_dim..(h + 1) * head_dim],
+                        &w_kn.data,
+                        cfg.norm_eps,
+                        &mut out,
+                    );
+                    k[h * head_dim..(h + 1) * head_dim].copy_from_slice(&out);
+                }
+            }
             if layer % opts.rope_stride == 0 {
                 apply_rope(&mut q, pos as u32, &rope)
                     .map_err(|e| ModelError::Forward(format!("rope: {e}")))?;
@@ -402,6 +502,7 @@ mod options_tests {
             activation: Activation::GeGlu,
             sliding_window: Some(1),
             rope_stride: 2,
+            apply_qk_norm: false,
         };
         let mut logits = vec![0f32; 2 * cfg.vocab_size];
         forward_with(&cfg, &weights, &kv, &[1, 2], 0, &mut logits, &opts).unwrap();

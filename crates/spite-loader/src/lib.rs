@@ -164,6 +164,24 @@ impl GgufModel {
     pub fn n_tensors(&self) -> usize {
         self.tensors.len()
     }
+
+    /// Root vocabulary size in tokens.
+    ///
+    /// Prefers the standard `tokenizer.ggml.token_count` GGUF key. When that
+    /// key is absent (some quantized files omit it), the size of the
+    /// `token_embd.weight` / `output.weight` tensors is used as a fallback.
+    pub fn vocab_size(&self) -> usize {
+        if let Some(crate::MetaValue::U32(v)) = self.meta.get("tokenizer.ggml.token_count") {
+            return *v as usize;
+        }
+        if !self.tensor("token_embd.weight").is_null() {
+            return self.tensor("token_embd.weight").ne[1] as usize; // ne[1] = rows = vocab
+        }
+        if !self.tensor("output.weight").is_null() {
+            return self.tensor("output.weight").ne[1] as usize; // ne[1] = rows
+        }
+        0
+    }
 }
 
 // ── GGUF parsing helpers ───────────────────────────────────────────────────

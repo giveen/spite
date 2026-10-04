@@ -128,7 +128,7 @@ impl ModelArch for Qwen3_5 {
             for layer in 0..cfg.n_layers {
                 let b = format!("blk.{layer}");
                 let w_norm = w.get(&format!("{b}.attn_norm.weight"))?;
-                let w_post = w.get(&format!("{b}.attn_post_norm.weight"))?;
+                let w_post = w.get(&format!("{b}.ffn_norm.weight"))?;
                 let w_gate = w.get(&format!("{b}.ffn_gate.weight"))?;
                 let w_up = w.get(&format!("{b}.ffn_up.weight"))?;
                 let w_down = w.get(&format!("{b}.ffn_down.weight"))?;
@@ -202,11 +202,27 @@ fn full_attn(
 ) -> Result<Vec<f32>, ModelError> {
     let d = cfg.d_model;
     // Fused Q+gate+K+V preferred (qwen35 full layers); split fallback.
-    let (q, gate, k, v) = if let Ok(wqkv) = w.get(&format!("{b}.attn_qkv.weight")) {
+    let (q, gate, k, v) = if let (Ok(w_q), Ok(w_k), Ok(w_v)) = (
+        w.get(&format!("{b}.attn_q.weight")),
+        w.get(&format!("{b}.attn_k.weight")),
+        w.get(&format!("{b}.attn_v.weight")),
+    ) {
+        let mut q = vec![0f32; n_heads * head_dim];
+        let mut k = vec![0f32; n_kv_heads * head_dim];
+        let mut v = vec![0f32; n_kv_heads * head_dim];
+        matvec(w_q, n, &mut q)
+            .map_err(|_| ModelError::MissingWeight(format!("{b}.attn_q.weight")))?;
+        matvec(w_k, n, &mut k)
+            .map_err(|_| ModelError::MissingWeight(format!("{b}.attn_k.weight")))?;
+        matvec(w_v, n, &mut v)
+            .map_err(|_| ModelError::MissingWeight(format!("{b}.attn_v.weight")))?;
+        (q, None, k, v)
+    } else if let Ok(wqkv) = w.get(&format!("{b}.attn_qkv.weight")) {
         let qg_dim = 2 * head_dim * n_heads;
         let k_dim = n_kv_heads * head_dim;
         let mut qkv = vec![0f32; wqkv.rows()];
-        matvec(wqkv, n, &mut qkv)?;
+        matvec(wqkv, n, &mut qkv)
+            .map_err(|_| ModelError::MissingWeight(format!("{b}.attn_qkv.weight")))?;
         let gate = qkv[qg_dim / 2..qg_dim].to_vec();
         (
             qkv[..qg_dim / 2].to_vec(),
@@ -215,19 +231,9 @@ fn full_attn(
             qkv[qg_dim + k_dim..].to_vec(),
         )
     } else {
-        let w_q = w.get(&format!("{b}.attn_q.weight"))?;
-        let w_k = w.get(&format!("{b}.attn_k.weight"))?;
-        let w_v = w.get(&format!("{b}.attn_v.weight"))?;
-        let mut q = vec![0f32; n_heads * head_dim];
-        let mut k = vec![0f32; n_kv_heads * head_dim];
-        let mut v = vec![0f32; n_kv_heads * head_dim];
-        matvec(w_q, n, &mut q)?;
-        matvec(w_k, n, &mut k)?;
-        matvec(w_v, n, &mut v)?;
-        (q, None, k, v)
+        return Err(ModelError::MissingWeight(format!("{b}.attn_qkv.weight")));
     };
 
-    // Per-head QK RMSNorm.
     let w_qn = w.get(&format!("{b}.attn_q_norm.weight"))?;
     let w_kn = w.get(&format!("{b}.attn_k_norm.weight"))?;
     let mut qn = vec![0f32; q.len()];
@@ -443,8 +449,10 @@ mod tests {
                 format!("{b}.attn_norm.weight"),
                 (vec![1.0; d], [d as u32, 1, 1, 1]),
             );
+            // Qwen3/Qwen3.5 use `ffn_norm` for the post-attention norm; there
+            // is no separate `attn_post_norm` tensor in the GGUF files.
             map.insert(
-                format!("{b}.attn_post_norm.weight"),
+                format!("{b}.ffn_norm.weight"),
                 (vec![1.0; d], [d as u32, 1, 1, 1]),
             );
             map.insert(format!("{b}.ffn_gate.weight"), w(ff, d, 0.05));

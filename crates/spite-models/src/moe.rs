@@ -227,6 +227,10 @@ fn expert_view(w: &Weight, e: usize, cols: usize, rows: usize) -> Vec<f32> {
     w.data[e * stride..(e + 1) * stride].to_vec()
 }
 
+/// `out[r] = Σ_c w[r*cols + c] * x[c]`, matching `dense::matvec`.
+///
+/// ggml packs tensors with `ne[0]` contiguous, so the row feeding output `r`
+/// starts at `r*ne[0]`; indexing as `c*rows + r` would transpose the weight.
 fn matvec_raw(
     w: &[f32],
     rows: usize,
@@ -238,9 +242,10 @@ fn matvec_raw(
         return Err(ModelError::Forward("moe matvec shape mismatch".into()));
     }
     for (r, o) in out.iter_mut().enumerate() {
+        let row = &w[r * cols..r * cols + cols];
         let mut acc = 0f32;
         for (c, &xv) in x.iter().enumerate() {
-            acc += w[c * rows + r] * xv;
+            acc += row[c] * xv;
         }
         *o = acc;
     }
@@ -269,9 +274,11 @@ mod tests {
     #[test]
     fn moe_selects_topk_and_weights() {
         // 2 experts, top-1. Router strongly prefers expert 1.
+        // Rows are laid out ggml-style (row r starts at r*cols), so expert 1's
+        // row is [0, 10] and dominates expert 0's [0, 0].
         let d = 2;
         let ff = 2;
-        let gate_inp = weight(vec![0.0, 10.0, 0.0, 10.0], d, 2);
+        let gate_inp = weight(vec![0.0, 0.0, 0.0, 10.0], d, 2);
         let ident = vec![1.0, 0.0, 0.0, 1.0];
         let zeros = vec![0.0; 4];
         let up = stacked(vec![zeros.clone(), ident.clone()], d, ff);

@@ -111,6 +111,12 @@ pub struct ModelConfig {
     pub compress_ratios: Vec<usize>,
     pub compress_rope_base: f32,
     pub n_expert_shared: usize,
+    pub indexer_n_head: usize,
+    pub indexer_head_size: usize,
+    pub indexer_top_k: usize,
+    pub indexer_types: Vec<bool>,
+    pub key_length_mla: usize,
+    pub value_length_mla: usize,
 
     // ── RoPE scaling (YaRN / linear / NTK) ───────────────────────────────
     /// Multiplicative rope scale factor. 1.0 = no scaling (default).
@@ -197,6 +203,12 @@ impl Default for ModelConfig {
             compress_ratios: Vec::new(),
             compress_rope_base: 0.0,
             n_expert_shared: 0,
+            indexer_n_head: 0,
+            indexer_head_size: 0,
+            indexer_top_k: 0,
+            indexer_types: Vec::new(),
+            key_length_mla: 0,
+            value_length_mla: 0,
             rope_scale_factor: 1.0,
             rope_original_ctx: 0,
             yarn_beta_fast: 32.0,
@@ -257,6 +269,12 @@ impl From<spite_loader::config::ModelHyperparams> for ModelConfig {
             compress_ratios: h.compress_ratios.iter().map(|&x| x as usize).collect(),
             compress_rope_base: h.compress_rope_base,
             n_expert_shared: h.n_expert_shared as usize,
+            indexer_n_head: h.indexer_n_head as usize,
+            indexer_head_size: h.indexer_head_size as usize,
+            indexer_top_k: h.indexer_top_k as usize,
+            indexer_types: h.indexer_types,
+            key_length_mla: h.key_length_mla as usize,
+            value_length_mla: h.value_length_mla as usize,
             ..Default::default()
         }
     }
@@ -309,6 +327,7 @@ impl Default for ArchRegistry {
                 ("mistral4", |c| Box::new(mistral::Mistral4::new(c))),
                 ("magistral", |c| Box::new(mistral::Mistral4::new(c))),
                 // ── Qwen family ──────────────────────────────────────────────
+                ("qwen3", |c| Box::new(qwen::Qwen3_5::new(c))),
                 ("qwen35", |c| Box::new(qwen::Qwen3_5::new(c))),
                 ("qwen35moe", |c| Box::new(qwen::Qwen3_5::new(c))),
                 ("qwen4", |c| Box::new(qwen::Qwen4::new(c))),

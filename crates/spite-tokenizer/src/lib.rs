@@ -117,6 +117,19 @@ pub struct Tokenizer {
     unigram: Option<sentencepiece::UnigramModel>,
     /// token string → id, for BPE byte lookup and merge resolution.
     vocab_map: std::collections::HashMap<String, u32>,
+    /// Whether prompts should be prefixed with BOS. Taken from
+    /// `tokenizer.ggml.add_bos_token`; when absent, SentencePiece models
+    /// default to true and byte-level BPE models (GPT-2/Qwen3) to false —
+    /// prepending `<|endoftext|>` to a Qwen3 base prompt measurably degrades
+    /// the next-token distribution.
+    add_bos: bool,
+    /// Whether this BPE vocabulary spells its bytes with the GPT-2
+    /// `bytes_to_unicode` alphabet (Qwen2/Qwen3, GPT-2), where 0x20 is 'Ġ'.
+    /// Raw-byte BPE vocabularies instead list bytes literally, so the
+    /// remapping must be skipped for them. Detected from the vocab itself
+    /// rather than assumed from `tokenizer.ggml.model`, since both spellings
+    /// report `"gpt2"`.
+    byte_level: bool,
 }
 
 impl Tokenize for Tokenizer {
@@ -196,6 +209,7 @@ impl Tokenizer {
             .collect();
 
         let kind_str = model.get_str("tokenizer.ggml.model").unwrap_or("gpt2");
+        let add_bos_default = matches!(kind_str, "llama" | "unigram");
         let kind = match kind_str {
             "llama" | "unigram" => TokenizerKind::SentencePiece,
             "bert" | "wordpiece" => TokenizerKind::WordPiece,
@@ -230,6 +244,18 @@ impl Tokenizer {
             _ => None,
         };
 
+        // Look for a *remapped* byte, i.e. one GPT-2 does not keep as
+        // itself: 'Ġ' (0x20) is the canonical marker and is absent from
+        // raw-byte vocabularies. Requiring several keeps a stray literal 'Ġ'
+        // in an unrelated vocab from misfiring.
+        let remapped = [0x20u8, 0x0A, 0x09, 0x00, 0x7F];
+        let byte_level = matches!(kind, TokenizerKind::Bpe)
+            && remapped
+                .iter()
+                .filter(|&&b| vocab_map.contains_key(bpe::byte_level_char(b).to_string().as_str()))
+                .count()
+                >= 3;
+
         let u32_id = |key: &str, default: u32| model.get_u32(key).unwrap_or(default);
         Ok(Self {
             vocab: Vocab {
@@ -245,7 +271,23 @@ impl Tokenizer {
             merges,
             unigram,
             vocab_map,
+            add_bos: match model.get_u32("tokenizer.ggml.add_bos_token") {
+                Some(v) => v != 0,
+                None => add_bos_default,
+            },
+            byte_level,
         })
+    }
+
+    /// Whether this BPE vocabulary uses the GPT-2 byte-level alphabet.
+    pub fn is_byte_level(&self) -> bool {
+        self.byte_level
+    }
+
+    /// Whether this tokenizer wants prompts prefixed with BOS. See the
+    /// `add_bos` field; callers should pass this to [`Tokenizer::encode`].
+    pub fn add_bos(&self) -> bool {
+        self.add_bos
     }
 
     /// Encode text to token ids. Prepends BOS if `add_bos` is true.
@@ -261,10 +303,16 @@ impl Tokenizer {
                     .as_ref()
                     .ok_or_else(|| TokenizerError::Encode("no BPE merge table".into()))?;
                 for word in bpe::pretokenize_gpt2(text) {
-                    // Map each byte to its single-byte token id.
+                    // Map each byte to its single-byte token id. Byte-level
+                    // vocabularies (Qwen2/Qwen3, GPT-2) spell bytes as
+                    // printable unicode, e.g. 0x20 is 'Ġ'.
                     let mut bytes = Vec::with_capacity(word.len());
                     for &b in word.as_bytes() {
-                        let s = (b as char).to_string();
+                        let s = if self.byte_level {
+                            bpe::byte_level_char(b).to_string()
+                        } else {
+                            (b as char).to_string()
+                        };
                         match self.vocab_map.get(&s) {
                             Some(&id) => bytes.push(id),
                             None => {
@@ -316,6 +364,21 @@ impl Tokenizer {
                 bytes.push(b);
                 continue;
             }
+            if self.byte_level {
+                // Byte-level BPE: every alphabet char is one byte, so decode
+                // char-by-char rather than re-encoding the string. Chars
+                // outside the alphabet (special tokens) pass through as UTF-8.
+                for c in tok.chars() {
+                    match bpe::byte_level_byte(c) {
+                        Some(b) => bytes.push(b),
+                        None => {
+                            let mut buf = [0u8; 4];
+                            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
+                continue;
+            }
             bytes.extend_from_slice(tok.replace('▁', " ").as_bytes());
         }
         String::from_utf8_lossy(&bytes).into_owned()
@@ -323,15 +386,32 @@ impl Tokenizer {
 
     /// Decode a single token id — used for streaming output.
     pub fn decode_one(&self, id: u32) -> Cow<'_, str> {
-        if let Some(tok) = self.vocab.token_to_str(id) {
-            if let Some(hex) = tok.strip_prefix("<0x").and_then(|s| s.strip_suffix('>'))
-                && let Ok(b) = u8::from_str_radix(hex, 16)
-            {
-                return Cow::Owned((b as char).to_string());
-            }
-            return Cow::Borrowed(tok);
+        let Some(tok) = self.vocab.token_to_str(id) else {
+            return Cow::Borrowed("");
+        };
+        if let Some(hex) = tok.strip_prefix("<0x").and_then(|s| s.strip_suffix('>'))
+            && let Ok(b) = u8::from_str_radix(hex, 16)
+        {
+            return Cow::Owned((b as char).to_string());
         }
-        Cow::Borrowed("")
+        if self.byte_level {
+            // Byte-level BPE: map each alphabet char back to its byte, same as
+            // `decode`, so streamed text matches the batch path.
+            if tok.chars().any(|c| bpe::byte_level_byte(c).is_some()) {
+                let mut bytes = Vec::with_capacity(tok.len());
+                for c in tok.chars() {
+                    match bpe::byte_level_byte(c) {
+                        Some(b) => bytes.push(b),
+                        None => {
+                            let mut buf = [0u8; 4];
+                            bytes.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
+                return Cow::Owned(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        Cow::Borrowed(tok)
     }
 }
 
