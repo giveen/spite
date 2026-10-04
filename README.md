@@ -68,7 +68,7 @@ model you want, filter by GGUF, and download a quantized version that fits
 your GPU's VRAM.
 
 | VRAM  | Recommended quant | Fits                                          | Size on disk |
-|-------|-------------------|-----------------------------------------------|--------------|
+|-------|-------------------|-----------------------------------------------|--|
 | 4 GB  | Q4_K_M            | 7B — keep context short                       | 3.9 GB       |
 | 8 GB  | Q5_K_M            | 7B higher quality, or 13B at Q4_K_M           | 4.8 / 7.3 GB |
 | 12 GB | Q6_K              | 7B near-lossless, or 13B good quality         | 5.7 / 10.6 GB |
@@ -90,20 +90,24 @@ The Rust host runs without GPU kernels (using the generic CPU fallback), but
 for full speed you'll want to compile the kernels for your GPU.
 
 ```bash
-# Find your GPU architecture first — the benchmark tool shows it:
+# Find your GPU architecture — the benchmark tool detects and prints it:
 ./target/release/spite benchmark --model ~/models/your.gguf
 
-# Build kernels for your card
+# Build GPU kernels for your card
 cmake -B build \
   -DSPITE_MODELS="llama3"    \
   -DSPITE_GPU_ARCHS="sm_89"  \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
+cmake --install build --prefix .
+```
 
-# Then run with kernels
+The install step copies the compiled kernels into `./kernels/`, which spite
+checks automatically. After that, run normally — no extra flags:
+
+```bash
 ./target/release/spite run \
   --model ~/models/your.gguf \
-  --kernels-dir build/kernels \
   --prompt "Hello"
 ```
 
