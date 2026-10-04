@@ -11,7 +11,7 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 // ── Tensor type tag ────────────────────────────────────────────────────────
 
@@ -29,15 +29,53 @@ pub enum SpiteType {
     Q6K = 14,
 }
 
+impl SpiteType {
+    /// Bytes per atomic storage unit (bytes-per-element for full-precision,
+    /// bytes-per-block for block-quantised types).
+    pub fn block_bytes(self) -> u64 {
+        match self {
+            Self::F32  => 4,
+            Self::F16  => 2,
+            Self::Bf16 => 2,
+            Self::Q8_0 => 34,   // 32-elem block: f16 scale + 32×i8
+            Self::Q5_1 => 24,   // 32-elem block: f16 d + f16 m + u32 qh + 16×u8
+            Self::Q4_0 => 18,   // 32-elem block: f16 scale + 16×u8
+            Self::Q4K  => 144,  // 256-elem super-block
+            Self::Q5K  => 176,  // 256-elem super-block
+            Self::Q6K  => 210,  // 256-elem super-block
+        }
+    }
+
+    /// Elements per atomic storage block (1 for full-precision types).
+    pub fn block_elements(self) -> u64 {
+        match self {
+            Self::Q8_0 | Self::Q5_1 | Self::Q4_0 => 32,
+            Self::Q4K  | Self::Q5K  | Self::Q6K  => 256,
+            _ => 1,
+        }
+    }
+}
+
 // ── Tensor ─────────────────────────────────────────────────────────────────
 
-/// A view into mmap'd weight data. No allocation, no copy.
-/// `data` points directly into the GGUF buffer; valid for the model's lifetime.
+/// A view into mmap'd weight data or an activation buffer. No allocation, no copy.
+///
+/// `nb` contains **byte** strides per dimension:
+/// - `nb[0]` = `kind.block_bytes()` (bytes per block/element)
+/// - `nb[1]` = `nb[0] * (ne[0] / kind.block_elements())` (bytes per row)
+/// - `nb[2]` = `nb[1] * ne[1]` (bytes per matrix)
+/// - `nb[3]` = `nb[2] * ne[2]` (bytes per batch item)
+///
+/// The executor guarantees all tensors passed to external kernel `.so` files are
+/// contiguous. Use `is_contiguous()` to assert this at kernel entry during
+/// development.
 #[repr(C)]
 pub struct SpiteTensor {
     pub data: *mut c_void,
-    /// Dimensions: ne[0]=cols, ne[1]=rows, ne[2..] for higher dims.
-    pub ne: [u32; 4],
+    /// Dimensions: ne[0]=cols, ne[1]=rows, ne[2]=matrices, ne[3]=batch.
+    pub ne:   [u32; 4],
+    /// Byte strides — see struct comment. nb[0]=0 means zero-sized tensor.
+    pub nb:   [u64; 4],
     pub kind: SpiteType,
 }
 
@@ -49,13 +87,43 @@ impl SpiteTensor {
     pub const fn null() -> Self {
         Self {
             data: core::ptr::null_mut(),
-            ne: [0; 4],
+            ne:   [0; 4],
+            nb:   [0; 4],
             kind: SpiteType::F32,
         }
     }
 
     pub fn is_null(&self) -> bool {
         self.data.is_null()
+    }
+
+    /// True iff strides are tightly packed (no padding, no transposition).
+    pub fn is_contiguous(&self) -> bool {
+        if self.nb[0] == 0 {
+            return true;
+        }
+        let blk = self.kind.block_elements();
+        let row = self.nb[0] * (self.ne[0] as u64 / blk);
+        if self.ne[1] > 1 && self.nb[1] != row {
+            return false;
+        }
+        if self.ne[2] > 1 && self.nb[2] != self.nb[1] * self.ne[1] as u64 {
+            return false;
+        }
+        if self.ne[3] > 1 && self.nb[3] != self.nb[2] * self.ne[2] as u64 {
+            return false;
+        }
+        true
+    }
+
+    /// Compute contiguous byte strides for the given type and shape.
+    pub fn contiguous_strides(kind: SpiteType, ne: &[u32; 4]) -> [u64; 4] {
+        let blk = kind.block_elements();
+        let nb0 = kind.block_bytes();
+        let nb1 = nb0 * (ne[0] as u64 / blk).max(1);
+        let nb2 = nb1 * ne[1] as u64;
+        let nb3 = nb2 * ne[2] as u64;
+        [nb0, nb1, nb2, nb3]
     }
 }
 

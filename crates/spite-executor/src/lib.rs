@@ -18,13 +18,32 @@
 
 use std::ffi::c_int;
 
-use spite_abi::{ShardStrategy, SpiteCtx};
+use spite_abi::{ShardStrategy, SpiteCtx, SpiteTensor};
 use spite_kvcache::{Cache, KvQuantConfig};
 use spite_offload::OffloadConfig;
 use spite_plugin::{PluginKey, Registry};
 use spite_sampling::{DefaultSampler, Sampler};
 use spite_tokenizer::Tokenize;
 use thiserror::Error;
+
+// ── Contiguity guard ──────────────────────────────────────────────────────
+
+/// Panic with a diagnostic message if `t` is not contiguous.
+///
+/// Call this at each executor dispatch site before invoking an external kernel
+/// `.so`. All kernels compiled against ABI v4 assume contiguous inputs; a
+/// non-contiguous tensor here means a KV-cache view or activation slice was
+/// passed without materialising it first.
+#[track_caller]
+pub fn require_contiguous(t: &SpiteTensor, name: &str) {
+    assert!(
+        t.is_contiguous(),
+        "tensor '{name}' passed to kernel dispatch is not contiguous \
+         (ne={:?} nb={:?} kind={:?}). \
+         Materialise strided views before dispatch.",
+        t.ne, t.nb, t.kind,
+    );
+}
 
 // ── Per-request overrides ─────────────────────────────────────────────────
 
