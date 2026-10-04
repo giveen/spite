@@ -130,8 +130,8 @@ is not).
 
 ## What agents may do
 
-- Open PRs on any branch that is not `main` or `master`
-- Push commits to feature branches
+- Open PRs from their own branch or fork
+- Push commits to their own branch (the one they opened the PR from)
 - Run `cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`
 - Run `spite verify` and `spite bench`
 - Use GitHub MCP tools to create PRs, add comments, and read CI results
@@ -140,6 +140,7 @@ is not).
 ## What agents must not do
 
 - Push to `main` or `master` directly
+- Push to another contributor's branch without their explicit request
 - Force-push to any branch
 - Modify `kernels/<model>/<arch>/` files that belong to a different GPU architecture
 - Change `ABI_VERSION` without a corresponding struct or signature change
