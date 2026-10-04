@@ -30,10 +30,10 @@ pub struct Weight {
 }
 
 impl Weight {
-    fn rows(&self) -> usize {
+    pub(crate) fn rows(&self) -> usize {
         self.ne[1].max(1) as usize
     }
-    fn cols(&self) -> usize {
+    pub(crate) fn cols(&self) -> usize {
         self.ne[0].max(1) as usize
     }
 }
@@ -67,6 +67,18 @@ impl DenseWeights {
         self.tensors
             .get(name)
             .ok_or_else(|| ModelError::MissingWeight(name.into()))
+    }
+
+    /// Build from explicit (data, shape) pairs. Test-only helper for
+    /// constructing tiny synthetic models without a GGUF file.
+    #[cfg(test)]
+    pub fn from_map(map: HashMap<String, (Vec<f32>, [u32; 4])>) -> Self {
+        Self {
+            tensors: map
+                .into_iter()
+                .map(|(k, (data, ne))| (k, Weight { data, ne }))
+                .collect(),
+        }
     }
 }
 
@@ -139,7 +151,7 @@ fn gelu(x: f32) -> f32 {
 }
 
 /// RMS norm over `x` with `weight`, matching llama.cpp `llm_graph` norm.
-fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
+pub(crate) fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     let mean_sq = x.iter().map(|&v| v * v).sum::<f32>() / x.len() as f32;
     let scale = 1.0 / (mean_sq + eps).sqrt();
     for ((o, &v), &w) in out.iter_mut().zip(x.iter()).zip(weight.iter()) {
@@ -148,7 +160,7 @@ fn rmsnorm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
 }
 
 /// `out[r] = Σ_c w[c*rows + r] * x[c]` — GGUF weights are `[cols, rows]`.
-fn matvec(w: &Weight, x: &[f32], out: &mut [f32]) -> Result<(), ModelError> {
+pub(crate) fn matvec(w: &Weight, x: &[f32], out: &mut [f32]) -> Result<(), ModelError> {
     let (rows, cols) = (w.rows(), w.cols());
     if x.len() != cols || out.len() != rows || w.data.len() != rows * cols {
         return Err(ModelError::Forward("matvec shape mismatch".into()));

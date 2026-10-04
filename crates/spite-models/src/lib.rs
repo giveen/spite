@@ -66,6 +66,16 @@ pub struct ModelConfig {
     pub norm_eps: f32,
     /// Sliding-window span for local-attention archs. None = full attention.
     pub sliding_window: Option<usize>,
+    /// Gated-delta-net geometry for hybrid archs (0 = not hybrid).
+    pub ssm_d_conv: usize,
+    pub ssm_d_inner: usize,
+    pub ssm_d_state: usize,
+    pub ssm_dt_rank: usize,
+    pub ssm_n_group: usize,
+    /// iRoPE dimension sections (Qwen3.5-style interleaved rope).
+    pub rope_sections: [u32; 4],
+    /// Per-layer recurrent flags for hybrid archs.
+    pub recurrent_layers: Vec<bool>,
 
     // ── RoPE scaling (YaRN / linear / NTK) ───────────────────────────────
     /// Multiplicative rope scale factor. 1.0 = no scaling (default).
@@ -115,6 +125,13 @@ impl Default for ModelConfig {
             rope_theta: 10000.0,
             norm_eps: 1e-5,
             sliding_window: None,
+            ssm_d_conv: 0,
+            ssm_d_inner: 0,
+            ssm_d_state: 0,
+            ssm_dt_rank: 0,
+            ssm_n_group: 0,
+            rope_sections: [0; 4],
+            recurrent_layers: Vec::new(),
             rope_scale_factor: 1.0,
             rope_original_ctx: 0,
             yarn_beta_fast: 32.0,
@@ -138,6 +155,13 @@ impl From<spite_loader::config::ModelHyperparams> for ModelConfig {
             rope_theta: h.rope_theta,
             norm_eps: h.norm_eps,
             sliding_window: (h.sliding_window > 0).then_some(h.sliding_window as usize),
+            ssm_d_conv: h.ssm_d_conv as usize,
+            ssm_d_inner: h.ssm_d_inner as usize,
+            ssm_d_state: h.ssm_d_state as usize,
+            ssm_dt_rank: h.ssm_dt_rank as usize,
+            ssm_n_group: h.ssm_n_group as usize,
+            rope_sections: h.rope_sections,
+            recurrent_layers: h.recurrent_layers,
             ..Default::default()
         }
     }

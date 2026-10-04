@@ -7,6 +7,7 @@
 
 pub mod dequant;
 pub mod flash_attn;
+pub mod linear_attn;
 pub mod matmul;
 
 use thiserror::Error;
