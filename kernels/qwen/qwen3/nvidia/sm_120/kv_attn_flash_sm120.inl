@@ -55,10 +55,14 @@ __global__ void kvflash_core_sm120(const float* __restrict__ q, const uint8_t* _
                                    int nh, int group, int n_tok, int per, float scale,
                                    float* __restrict__ wm, float* __restrict__ wl,
                                    float* __restrict__ wacc) {
+    /* The block decoders below index a head's VBR blocks from the head offset,
+     * which only holds when a head range starts on a 32-element block boundary;
+     * the same multiple of 32 makes the lane->dim mapping exact. */
+    static_assert(HD % 32 == 0, "flash tile: head_dim must be a multiple of 32");
     /* A lane owns 4 consecutive output dims once it can fill a float4, and
      * strided single dims otherwise. */
     constexpr bool VEC4 = (HD % 128) == 0;
-    constexpr int ND = VEC4 ? HD / 128 : (HD + 31) / 32;
+    constexpr int ND = VEC4 ? HD / 128 : HD / 32;
 
     const int lane = threadIdx.x;
     const int w = threadIdx.y;
@@ -284,11 +288,11 @@ __global__ void kvflash_core_sm120(const float* __restrict__ q, const uint8_t* _
     }
 }
 
+/* Same coverage as the portable tile kernel: multiples of 32, where the head
+ * range starts on a VBR block boundary and the lane->dim mapping is exact.
+ * Other head dims take the VBR back end via kvflash_run()'s fallback. */
 inline bool kvflash_hd_supported(int hd) {
-    /* float4 staging wants a head_dim divisible by 4; the vector widths above
-     * degrade per lane count, so every shape the portable core covers is also
-     * covered here. */
-    return hd == 32 || hd == 64 || hd == 80 || hd == 96 || hd == 128;
+    return hd == 32 || hd == 64 || hd == 96 || hd == 128;
 }
 
 template <int HD>
@@ -307,7 +311,6 @@ inline int kvflash_launch_hd(const KvattnArgs& a, int chunks, int per, float* ac
     switch (a.hd) {
     case 32: return kvflash_launch_tile<32>(a, chunks, per, acc, m, l, s);
     case 64: return kvflash_launch_tile<64>(a, chunks, per, acc, m, l, s);
-    case 80: return kvflash_launch_tile<80>(a, chunks, per, acc, m, l, s);
     case 96: return kvflash_launch_tile<96>(a, chunks, per, acc, m, l, s);
     case 128: return kvflash_launch_tile<128>(a, chunks, per, acc, m, l, s);
     default: return -1;

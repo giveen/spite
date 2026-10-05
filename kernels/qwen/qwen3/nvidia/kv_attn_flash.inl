@@ -82,7 +82,11 @@ __global__ void kvflash_core_portable(const float* __restrict__ q,
                                       int nh, int group, int n_tok, int per, float scale,
                                       float* __restrict__ wm, float* __restrict__ wl,
                                       float* __restrict__ wacc) {
-    constexpr int NLANE = (HD + 31) / 32;  /* output dims owned by one lane */
+    /* A lane owns KV row `lane` in the score phase and dims lane+32e in the
+     * P.V phase, so the head range must split evenly across lanes and start on
+     * a VBR block boundary. */
+    static_assert(HD % 32 == 0, "flash tile: head_dim must be a multiple of 32");
+    constexpr int NLANE = HD / 32;  /* output dims owned by one lane */
     const int lane = threadIdx.x;
     const int w = threadIdx.y;
     const int nwarps = blockDim.y;
@@ -116,16 +120,96 @@ __global__ void kvflash_core_portable(const float* __restrict__ q,
     for (int t0 = t_begin; t0 < t_end; t0 += KVFLASH_TILE) {
         /* Stage K and V for this tile, decoded to float, once for the group.
          * Warp w owns rows w, w+nwarps, ... and the lanes walk a row, so the
-         * global side is coalesced and the smem side is conflict-free. */
+         * global side is coalesced and the smem side is conflict-free.
+         *
+         * The block tiers decode inline rather than through kvq_get(): element
+         * lane+32k of a head sits in block k at position lane, so the block
+         * index is the loop index and the per-element tier switch plus block
+         * address math disappear from the hottest loop in the op. */
         for (int t = w; t < KVFLASH_TILE; t += nwarps) {
             const int gt = t0 + t;
             const bool ok = gt < t_end;
             const uint8_t* kr = kc + static_cast<size_t>(gt) * row_bytes;
             const uint8_t* vr = vc + static_cast<size_t>(gt) * row_bytes;
+            float* skrow = s_k[t];
+            float* svrow = s_v[t];
+
+            if (kind == SPITE_TYPE_F32) {
+                const float* kf =
+                    reinterpret_cast<const float*>(kr) + static_cast<size_t>(kh) * HD;
+                const float* vf =
+                    reinterpret_cast<const float*>(vr) + static_cast<size_t>(kh) * HD;
 #pragma unroll 4
-            for (int i = lane; i < HD; i += 32) {
-                s_k[t][i] = ok ? kvq_get(kr, kind, kh * HD + i) : 0.0f;
-                s_v[t][i] = ok ? kvq_get(vr, kind, kh * HD + i) : 0.0f;
+                for (int i = lane; i < HD; i += 32) {
+                    skrow[i] = ok ? kf[i] : 0.0f;
+                    svrow[i] = ok ? vf[i] : 0.0f;
+                }
+            } else if (kind == SPITE_TYPE_F16) {
+                const __half* khs =
+                    reinterpret_cast<const __half*>(kr) + static_cast<size_t>(kh) * HD;
+                const __half* vhs =
+                    reinterpret_cast<const __half*>(vr) + static_cast<size_t>(kh) * HD;
+#pragma unroll 4
+                for (int i = lane; i < HD; i += 32) {
+                    skrow[i] = ok ? __half2float(khs[i]) : 0.0f;
+                    svrow[i] = ok ? __half2float(vhs[i]) : 0.0f;
+                }
+            } else if (kind == SPITE_TYPE_Q8_0) {
+                const BlockQ8_0* kb =
+                    reinterpret_cast<const BlockQ8_0*>(kr) + static_cast<size_t>(kh) * (HD / 32);
+                const BlockQ8_0* vb =
+                    reinterpret_cast<const BlockQ8_0*>(vr) + static_cast<size_t>(kh) * (HD / 32);
+#pragma unroll
+                for (int k = 0; k < HD / 32; ++k) {
+                    skrow[lane + 32 * k] =
+                        ok ? __half2float(kb[k].d) * static_cast<float>(kb[k].qs[lane]) : 0.0f;
+                    svrow[lane + 32 * k] =
+                        ok ? __half2float(vb[k].d) * static_cast<float>(vb[k].qs[lane]) : 0.0f;
+                }
+            } else if (kind == SPITE_TYPE_Q5_1) {
+                const KvqQ5_1* kb =
+                    reinterpret_cast<const KvqQ5_1*>(kr) + static_cast<size_t>(kh) * (HD / 32);
+                const KvqQ5_1* vb =
+                    reinterpret_cast<const KvqQ5_1*>(vr) + static_cast<size_t>(kh) * (HD / 32);
+#pragma unroll
+                for (int k = 0; k < HD / 32; ++k) {
+                    if (ok) {
+                        const int j = lane & 15;
+                        const uint8_t kbq = kb[k].qs[j];
+                        const uint8_t vbq = vb[k].qs[j];
+                        const uint32_t klo = (lane < 16) ? (kbq & 0x0Fu) : (kbq >> 4);
+                        const uint32_t vlo = (lane < 16) ? (vbq & 0x0Fu) : (vbq >> 4);
+                        const uint32_t kq = klo | (((kb[k].qh >> lane) & 1u) << 4);
+                        const uint32_t vq = vlo | (((vb[k].qh >> lane) & 1u) << 4);
+                        skrow[lane + 32 * k] =
+                            static_cast<float>(kq) * __half2float(kb[k].d) + __half2float(kb[k].m);
+                        svrow[lane + 32 * k] =
+                            static_cast<float>(vq) * __half2float(vb[k].d) + __half2float(vb[k].m);
+                    } else {
+                        skrow[lane + 32 * k] = 0.0f;
+                        svrow[lane + 32 * k] = 0.0f;
+                    }
+                }
+            } else { /* SPITE_TYPE_Q4_0 */
+                const KvqQ4_0* kb =
+                    reinterpret_cast<const KvqQ4_0*>(kr) + static_cast<size_t>(kh) * (HD / 32);
+                const KvqQ4_0* vb =
+                    reinterpret_cast<const KvqQ4_0*>(vr) + static_cast<size_t>(kh) * (HD / 32);
+#pragma unroll
+                for (int k = 0; k < HD / 32; ++k) {
+                    if (ok) {
+                        const int j = lane & 15;
+                        const uint8_t kbq = kb[k].qs[j];
+                        const uint8_t vbq = vb[k].qs[j];
+                        const int klo = (lane < 16) ? (kbq & 0x0F) : (kbq >> 4);
+                        const int vlo = (lane < 16) ? (vbq & 0x0F) : (vbq >> 4);
+                        skrow[lane + 32 * k] = static_cast<float>(klo - 8) * __half2float(kb[k].d);
+                        svrow[lane + 32 * k] = static_cast<float>(vlo - 8) * __half2float(vb[k].d);
+                    } else {
+                        skrow[lane + 32 * k] = 0.0f;
+                        svrow[lane + 32 * k] = 0.0f;
+                    }
+                }
             }
         }
         __syncthreads();
@@ -196,8 +280,12 @@ __global__ void kvflash_core_portable(const float* __restrict__ q,
     }
 }
 
+/* Head dims the tile kernel covers: multiples of 32, so a head's element range
+ * both splits evenly across the 32 lanes and starts on a VBR block boundary.
+ * Anything else (hd=80, hd=256, …) needs no special handling — kvflash_run()
+ * hands it to the VBR back end, which decodes through kvq_get() element-wise. */
 inline bool kvflash_hd_supported(int hd) {
-    return hd == 32 || hd == 64 || hd == 80 || hd == 96 || hd == 128;
+    return hd == 32 || hd == 64 || hd == 96 || hd == 128;
 }
 
 template <int HD>
@@ -216,7 +304,6 @@ inline int kvflash_launch_hd(const KvattnArgs& a, int chunks, int per, float* ac
     switch (a.hd) {
     case 32: return kvflash_launch_tile<32>(a, chunks, per, acc, m, l, s);
     case 64: return kvflash_launch_tile<64>(a, chunks, per, acc, m, l, s);
-    case 80: return kvflash_launch_tile<80>(a, chunks, per, acc, m, l, s);
     case 96: return kvflash_launch_tile<96>(a, chunks, per, acc, m, l, s);
     case 128: return kvflash_launch_tile<128>(a, chunks, per, acc, m, l, s);
     default: return -1;

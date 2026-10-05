@@ -763,12 +763,18 @@ def main():
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=64, ffn_dim=128)
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=2048, ffn_dim=4096)
 
-    # head_dim=16 is outside every GPU kernel's flash dispatch, so this pair
-    # pins the portable VBR back end; the two below pin the flash back end
-    # (one tile + tail, then a multi-tile history that splits across chunks).
+    # head_dim 16 and 80 are outside every GPU kernel's flash dispatch, so these
+    # pin the portable VBR back end at both ends of its range; the rest pin the
+    # flash back end: one tile plus a tail, a non-power-of-two head_dim whose
+    # lanes own three dims each, and a multi-tile history that splits across
+    # chunks.
     passed &= verify_attention(ref_info, test_info, cuda, is_cuda, use_qk_norm=True)
     passed &= verify_attention(ref_info, test_info, cuda, is_cuda, use_qk_norm=False)
+    passed &= verify_attention(ref_info, test_info, cuda, is_cuda, head_dim=80, n_ctx=160, pos=20,
+                               use_qk_norm=True)
     passed &= verify_attention(ref_info, test_info, cuda, is_cuda, head_dim=64, n_ctx=96, pos=7,
+                               use_qk_norm=True)
+    passed &= verify_attention(ref_info, test_info, cuda, is_cuda, head_dim=96, n_ctx=160, pos=20,
                                use_qk_norm=True)
     passed &= verify_attention(ref_info, test_info, cuda, is_cuda, head_dim=64, n_ctx=320, pos=140,
                                use_qk_norm=True)
