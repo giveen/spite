@@ -71,12 +71,11 @@ Any violation of these triggers must be **rejected**:
 ### Level 2 — Structural & Architectural Patterns (Request Changes)
 
 - **Trigger: Misplaced Kernel Scope**
-  - *Rule*: Code must live at the exact scope of its benefit:
-    - `kernels/generic/generic/`: algorithmic improvement benefiting all GPUs & CPU fallback.
-    - `kernels/generic/<company>/<arch>/`: arch-wide optimizations across models (e.g. `nvidia/sm_89/`).
-    - `kernels/<family>/<model>/<company>/`: generic model baseline across all GPUs of a vendor (guiding principle, e.g. `qwen/qwen3/nvidia/`).
-    - `kernels/<family>/<model>/<company>/<arch>/`: model variant on an architecture.
-    - `kernels/<family>/<model>/<company>/<arch>/<card>/`: specific card tuning (e.g. `qwen/qwen3/nvidia/sm_120/rtx_5090/`).
+  - *Rule*: Code must live at the exact scope of its benefit, resolved by answering 4 guiding questions:
+    1. *Does this benefit EVERYONE running that model on any hardware?* → `kernels/generic/generic/` (or `kernels/<family>/<model>/`).
+    2. *Does this benefit EVERYONE running that BRAND of card (NVIDIA, AMD, Intel, Apple) for this model?* → `kernels/<family>/<model>/<company>/` (vendor root of that model tree, e.g. `qwen/qwen3/nvidia/`).
+    3. *Does this benefit EVERYONE running that specific GPU ARCHITECTURE (`sm_89`, `sm_120`, `rdna3`)?* → `kernels/<family>/<model>/<company>/<arch>/` (or `kernels/generic/<company>/<arch>/` if cross-model).
+    4. *Does this benefit ONLY people running that specific CARD (`rtx_5090`, `rtx_3060`, `rx_7900_xtx`)?* → `kernels/<family>/<model>/<company>/<arch>/<card>/` (narrowest sub-path).
   - *Why*: Prevents architecture directories from being polluted with card-specific tile constraints and ensures vendor-wide baselines are placed at the tree root.
   - *Severity*: **REQUEST CHANGES**
 

@@ -55,6 +55,11 @@ dispatcher finds it automatically.
 
 ### Every GPU is its own module
 
+Kernels are placed according to the **scope of their benefit**:
+- **Everyone running that brand?** `kernels/<family>/<model>/<company>/` (vendor baseline, e.g. general CUDA across all NVIDIA GPUs).
+- **Everyone running that architecture?** `kernels/<family>/<model>/<company>/<arch>/` (e.g. Ada Lovelace FP8 on `sm_89`).
+- **Everyone running that specific card?** `kernels/<family>/<model>/<company>/<arch>/<card>/` (e.g. RTX 4090 tile sizes).
+
 `kernels/llama/llama4/nvidia/sm_89/rtx_4090/` is completely separate from `kernels/llama/llama4/amd/rdna3/rx_7900_xtx/`.
 An RTX 4090 kernel can use FP8 tensor cores. An RX 7900 XTX kernel can exploit
 96 MB of Infinity Cache. An Apple M4 kernel can use the Neural Engine. Each gets

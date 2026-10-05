@@ -27,20 +27,45 @@ finds it automatically. Kernel development requires knowing one GPU; nothing els
 
 ---
 
-## Where does new code belong?
+## Where does new code belong? (Guiding Principles)
 
-Before writing any code, answer this question about the improvement:
+Before writing any code, walk through this **scope-of-benefit decision tree** to determine the exact directory where the code belongs:
 
-| Who benefits? | Where the code lives |
-|---|---|
-| Every model on every GPU (algorithmic improvement, correctness fix) | `kernels/generic/generic/` |
-| One GPU architecture across all models | `kernels/generic/<company>/<arch>/` |
-| One model variant across all GPUs of a vendor (guiding principle) | `kernels/<family>/<model>/<company>/` |
-| One model variant on one GPU architecture | `kernels/<family>/<model>/<company>/<arch>/` |
-| One specific card variant (tile sizes, cache layout, ISA quirk) | `kernels/<family>/<model>/<company>/<arch>/<card>/` (narrowest sub-path) |
-| Rust host / ABI / scheduling / sampling | `crates/spite-<name>/src/` |
+1. **Does this benefit EVERYONE who would run that specific model on any hardware?**
+   - *Scope*: Global algorithmic improvements, mathematical simplifications, or universal CPU fallbacks.
+   - *Location*: `kernels/generic/generic/` (or `kernels/<family>/<model>/`).
+   - *Example*: Universal RMSNorm epsilon handling or attention scaling math.
 
-**Place code at the scope of its benefit.** A tile-size tweak that only helps the RTX 3060 does not belong in the generic sm\_86 directory — it belongs in `nvidia/sm_86/rtx_3060/` with a comment explaining the card constraint. A generic CUDA kernel that works across all NVIDIA GPUs for Qwen3 belongs at `kernels/qwen/qwen3/nvidia/` as the vendor-wide baseline. A math fix that applies to all models belongs in `kernels/generic/generic/` so every GPU gets the improvement automatically.
+2. **Does this benefit EVERYONE who runs that BRAND of card (`nvidia`, `amd`, `intel`, `apple`) for this model?**
+   - *Scope*: Vendor-wide baseline using standard vendor APIs (e.g. portable CUDA C++, HIP, Metal Shading Language) without architecture-locked intrinsics.
+   - *Location*: `kernels/<family>/<model>/<company>/` (vendor root of that model tree).
+   - *Example*: A general CUDA kernel for Qwen3 running on all NVIDIA GPUs lives at `kernels/qwen/qwen3/nvidia/`.
+
+3. **Does this benefit EVERYONE who runs that specific GPU ARCHITECTURE (`sm_89`, `sm_120`, `rdna3`, `arc_battlemage`)?**
+   - *Scope*: Optimizations exploiting architecture-specific ISA features (e.g. FP8 tensor cores, WMMA instructions, matrix multiplication units).
+   - *Location*: `kernels/<family>/<model>/<company>/<arch>/` (or `kernels/generic/<company>/<arch>/` if cross-model).
+   - *Example*: Ada Lovelace FP8 execution for Llama 4 lives at `kernels/llama/llama4/nvidia/sm_89/`.
+
+4. **Does this benefit ONLY people who run that specific CARD (`rtx_5090`, `rtx_4090`, `rtx_3060`, `rx_7900_xtx`)?**
+   - *Scope*: Tuning tailored to physical hardware constraints (L2 cache capacity, shared memory limits, memory bus width, core counts).
+   - *Location*: `kernels/<family>/<model>/<company>/<arch>/<card>/` (narrowest sub-path).
+   - *Example*: A tile-size tweak that specifically fits the RTX 3060's 48 KB shared memory lives at `kernels/qwen/qwen3/nvidia/sm_86/rtx_3060/`.
+
+5. **Rust host / ABI / scheduling / sampling?**
+   - *Location*: `crates/spite-<name>/src/`.
+
+### Summary Mapping
+
+| Who benefits? | Guiding Question | Where the code lives |
+|---|---|---|
+| Every model on every GPU | Algorithmic improvement, math fix | `kernels/generic/generic/` |
+| One GPU architecture across all models | Cross-model arch optimization | `kernels/generic/<company>/<arch>/` |
+| **All GPUs of a brand for one model** | **Benefits everyone on that brand (NVIDIA, AMD, etc.)?** | **`kernels/<family>/<model>/<company>/`** |
+| One model variant on one GPU architecture | Benefits everyone on that arch (`sm_89`, `sm_120`)? | `kernels/<family>/<model>/<company>/<arch>/` |
+| One specific card variant | Benefits everyone on that exact card (`rtx_5090`, `rtx_3060`)? | `kernels/<family>/<model>/<company>/<arch>/<card>/` |
+| Rust host / ABI / scheduling | Host infrastructure | `crates/spite-<name>/src/` |
+
+**Place code at the scope of its benefit.** Never pollute an architecture directory with card-specific tile constraints, and never force a card-specific directory to host vendor-wide baselines.
 
 ---
 
