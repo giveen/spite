@@ -6,6 +6,16 @@ Use the GitHub MCP tools. Do **not** push to `main` or `master` directly.
 
 ---
 
+## Building & Review Skill (Non-Negotiable)
+
+All development, compilation, testing, verification, and code review across spite must follow the rules and methodology defined in the **Spite Building & Review Guide** ([`skill/SKILL.md`](skill/SKILL.md)):
+
+- **Review Mindset & Triggers**: Follow the Linus Torvalds review method detailed in [`skill/SKILL.md`](skill/SKILL.md). Invariant-false triggers (broken ABI, unverified kernels, missing benchmark proof, test skipping, panics on bad inputs) are **immediate rejections**.
+- **Kernel & Host Building**: Follow the explicit CMake and cargo procedures in [`skill/SKILL.md`](skill/SKILL.md).
+- **Correctness & Performance Gates**: All PRs must include `verify.py` confirmation and before/after benchmark results.
+
+---
+
 ## Architecture in one paragraph
 
 spite is a Rust workspace where every layer is replaceable without touching any other.
@@ -140,6 +150,7 @@ is not).
 - Run the kernel verify tool and `spite-bench`
 - Use GitHub MCP tools to create PRs, add comments, and read CI results
 - Add files to `kernels/<family>/<model>/<company>/<arch>/<card>/` without asking — the dispatcher picks them up
+- Consult and follow the building & review guide in [`skill/SKILL.md`](skill/SKILL.md)
 
 ## What agents must not do
 
@@ -150,3 +161,4 @@ is not).
 - Change `ABI_VERSION` without a corresponding struct or signature change
 - Submit a kernel PR without a `.bench` file and before/after numbers
 - Disable or skip tests to make CI pass
+- Violate any Level 1 review triggers defined in [`skill/SKILL.md`](skill/SKILL.md)
