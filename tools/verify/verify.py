@@ -25,7 +25,7 @@ import random
 
 # ── ABI constants (must match core/abi.h) ────────────────────────────────
 
-SPITE_ABI_VERSION = 3
+SPITE_ABI_VERSION = 4
 
 SPITE_TYPE_F32  = 0
 SPITE_TYPE_F16  = 1
@@ -138,28 +138,63 @@ def verify_rms_norm(ref_lib, test_lib, dim: int = 64) -> bool:
         ctypes.POINTER(SpiteCtx),
     )
 
-    def run_rms_norm(lib, out_data):
+    def run_rms_norm(lib, out_data, is_cuda=False):
         out_t, out_arr = make_tensor(out_data)
-        fn_ptr = ctypes.cast(
-            ctypes.c_void_p.in_dll(lib, "spite_generic_rms_norm")
-            if hasattr(lib, "spite_generic_rms_norm") else None,
-            RmsNormFn
-        ) if False else None
-
-        # Use function pointer from KernelInfo struct
-        # For simplicity, call directly if symbol exists
         try:
-            fn = RmsNormFn(("spite_generic_rms_norm", lib))
+            fn_sym = "qwen3_cuda_rms_norm" if is_cuda else "spite_generic_rms_norm"
+            fn = RmsNormFn((fn_sym, lib))
         except AttributeError:
             return None
-        ret = fn(ctypes.byref(out_t), ctypes.byref(x_t), ctypes.byref(w_t),
-                 1e-5, ctypes.byref(ctx))
-        if ret != 0:
-            return None
-        return list(out_arr)
 
-    ref_out  = run_rms_norm(ref_lib,  out_ref)
-    test_out = run_rms_norm(test_lib, out_test)
+        if not is_cuda:
+            ret = fn(ctypes.byref(out_t), ctypes.byref(x_t), ctypes.byref(w_t),
+                     1e-5, ctypes.byref(ctx))
+            if ret != 0:
+                return None
+            return list(out_arr)
+        else:
+            # Stage inputs/outputs via cudart
+            cudart = ctypes.CDLL("libcudart.so")
+            cudart.cudaMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t]
+            cudart.cudaMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+            cudart.cudaFree.argtypes = [ctypes.c_void_p]
+
+            d_x = ctypes.c_void_p()
+            d_w = ctypes.c_void_p()
+            d_out = ctypes.c_void_p()
+            nbytes = dim * 4
+            cudart.cudaMalloc(ctypes.byref(d_x), nbytes)
+            cudart.cudaMalloc(ctypes.byref(d_w), nbytes)
+            cudart.cudaMalloc(ctypes.byref(d_out), nbytes)
+
+            cudart.cudaMemcpy(d_x, ctypes.cast(x_arr, ctypes.c_void_p), nbytes, 1) # H2D
+            cudart.cudaMemcpy(d_w, ctypes.cast(w_arr, ctypes.c_void_p), nbytes, 1) # H2D
+
+            t_x, _ = make_tensor([0.0]*dim)
+            t_w, _ = make_tensor([0.0]*dim)
+            t_o, _ = make_tensor([0.0]*dim)
+            t_x.data = d_x.value
+            t_w.data = d_w.value
+            t_o.data = d_out.value
+
+            ret = fn(ctypes.byref(t_o), ctypes.byref(t_x), ctypes.byref(t_w),
+                     1e-5, ctypes.byref(ctx))
+            cudart.cudaDeviceSynchronize()
+
+            res_arr = (ctypes.c_float * dim)()
+            cudart.cudaMemcpy(ctypes.cast(res_arr, ctypes.c_void_p), d_out, nbytes, 2) # D2H
+
+            cudart.cudaFree(d_x)
+            cudart.cudaFree(d_w)
+            cudart.cudaFree(d_out)
+
+            if ret != 0:
+                return None
+            return list(res_arr)
+
+    ref_out  = run_rms_norm(ref_lib,  out_ref, is_cuda=False)
+    is_cuda = b'sm_' in test_lib.spite_kernel_info().contents.gpu_arch
+    test_out = run_rms_norm(test_lib, out_test, is_cuda=is_cuda)
 
     if ref_out is None:
         print("    SKIP: reference kernel has no rms_norm symbol")

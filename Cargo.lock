@@ -1353,6 +1353,7 @@ dependencies = [
 name = "spite-gpu"
 version = "0.1.0"
 dependencies = [
+ "libloading",
  "spite-abi",
  "thiserror",
 ]
@@ -1401,6 +1402,7 @@ dependencies = [
  "spite-abi",
  "spite-compute",
  "spite-dispatch",
+ "spite-gpu",
  "spite-loader",
  "spite-rope",
  "spite-testkit",

@@ -152,6 +152,12 @@ typedef int (*SpiteRmsNormFn)(
     const SpiteCtx*    ctx
 );
 
+/*
+ * Attention for one token at ctx->pos.
+ * ABI v4: result is ACCUMULATED into out (out += attn(x)) — residual fused.
+ * q_norm / k_norm: optional per-head RMSNorm weights [head_dim] (Qwen3);
+ * NULL when absent. head_dim = wq->ne[1] / ctx->n_heads.
+ */
 typedef int (*SpiteAttentionFn)(
     SpiteTensor*       out,
     const SpiteTensor* x,
@@ -159,6 +165,9 @@ typedef int (*SpiteAttentionFn)(
     const SpiteTensor* wk,
     const SpiteTensor* wv,
     const SpiteTensor* wo,
+    const SpiteTensor* q_norm,
+    const SpiteTensor* k_norm,
+    float              norm_eps,
     SpiteKvCache*      kvcache,
     float              rope_freq_base,
     const SpiteCtx*    ctx              /* pos, n_heads, n_kv_heads live in ctx */
@@ -172,6 +181,7 @@ typedef enum {
     SPITE_FFN_RELU      = 3,  /* ReLU²  — GPT-NeoX variants */
 } SpiteFfnActivation;
 
+/* ABI v4: result is ACCUMULATED into out (out += ffn(x)). */
 typedef int (*SpiteFfnFn)(
     SpiteTensor*        out,
     const SpiteTensor*  x,
@@ -180,6 +190,14 @@ typedef int (*SpiteFfnFn)(
     const SpiteTensor*  w_down,
     SpiteFfnActivation  activation,
     const SpiteCtx*     ctx
+);
+
+/* Dense projection out[r] = sum_c w[r,c] * x[c] (overwrites out). ABI v4. */
+typedef int (*SpiteMatmulFn)(
+    SpiteTensor*       out,
+    const SpiteTensor* x,
+    const SpiteTensor* w,
+    const SpiteCtx*    ctx
 );
 
 /*
@@ -276,6 +294,8 @@ typedef struct {
     SpiteSpecVerifyFn speculative_verify; /* NULL if no optimized impl */
     /* Chunked prefill: process prompt in chunks; caller passes chunk_idx via pos. */
     SpiteLayerFn     prefill;
+    /* Dense projection (LM head). Added in ABI v4. */
+    SpiteMatmulFn    matmul;
 } SpiteKernelInfo;
 
 /* Every kernel .so must export this symbol. */

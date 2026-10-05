@@ -1,0 +1,7 @@
+# Benchmark results for qwen/qwen3 on RTX 5090 (sm_120)
+# Model: /mnt/storage/models/qwen3/Qwen3-8B-Q8_0.gguf
+
+| device | prompt tok/s | decode tok/s | total tok/s | VRAM resident (GiB) | load time (s) |
+|---|---|---|---|---|---|
+| cpu fallback (before) | - | 1.39 | 1.39 | 0.00 (RAM ~32 GiB) | 11.22 |
+| cuda sm_120 (after) | - | 100.28 | 100.28 | 8.11 weights + 1.12 KV | 1.18 |

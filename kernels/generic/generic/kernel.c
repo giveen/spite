@@ -8,6 +8,7 @@
  *   rms_norm  — scalar C, any F32/Q8_0/Q4_K weight
  *   ffn       — scalar C, any F32/Q8_0/Q4_K weight
  *   attention — returns -1 (Rust spite-compute scalar GQA takes over)
+ *   matmul    — scalar C, any F32/Q8_0/Q4_K weight (LM head)
  *   layer     — NULL  (individual ops are dispatched separately)
  *   prefill   — NULL  (Rust handles chunked prefill)
  */
@@ -23,7 +24,10 @@ int spite_generic_ffn(
 int spite_generic_attention(
     SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
     const SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
+    const SpiteTensor*, const SpiteTensor*, float,
     SpiteKvCache*, float, const SpiteCtx*);
+int spite_generic_matmul(
+    SpiteTensor*, const SpiteTensor*, const SpiteTensor*, const SpiteCtx*);
 
 static const SpiteKernelInfo GENERIC_KERNEL_INFO = {
     .abi_version = SPITE_ABI_VERSION,
@@ -45,6 +49,7 @@ static const SpiteKernelInfo GENERIC_KERNEL_INFO = {
     .layer               = NULL,
     .speculative_verify  = NULL,
     .prefill             = NULL,
+    .matmul              = spite_generic_matmul,
 };
 
 const SpiteKernelInfo *spite_kernel_info(void) {

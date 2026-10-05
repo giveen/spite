@@ -147,6 +147,7 @@ pub fn arch_to_family_model(arch: &str) -> (String, String) {
         "mistral4" | "magistral" => ("mistral", "mistral4"),
 
         // ── Qwen ─────────────────────────────────────────────────────────
+        "qwen3" => ("qwen", "qwen3"),
         "qwen35" | "qwen35moe" => ("qwen", "qwen3_5"),
         "qwen4" | "qwen4exp" => ("qwen", "qwen4"),
 

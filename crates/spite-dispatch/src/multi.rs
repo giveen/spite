@@ -61,14 +61,30 @@ impl GpuNode {
     pub fn from_card(raw: &str) -> Self {
         let card_id = normalize_card_name(raw);
         let spec = card_spec(&card_id);
+        // Auto-detection (no --card) hands us a raw arch like "sm_120";
+        // keep it as the kernel arch rather than collapsing to "generic".
+        let gpu_arch = if spec.gpu_arch == "generic" && is_arch_string(&card_id) {
+            card_id.clone()
+        } else {
+            spec.gpu_arch.to_owned()
+        };
         Self {
             card_id,
-            gpu_arch: spec.gpu_arch.to_owned(),
+            gpu_arch,
             vram_gib: spec.vram_gib,
             layers: 0..0, // filled in by MultiGpuSpec::assign_layers
             link_out: CommLink::None,
         }
     }
+}
+
+/// True for kernel-tree arch strings: `sm_<digits>`, `rdna<n>`, `cdna<n>`, `metal`.
+fn is_arch_string(s: &str) -> bool {
+    let digits_after = |p: &str| {
+        s.strip_prefix(p)
+            .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+    };
+    digits_after("sm_") || digits_after("rdna") || digits_after("cdna") || s == "metal"
 }
 
 // ── Communication topology ─────────────────────────────────────────────────

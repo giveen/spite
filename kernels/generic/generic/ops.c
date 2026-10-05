@@ -174,8 +174,14 @@ int spite_generic_ffn(
     /* fuse: gate = silu(gate) * up */
     for (int i = 0; i < ffn; i++) gate[i] = silu(gate[i]) * up[i];
 
-    /* out = w_down × gate  [hidden, ffn] × [ffn, 1] → [hidden, 1] */
-    matmul_f32((float *)out->data, wd, gate, hidden, ffn, 1);
+    /* out += w_down × gate  [hidden, ffn] × [ffn, 1] → [hidden, 1]
+     * ABI v4: ffn accumulates into out (residual fused). */
+    float *down = (float *)malloc((size_t)hidden * sizeof(float));
+    if (!down) { free(gate); free(up); free(wg); free(wu); free(wd); return -1; }
+    matmul_f32(down, wd, gate, hidden, ffn, 1);
+    float *o = (float *)out->data;
+    for (int i = 0; i < hidden; i++) o[i] += down[i];
+    free(down);
 
     free(gate); free(up);
     free(wg); free(wu); free(wd);
@@ -196,11 +202,34 @@ int spite_generic_attention(
     const SpiteTensor *wk,
     const SpiteTensor *wv,
     const SpiteTensor *wo,
+    const SpiteTensor *q_norm,
+    const SpiteTensor *k_norm,
+    float              norm_eps,
     SpiteKvCache      *kvcache,
     float              rope_freq_base,
     const SpiteCtx    *ctx
 ) {
     (void)out; (void)x; (void)wq; (void)wk; (void)wv; (void)wo;
+    (void)q_norm; (void)k_norm; (void)norm_eps;
     (void)kvcache; (void)rope_freq_base; (void)ctx;
     return -1; /* defer to Rust scalar fallback */
+}
+
+/* ── Matmul ───────────────────────────────────────────────────────────── */
+
+/* out[r] = sum_c w[r, c] * x[c]; single token. Reference for GPU matmul. */
+int spite_generic_matmul(
+    SpiteTensor       *out,
+    const SpiteTensor *x,
+    const SpiteTensor *w,
+    const SpiteCtx    *ctx
+) {
+    (void)ctx;
+    if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
+    float *wf = dequant_to_f32(w);
+    if (!wf) return -1;
+    matmul_f32((float *)out->data, wf, (const float *)x->data,
+               tensor_rows(w), tensor_cols(w), 1);
+    free(wf);
+    return 0;
 }

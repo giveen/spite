@@ -93,6 +93,9 @@ impl GpuBackend {
     /// 8. OpenCL:  probe ICD loader; prefer for Adreno devices
     /// 9. Vulkan:  last GPU option before falling back to Cpu
     pub fn detect() -> Self {
+        if cuda::is_available() {
+            return GpuBackend::Cuda;
+        }
         if hip_unified::is_unified() {
             return GpuBackend::HipUnified;
         }

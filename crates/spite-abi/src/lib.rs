@@ -166,6 +166,13 @@ pub type RmsNormFn = unsafe extern "C" fn(
     ctx: *const SpiteCtx,
 ) -> c_int;
 
+/// Attention for one token at `ctx.pos`.
+///
+/// Semantics (ABI v4): the result is **accumulated** into `out`
+/// (`out += attn(x)`), so the residual add is fused into the op.
+/// `q_norm` / `k_norm` are optional per-head RMSNorm weights `[head_dim]`
+/// (Qwen3-style); pass null when the model has none. `norm_eps` applies to
+/// them. `head_dim` is `wq.ne[1] / ctx.n_heads`.
 pub type AttentionFn = unsafe extern "C" fn(
     out: *mut SpiteTensor,
     x: *const SpiteTensor,
@@ -173,9 +180,21 @@ pub type AttentionFn = unsafe extern "C" fn(
     wk: *const SpiteTensor,
     wv: *const SpiteTensor,
     wo: *const SpiteTensor,
+    q_norm: *const SpiteTensor,
+    k_norm: *const SpiteTensor,
+    norm_eps: f32,
     kvcache: *mut SpiteKvCache,
     rope_freq_base: f32,
     ctx: *const SpiteCtx, // pos, n_heads, n_kv_heads are in ctx
+) -> c_int;
+
+/// Dense projection `out[r] = Σ_c w[r, c] · x[c]` (overwrites `out`).
+/// Used for the LM head and any standalone projection.
+pub type MatmulFn = unsafe extern "C" fn(
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
+    w: *const SpiteTensor,
+    ctx: *const SpiteCtx,
 ) -> c_int;
 
 /// FFN activation function selector.
@@ -188,6 +207,8 @@ pub enum FfnActivation {
     Relu = 3,     // ReLU²  — GPT-NeoX variants
 }
 
+/// Gated FFN. Semantics (ABI v4): result is **accumulated** into `out`
+/// (`out += ffn(x)`), fusing the residual add.
 pub type FfnFn = unsafe extern "C" fn(
     out: *mut SpiteTensor,
     x: *const SpiteTensor,
@@ -297,6 +318,8 @@ pub struct SpiteKernelInfo {
     /// at once, enabling interleaving with decode steps and bounding peak memory.
     /// Reuses `LayerFn` signature; the caller passes `chunk_idx` via `pos` in ctx.
     pub prefill: Option<LayerFn>,
+    /// Dense projection (LM head). Added in ABI v4.
+    pub matmul: Option<MatmulFn>,
 }
 
 unsafe impl Send for SpiteKernelInfo {}
