@@ -32,8 +32,8 @@ your card would be faster.
 ## Step 2 — Copy the template
 
 ```bash
-cp kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu \
-   kernels/llama/llama4/sm_120/attention.cu
+cp kernels/llama/llama4/nvidia/sm_89/rtx_4090/KERNEL_TEMPLATE.cu \
+   kernels/llama/llama4/nvidia/sm_120/rtx_5090/attention.cu
 ```
 
 Edit the `gpu_arch` field in `kernel_info` at the bottom of the file.
@@ -53,12 +53,12 @@ Start with `ffn` or `rms_norm`. Attention is the most complex.
 ## Step 4 — Build and verify correctness
 
 ```bash
-cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="sm_120" \
+cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="RTX_5090" \
   -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 
 python3 tools/verify/verify.py \
-  build/kernels/llama/llama4/sm_120/libkernel_llama_llama4_sm_120.so
+  build/kernels/llama/llama4/nvidia/sm_120/rtx_5090/libkernel_llama_llama4_nvidia_sm_120_rtx_5090.so
 ```
 
 This runs your kernel against the generic reference implementation on a set
@@ -80,12 +80,14 @@ kernel achieves on your hardware.
 kernels/
   llama/
     llama4/
-      sm_120/
-        attention.cu      ← your file
-        attention.bench   ← the bench output
+      nvidia/
+        sm_120/
+          rtx_5090/
+            attention.cu      ← your file
+            attention.bench   ← the bench output
 ```
 
-PR title format: `kernel: llama/llama4/sm_120 attention`
+PR title format: `kernel: llama/llama4/nvidia/sm_120/rtx_5090 attention`
 
 That's it. No need to touch anything outside the `kernels/` directory.
 

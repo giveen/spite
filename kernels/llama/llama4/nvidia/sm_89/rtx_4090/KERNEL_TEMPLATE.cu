@@ -3,17 +3,17 @@
 //
 // HOW TO USE THIS FILE
 // ────────────────────
-// 1. cp kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu \
-//       kernels/llama/llama4/<your_gpu>/<op_name>.cu
+// 1. cp kernels/llama/llama4/nvidia/sm_89/rtx_4090/KERNEL_TEMPLATE.cu \
+//       kernels/llama/llama4/<company>/<gpu_arch>/<card>/<op_name>.cu
 // 2. Change gpu_arch in KERNEL_INFO at the bottom.
 // 3. Implement one op. Leave the rest returning -1 — the dispatcher
 //    uses the fallback for those.
 // 4. Build the kernels for your card:
-//      cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="<your_gpu>" \
+//      cmake -B build -DSPITE_MODELS="llama/llama4" -DSPITE_GPU_ARCHS="<card_or_arch>" \
 //        && cmake --build build
 // 5. Verify the built .so against the generic reference:
 //      python3 tools/verify/verify.py \
-//        build/kernels/llama/llama4/<your_gpu>/libkernel_llama_llama4_<your_gpu>.so
+//        build/kernels/llama/llama4/<company>/<gpu_arch>/<card>/libkernel_llama_llama4_<company>_<gpu_arch>_<card>.so
 // 6. Benchmark:
 //      cargo run --release -p spite-bench -- --model path/to/model.gguf
 // 7. Paste bench output in your PR description.

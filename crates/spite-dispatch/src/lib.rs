@@ -35,7 +35,9 @@ pub mod resolve;
 
 pub use cards::card_spec;
 pub use multi::{CommLink, GpuNode, MultiGpuSpec};
-pub use resolve::{KernelSpec, arch_to_family_model, detect_card_id, normalize_card_name};
+pub use resolve::{
+    KernelSpec, arch_to_family_model, company_from_arch, detect_card_id, normalize_card_name,
+};
 
 #[derive(Debug, Error)]
 pub enum DispatchError {

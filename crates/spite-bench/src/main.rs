@@ -124,7 +124,11 @@ fn main() -> Result<()> {
     };
 
     if args.verbose {
-        let spec = spite_dispatch::KernelSpec::from_arch(model.config().arch.as_str(), &gpu_arch);
+        let mut spec =
+            spite_dispatch::KernelSpec::from_arch(model.config().arch.as_str(), &gpu_arch);
+        if spec.card_id.is_empty() {
+            spec.card_id = spite_dispatch::detect_card_id(args.card.as_deref().unwrap_or(""));
+        }
         if let Ok(table) = spite_dispatch::DispatchBuilder::new(&args.kernels_dir, spec).build() {
             table.print_sources();
         }

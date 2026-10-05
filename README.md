@@ -55,7 +55,7 @@ dispatcher finds it automatically.
 
 ### Every GPU is its own module
 
-`kernels/llama/llama4/sm_89/` is completely separate from `kernels/llama/llama4/rdna3/`.
+`kernels/llama/llama4/nvidia/sm_89/rtx_4090/` is completely separate from `kernels/llama/llama4/amd/rdna3/rx_7900_xtx/`.
 An RTX 4090 kernel can use FP8 tensor cores. An RX 7900 XTX kernel can exploit
 96 MB of Infinity Cache. An Apple M4 kernel can use the Neural Engine. Each gets
 what makes it fast, not a watered-down kernel that has to work on everything.
@@ -261,7 +261,7 @@ You don't need to understand the scheduler, the tokenizer, the server, or
 anything else. You need:
 - Your GPU
 - One operation to implement (attention, FFN, or rms_norm)
-- The template in `kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu`
+- The template in `kernels/llama/llama4/nvidia/sm_89/rtx_4090/KERNEL_TEMPLATE.cu`
 
 **The steps:**
 
@@ -270,8 +270,8 @@ anything else. You need:
 spite dispatch -m your.gguf --card RTX_5090
 
 # 2. Copy the template for your card
-cp kernels/llama/llama4/sm_89/KERNEL_TEMPLATE.cu \
-   kernels/llama/llama4/sm_120/attention.cu
+cp kernels/llama/llama4/nvidia/sm_89/rtx_4090/KERNEL_TEMPLATE.cu \
+   kernels/llama/llama4/nvidia/sm_120/rtx_5090/attention.cu
 
 # 3. Implement the op (the template has comments for each section)
 
@@ -282,13 +282,13 @@ cmake --build build -j$(nproc)
 
 # 5. Verify correctness — must pass before PR
 python3 tools/verify/verify.py \
-  build/kernels/llama/llama4/sm_120/libkernel_llama_llama4_sm_120.so
+  build/kernels/llama/llama4/nvidia/sm_120/rtx_5090/libkernel_llama_llama4_nvidia_sm_120_rtx_5090.so
 
 # 6. Benchmark and save the output
 cargo run --release -p spite-bench -- --model your.gguf \
-  > kernels/llama/llama4/sm_120/attention.bench
+  > kernels/llama/llama4/nvidia/sm_120/rtx_5090/attention.bench
 
-# 7. Open a PR titled:  kernel: llama/llama4/sm_120 attention
+# 7. Open a PR titled:  kernel: llama/llama4/nvidia/sm_120/rtx_5090 attention
 ```
 
 You only touch the `kernels/` directory. Nothing else breaks when you add a

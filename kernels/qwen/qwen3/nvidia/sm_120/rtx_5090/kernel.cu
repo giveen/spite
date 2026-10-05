@@ -1,5 +1,5 @@
 /*
- * kernels/qwen/qwen3/sm_120/kernel.cu
+ * kernels/qwen/qwen3/nvidia/sm_120/rtx_5090/kernel.cu
  *
  * General-purpose CUDA kernel for Qwen3 dense decoders (no tensor cores,
  * no tiling — correct first, fast later). Every SpiteTensor.data is a
