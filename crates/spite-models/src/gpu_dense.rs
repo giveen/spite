@@ -42,6 +42,7 @@ impl DeviceWeight {
         SpiteTensor {
             data: self.buf.as_ptr().cast(),
             ne: self.ne,
+            nb: SpiteTensor::contiguous_strides(self.kind, &self.ne),
             kind: self.kind,
         }
     }
@@ -49,9 +50,11 @@ impl DeviceWeight {
 
 /// F32 device vector view of `n` elements.
 fn f32_tensor(buf: &DeviceBuffer, n: usize) -> SpiteTensor {
+    let ne = [n as u32, 1, 1, 1];
     SpiteTensor {
         data: buf.as_ptr().cast(),
-        ne: [n as u32, 1, 1, 1],
+        ne,
+        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &ne),
         kind: SpiteType::F32,
     }
 }
@@ -364,15 +367,18 @@ impl ModelArch for GpuDense {
                     w(&format!("{b}.ffn_up.weight"))?,
                     w(&format!("{b}.ffn_down.weight"))?,
                 );
+                let kv_ne = [kv_row as u32, self.n_ctx as u32, 1, 1];
                 let mut kv = SpiteKvCache {
                     k: SpiteTensor {
                         data: st.k_cache[layer].as_ptr().cast(),
-                        ne: [kv_row as u32, self.n_ctx as u32, 1, 1],
+                        ne: kv_ne,
+                        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &kv_ne),
                         kind: SpiteType::F32,
                     },
                     v: SpiteTensor {
                         data: st.v_cache[layer].as_ptr().cast(),
-                        ne: [kv_row as u32, self.n_ctx as u32, 1, 1],
+                        ne: kv_ne,
+                        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &kv_ne),
                         kind: SpiteType::F32,
                     },
                     layer: layer as c_int,

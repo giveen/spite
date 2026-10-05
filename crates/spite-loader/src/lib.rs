@@ -153,6 +153,7 @@ impl GgufModel {
         SpiteTensor {
             data: ptr as *mut _,
             ne: rec.ne,
+            nb: SpiteTensor::contiguous_strides(rec.kind, &rec.ne),
             kind: rec.kind,
         }
     }
