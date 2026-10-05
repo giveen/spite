@@ -23,6 +23,7 @@ use spite_loader::GgufModel;
 
 use crate::dense::{self, Activation, DenseOptions, DenseWeights, KvStore};
 use crate::{ModelArch, ModelConfig, ModelError};
+use spite_kvcache::KvQuantConfig;
 
 pub struct Gemma4 {
     config: ModelConfig,
@@ -54,6 +55,12 @@ impl ModelArch for Gemma4 {
     fn reset_cache(&self) {
         if let Ok(mut kv) = self.kv.write() {
             kv.reset();
+        }
+    }
+
+    fn set_kv_quant(&self, cfg: KvQuantConfig) {
+        if let Ok(mut kv) = self.kv.write() {
+            kv.set_quant(&cfg);
         }
     }
 

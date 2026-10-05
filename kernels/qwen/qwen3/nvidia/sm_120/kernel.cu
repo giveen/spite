@@ -1,16 +1,15 @@
 /*
- * kernels/qwen/qwen3/nvidia/sm_120/rtx_5090/kernel.cu
+ * kernels/qwen/qwen3/nvidia/sm_120/kernel.cu
  *
- * Card-specialized CUDA kernel for Qwen3 dense decoders tuned specifically
- * for NVIDIA GeForce RTX 5090 (Blackwell sm_120, 192 SMs, 96 MB L2, 128 KB SM shmem).
+ * Architecture-specialized CUDA kernel for Qwen3 dense decoders on
+ * Blackwell GPUs (sm_120).
  *
- * Physical hardware tuning:
- *   - Fused Gate-Up FFN with integrated SwiGLU/GeGLU activation:
- *     Eliminates 72 kernel launches per token across 36 decoder layers,
- *     halves memory bandwidth for input activation reads, and completely eliminates
- *     intermediate VRAM roundtrips for the 12,288-dim gate and up tensors.
- *   - 4-warp threadblocks with fully unrolled warp-level fma reductions.
- *   - Vectorized 128-bit float4 loads for RMSNorm and attention dot-products.
+ * Key micro-architectural optimizations:
+ *   - 128-bit vectorized float4 memory loads for row-wise RMSNorm,
+ *     dense matvec, and attention dot-products.
+ *   - Vectorized 32-bit integer loads for Q8_0 weights with fast FMA.
+ *   - Fully unrolled warp reduction shuffles matching Blackwell's dual-issue
+ *     warp schedulers.
  *
  * Weight types: F32, F16, Q8_0. Activations and KV cache: F32.
  */
@@ -104,40 +103,7 @@ __global__ void matvec_q8_0(const BlockQ8_0* __restrict__ w, const float* __rest
     if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
 }
 
-// ── Fused Dual Gate-Up Matvec + SwiGLU Activation for RTX 5090 ───────────
-
-__global__ void matvec_q8_0_fused_gate_up(
-    const BlockQ8_0* __restrict__ w_gate,
-    const BlockQ8_0* __restrict__ w_up,
-    const float* __restrict__ x,
-    float* __restrict__ gate_out,
-    int rows, int cols, int gelu)
-{
-    const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
-    if (row >= rows) return;
-    const int nb = cols / QK8_0;
-    const BlockQ8_0* wr_gate = w_gate + static_cast<size_t>(row) * nb;
-    const BlockQ8_0* wr_up = w_up + static_cast<size_t>(row) * nb;
-    float acc_gate = 0.0f;
-    float acc_up = 0.0f;
-    #pragma unroll 4
-    for (int b = 0; b < nb; ++b) {
-        const float x_val = x[b * QK8_0 + threadIdx.x];
-        const float dg = __half2float(wr_gate[b].d);
-        const float du = __half2float(wr_up[b].d);
-        acc_gate = fmaf(dg * static_cast<float>(wr_gate[b].qs[threadIdx.x]), x_val, acc_gate);
-        acc_up = fmaf(du * static_cast<float>(wr_up[b].qs[threadIdx.x]), x_val, acc_up);
-    }
-    acc_gate = warp_sum(acc_gate);
-    acc_up = warp_sum(acc_up);
-    if (threadIdx.x == 0) {
-        const float a = gelu ? 0.5f * acc_gate * (1.0f + tanhf(0.7978846f * (acc_gate + 0.044715f * acc_gate * acc_gate * acc_gate)))
-                             : acc_gate / (1.0f + __expf(-acc_gate));
-        gate_out[row] = a * acc_up;
-    }
-}
-
-// ── Dense Matvec ─────────────────────────────────────────────────────────
+// ── Vectorized 128-bit Dense Matvec ──────────────────────────────────────
 
 __global__ void matvec_dense_f32_vec4(const float* __restrict__ w, const float* __restrict__ x,
                                       float* __restrict__ y, int rows, int cols, int accumulate) {
@@ -313,29 +279,12 @@ extern "C" int qwen3_cuda_ffn(SpiteTensor* out, const SpiteTensor* x, const Spit
     if (act != SPITE_FFN_SILU_GATE && act != SPITE_FFN_GELU_GATE) return -1;
     if (!ctx) return -1;
     const int d_ffn = static_cast<int>(w_gate->ne[1]);
-    const int cols = static_cast<int>(w_gate->ne[0]);
-    cudaStream_t s = stream_of(ctx);
-    const float* xin = static_cast<const float*>(x->data);
-
-    // If Q8_0 weights and scratchpad available, run RTX 5090 fused dual gate-up kernel
-    if (w_gate->kind == SPITE_TYPE_Q8_0 && w_up->kind == SPITE_TYPE_Q8_0 && ctx->scratchpad &&
-        ctx->scratchpad_bytes >= sizeof(float) * static_cast<size_t>(d_ffn)) {
-        float* gate = static_cast<float*>(ctx->scratchpad);
-        const dim3 block(WARP, ROWS_PER_BLOCK);
-        const dim3 grid((d_ffn + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
-        matvec_q8_0_fused_gate_up<<<grid, block, 0, s>>>(
-            static_cast<const BlockQ8_0*>(w_gate->data),
-            static_cast<const BlockQ8_0*>(w_up->data),
-            xin, gate, d_ffn, cols, act == SPITE_FFN_GELU_GATE);
-        if (launch_matvec(w_down, gate, static_cast<float*>(out->data), true, s)) return -1;
-        return finish();
-    }
-
-    // Fallback for non-Q8_0
     const size_t need = sizeof(float) * 2 * static_cast<size_t>(d_ffn);
     if (!ctx->scratchpad || ctx->scratchpad_bytes < need) return -2;
     float* gate = static_cast<float*>(ctx->scratchpad);
     float* up = gate + d_ffn;
+    cudaStream_t s = stream_of(ctx);
+    const float* xin = static_cast<const float*>(x->data);
     if (launch_matvec(w_gate, xin, gate, false, s) || launch_matvec(w_up, xin, up, false, s))
         return -1;
     glu_act<<<(d_ffn + 255) / 256, 256, 0, s>>>(gate, up, d_ffn, act == SPITE_FFN_GELU_GATE);
@@ -356,7 +305,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     SPITE_ABI_VERSION,
     "qwen3",
     "sm_120",
-    "spite project (rtx_5090 tuned card path)",
+    "spite project (sm_120 blackwell architecture)",
     {SPITE_TYPE_F32, SPITE_TYPE_F16, SPITE_TYPE_Q8_0, 0, 0, 0, 0, 0},
     qwen3_cuda_rms_norm,
     qwen3_cuda_attention,

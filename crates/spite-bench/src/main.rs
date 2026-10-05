@@ -56,6 +56,11 @@ struct Args {
     /// Path to kernels directory.
     #[arg(long, default_value = "kernels")]
     kernels_dir: PathBuf,
+
+    /// KV-cache start tier: `TYPE` or `TYPE,TYPE` for K,V
+    /// (f32, f16, q8, q5_1, q4). Defaults to the host-wide default (f16).
+    #[arg(long = "kv-quant", env = "SPITE_KV_QUANT", value_name = "TYPE[,TYPE]")]
+    kv_quant: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -68,6 +73,13 @@ fn main() -> Result<()> {
     let hp = spite_loader::config::ModelHyperparams::from_gguf(&gguf);
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
 
+    if let Some(ref card) = args.card {
+        let normalized = spite_dispatch::normalize_card_name(card);
+        unsafe {
+            std::env::set_var("SPITE_CARD_ID", normalized);
+        }
+    }
+
     let gpu_arch = args
         .gpu_arch
         .clone()
@@ -75,10 +87,19 @@ fn main() -> Result<()> {
             args.card
                 .as_deref()
                 .map(spite_dispatch::normalize_card_name)
+                .map(|c| spite_dispatch::card_spec(&c).gpu_arch.to_string())
         })
         .unwrap_or_else(spite_dispatch::detect_gpu_arch);
 
     let mut peak_mem_mib = 0u64;
+
+    let kv_cfg = match args.kv_quant.as_deref() {
+        Some(s) => s
+            .parse::<spite_kvcache::KvQuantConfig>()
+            .map_err(|e| anyhow::anyhow!(e))?,
+        None => spite_kvcache::KvQuantConfig::default(),
+    };
+    let kv_label = format!("{}/{}", kv_cfg.key, kv_cfg.val);
 
     let (model, device_label): (Box<dyn spite_models::ModelArch>, String) = match args.device {
         Device::Cpu => {
@@ -100,11 +121,12 @@ fn main() -> Result<()> {
                         table,
                         4096,
                         qk_norm,
+                        &kv_cfg,
                     )
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                     peak_mem_mib =
                         ((r.weights_bytes + r.kv_bytes + r.scratch_bytes) / (1024 * 1024)) as u64;
-                    (Box::new(m), format!("cuda ({gpu_arch})"))
+                    (Box::new(m), format!("cuda ({gpu_arch}, kv {kv_label})"))
                 }
                 None if args.device == Device::Cuda => {
                     anyhow::bail!(
@@ -136,7 +158,10 @@ fn main() -> Result<()> {
 
     // Fixed prompt keeps runs comparable; real-model runs use --n-tokens.
     let prompt_ids = tokenizer.encode("Benchmark prompt for throughput measurement.", true)?;
-    let exec_cfg = ExecutorConfig::default();
+    let exec_cfg = ExecutorConfig {
+        kv_quant: kv_cfg.clone(),
+        ..ExecutorConfig::default()
+    };
     let mut exec = Executor::new(exec_cfg);
     exec.load_model(model);
 

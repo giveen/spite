@@ -15,6 +15,7 @@ use std::sync::RwLock;
 use spite_abi::SpiteType;
 use spite_compute::dequant::dequant_to_f32;
 use spite_compute::flash_attn::{FlashAttnConfig, scalar_attention};
+use spite_kvcache::{KvQuant, KvQuantConfig, VbrPolicy, VbrRows};
 use spite_loader::GgufModel;
 use spite_rope::{RopeConfig, apply_rope};
 
@@ -100,14 +101,41 @@ pub(crate) fn packed_bytes(kind: SpiteType, n_elem: usize) -> Option<usize> {
 }
 
 /// Per-layer K/V cache: post-RoPE keys, raw values, one row per position.
-#[derive(Default)]
+///
+/// Rows are stored through [`VbrRows`], which can quantize and auto-degrade
+/// them as the sequence grows. The default tier is full precision so the
+/// reference forward path stays exact; the executor calls
+/// [`set_quant`](KvStore::set_quant) to enable Variable Bit Rate compression
+/// before the first token.
 pub struct KvStore {
-    k: Vec<Vec<f32>>,
-    v: Vec<Vec<f32>>,
+    k: Vec<VbrRows>,
+    v: Vec<VbrRows>,
+    key_quant: KvQuant,
+    val_quant: KvQuant,
+}
+
+impl Default for KvStore {
+    fn default() -> Self {
+        Self {
+            k: Vec::new(),
+            v: Vec::new(),
+            key_quant: KvQuant::F32,
+            val_quant: KvQuant::F32,
+        }
+    }
 }
 
 impl KvStore {
     pub fn reset(&mut self) {
+        self.k.clear();
+        self.v.clear();
+    }
+
+    /// Set the starting K/V tiers. Clears cache content so the new tiers apply
+    /// from the first position.
+    pub fn set_quant(&mut self, cfg: &KvQuantConfig) {
+        self.key_quant = cfg.key;
+        self.val_quant = cfg.val;
         self.k.clear();
         self.v.clear();
     }
@@ -370,32 +398,32 @@ pub fn forward_with(
                     .map_err(|e| ModelError::Forward(format!("rope: {e}")))?;
             }
 
-            while kv.k.len() <= layer {
-                kv.k.push(Vec::new());
-                kv.v.push(Vec::new());
-            }
-            kv.k[layer].extend_from_slice(&k);
-            kv.v[layer].extend_from_slice(&v);
-            // Sliding window: attend only to the trailing span.
             let row_len = n_kv_heads * head_dim;
-            let n_prev = kv.k[layer].len() / row_len;
-            let (kk, vv) = match opts.sliding_window {
-                Some(w) if n_prev > w => {
-                    let skip = (n_prev - w) * row_len;
-                    (&kv.k[layer][skip..], &kv.v[layer][skip..])
-                }
-                _ => (kv.k[layer].as_slice(), kv.v[layer].as_slice()),
-            };
+            let (kq, vq) = (kv.key_quant, kv.val_quant);
+            while kv.k.len() <= layer {
+                kv.k.push(VbrRows::new(
+                    row_len,
+                    VbrPolicy::from_ctx(cfg.max_seq_len, kq),
+                ));
+                kv.v.push(VbrRows::new(
+                    row_len,
+                    VbrPolicy::from_ctx(cfg.max_seq_len, vq),
+                ));
+            }
+            kv.k[layer].push(&k);
+            kv.v[layer].push(&v);
+            // Sliding window: attend only to the trailing span. Rows are
+            // dequantized on demand, costing O(ctx) per layer per token — the
+            // same order as the scalar attention it feeds.
+            let n_prev = kv.k[layer].len();
+            let n_attend = opts.sliding_window.map_or(n_prev, |w| n_prev.min(w));
+            let from = n_prev - n_attend;
+            let kk = kv.k[layer].to_f32_from(from);
+            let vv = kv.v[layer].to_f32_from(from);
 
-            let attn_cfg = FlashAttnConfig::new(
-                1,
-                n_prev.min(opts.sliding_window.unwrap_or(n_prev)),
-                n_heads,
-                n_kv_heads,
-                head_dim,
-            );
+            let attn_cfg = FlashAttnConfig::new(1, n_attend, n_heads, n_kv_heads, head_dim);
             let mut attn_out = vec![0f32; n_heads * head_dim];
-            scalar_attention(&q, kk, vv, &mut attn_out, &attn_cfg)
+            scalar_attention(&q, &kk, &vv, &mut attn_out, &attn_cfg)
                 .map_err(|e| ModelError::Forward(format!("attn: {e}")))?;
             let mut proj = vec![0f32; d];
             matvec(w_o, &attn_out, &mut proj)?;

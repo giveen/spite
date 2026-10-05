@@ -155,6 +155,10 @@ impl Executor {
 
     /// Load model weights. Resets KV state; call once before `prefill`.
     pub fn load_model(&mut self, model: Box<dyn spite_models::ModelArch>) {
+        // Hand the KV quantization policy to the model before any token is
+        // cached; `set_kv_quant` also clears state, so the tier applies from
+        // position zero.
+        model.set_kv_quant(self.cfg.kv_quant.clone());
         model.reset_cache();
         self.model = Some(model);
         self.n_ctx_used = 0;

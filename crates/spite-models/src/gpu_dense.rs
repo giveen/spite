@@ -18,6 +18,7 @@ use spite_abi::{FfnActivation, SpiteCtx, SpiteKvCache, SpiteTensor, SpiteType};
 use spite_compute::dequant::dequant_to_f32;
 use spite_dispatch::{DispatchBuilder, DispatchTable, KernelSpec};
 use spite_gpu::{DeviceBuffer, GpuBackend, cuda};
+use spite_kvcache::{KvQuant, KvQuantConfig, VbrPolicy, quant};
 use spite_loader::GgufModel;
 
 use crate::dense::{Activation, packed_bytes};
@@ -68,6 +69,14 @@ struct GpuState {
     h: DeviceBuffer,
     n: DeviceBuffer,
     logits: DeviceBuffer,
+    /// Configured start tier per side (restored on `reset_cache`).
+    k_start: KvQuant,
+    v_start: KvQuant,
+    /// Current VBR tier for each side and the depths at which it steps down.
+    k_quant: KvQuant,
+    v_quant: KvQuant,
+    k_degrade_at: Vec<usize>,
+    v_degrade_at: Vec<usize>,
 }
 
 /// Dense decoder running entirely on one CUDA device.
@@ -77,7 +86,8 @@ pub struct GpuDense {
     activation: Activation,
     apply_qk_norm: bool,
     n_ctx: usize,
-    head_dim: usize,
+    /// Elements per KV row (`n_kv_heads * head_dim`).
+    kv_row: usize,
     /// Raw (packed) token embedding rows on the host; one row is dequantized
     /// per token. Avoids a device gather op the ABI does not define.
     embd_host: Vec<u8>,
@@ -130,6 +140,7 @@ impl GpuDense {
         table: DispatchTable,
         n_ctx: usize,
         apply_qk_norm: bool,
+        kv: &KvQuantConfig,
     ) -> Result<(Self, VramReport), ModelError> {
         let d = config.d_model;
         let n_heads = config.n_heads;
@@ -156,8 +167,13 @@ impl GpuDense {
             weights_bytes += bytes;
             sizes.push((name.to_owned(), t, bytes));
         }
-        let kv_bytes = 2 * config.n_layers * n_ctx * kv_row * 4;
-        let attn_scratch = (2 * n_heads * head_dim + kv_row + n_heads * n_ctx) * 4;
+        let k_degrade_at = VbrPolicy::from_ctx(n_ctx, kv.key).degrade_at;
+        let v_degrade_at = VbrPolicy::from_ctx(n_ctx, kv.val).degrade_at;
+        let k_budget = kv_budget_bytes(n_ctx, kv_row, kv.key);
+        let v_budget = kv_budget_bytes(n_ctx, kv_row, kv.val);
+        let kv_bytes = config.n_layers * (k_budget + v_budget);
+        // q + k + att + scores + vtmp
+        let attn_scratch = (2 * n_heads * head_dim + 2 * kv_row + n_heads * n_ctx) * 4;
         let ffn_scratch = 2 * config.d_ffn * 4;
         let scratch_bytes = attn_scratch.max(ffn_scratch);
         let act_bytes = (2 * d + config.vocab_size) * 4;
@@ -199,8 +215,8 @@ impl GpuDense {
         let mut k_cache = Vec::with_capacity(config.n_layers);
         let mut v_cache = Vec::with_capacity(config.n_layers);
         for _ in 0..config.n_layers {
-            k_cache.push(alloc(n_ctx * kv_row * 4)?);
-            v_cache.push(alloc(n_ctx * kv_row * 4)?);
+            k_cache.push(alloc(k_budget)?);
+            v_cache.push(alloc(v_budget)?);
         }
         let state = GpuState {
             weights,
@@ -210,6 +226,12 @@ impl GpuDense {
             h: alloc(d * 4)?,
             n: alloc(d * 4)?,
             logits: alloc(config.vocab_size * 4)?,
+            k_start: kv.key,
+            v_start: kv.val,
+            k_quant: kv.key,
+            v_quant: kv.val,
+            k_degrade_at,
+            v_degrade_at,
         };
 
         // Host copy of the packed embedding table for per-token row dequant.
@@ -239,7 +261,7 @@ impl GpuDense {
                 activation: Activation::SwiGlu,
                 apply_qk_norm,
                 n_ctx,
-                head_dim,
+                kv_row,
                 embd_host,
                 embd_kind: embd.kind,
                 state: Mutex::new(state),
@@ -268,6 +290,84 @@ fn gib(b: usize) -> f64 {
     b as f64 / (1u64 << 30) as f64
 }
 
+/// ABI tensor kind for a KV cache tier.
+fn kvq_spite(q: KvQuant) -> SpiteType {
+    match q {
+        KvQuant::F32 => SpiteType::F32,
+        KvQuant::F16 => SpiteType::F16,
+        KvQuant::Q8 => SpiteType::Q8_0,
+        KvQuant::Q5_1 => SpiteType::Q5_1,
+        KvQuant::Q4 => SpiteType::Q4_0,
+    }
+}
+
+/// Reserve enough for the peak of `depth × row_bytes(tier(depth))` over the
+/// whole window, so the cache never overflows as it degrades.
+fn kv_budget_bytes(n_ctx: usize, row_elems: usize, start: KvQuant) -> usize {
+    let policy = VbrPolicy::from_ctx(n_ctx, start);
+    let mut peak = 0usize;
+    let mut q = start;
+    let mut lo = 0usize;
+    for &th in policy.degrade_at.iter() {
+        let hi = th.min(n_ctx);
+        if hi > lo {
+            peak = peak.max(hi * quant::packed_bytes(q, row_elems));
+            lo = hi;
+        }
+        match q.degrade() {
+            Some(n) => q = n,
+            // At the floor the tier holds for the rest of the window.
+            None => break,
+        }
+    }
+    // Cover the tail: rows past the last threshold, at the current tier.
+    if lo < n_ctx {
+        peak = peak.max(n_ctx * quant::packed_bytes(q, row_elems));
+    }
+    peak
+}
+
+/// Tier selected at `depth` by a degradation schedule.
+fn kv_tier_at(degrade_at: &[usize], depth: usize, start: KvQuant) -> KvQuant {
+    let mut q = start;
+    for &th in degrade_at {
+        if depth >= th {
+            match q.degrade() {
+                Some(n) => q = n,
+                None => break,
+            }
+        }
+    }
+    q
+}
+
+/// Re-encode the first `n_rows` rows of every layer's cache from `from` to `to`.
+/// Runs once per degradation, so a host round-trip is acceptable here.
+fn requantize_kv(
+    bufs: &[DeviceBuffer],
+    n_rows: usize,
+    row_elems: usize,
+    from: KvQuant,
+    to: KvQuant,
+) -> Result<(), ModelError> {
+    if n_rows == 0 || from == to {
+        return Ok(());
+    }
+    let from_bytes = quant::packed_bytes(from, row_elems);
+    let to_bytes = quant::packed_bytes(to, row_elems);
+    let n_elem = n_rows * row_elems;
+    let mut host = vec![0u8; from_bytes * n_rows];
+    let mut f32buf = vec![0f32; n_elem];
+    let mut packed = vec![0u8; to_bytes * n_rows];
+    for buf in bufs {
+        cuda::download(buf.as_ptr(), &mut host).map_err(|e| err(e.to_string()))?;
+        quant::dequantize(from, &host, n_elem, &mut f32buf);
+        quant::quantize(to, &f32buf, &mut packed);
+        cuda::upload(buf.as_ptr(), &packed).map_err(|e| err(e.to_string()))?;
+    }
+    Ok(())
+}
+
 fn rc(code: c_int, op: &str, layer: usize) -> Result<(), ModelError> {
     if code == 0 {
         Ok(())
@@ -283,8 +383,48 @@ impl ModelArch for GpuDense {
         &self.config
     }
 
-    /// KV rows are overwritten by position, so nothing to clear.
-    fn reset_cache(&self) {}
+    /// KV rows are overwritten by position, so nothing to clear until the
+    /// next sequence re-starts at position 0.
+    fn reset_cache(&self) {
+        if let Ok(mut st) = self.state.lock() {
+            st.k_quant = st.k_start;
+            st.v_quant = st.v_start;
+        }
+    }
+
+    /// Re-tier the KV cache. The CLI and server pass the same config that was
+    /// given to [`GpuDense::load`], so this is normally a no-op.
+    fn set_kv_quant(&self, cfg: KvQuantConfig) {
+        let Ok(mut st) = self.state.lock() else {
+            return;
+        };
+        if st.k_start == cfg.key && st.v_start == cfg.val {
+            return;
+        }
+        st.k_start = cfg.key;
+        st.v_start = cfg.val;
+        st.k_quant = cfg.key;
+        st.v_quant = cfg.val;
+        st.k_degrade_at = VbrPolicy::from_ctx(self.n_ctx, cfg.key).degrade_at;
+        st.v_degrade_at = VbrPolicy::from_ctx(self.n_ctx, cfg.val).degrade_at;
+        // The budget depends on the start tier, so reallocate the KV buffers.
+        let k_budget = kv_budget_bytes(self.n_ctx, self.kv_row, cfg.key);
+        let v_budget = kv_budget_bytes(self.n_ctx, self.kv_row, cfg.val);
+        let mut nk = Vec::with_capacity(self.config.n_layers);
+        let mut nv = Vec::with_capacity(self.config.n_layers);
+        for _ in 0..self.config.n_layers {
+            let Ok(kb) = DeviceBuffer::alloc(GpuBackend::Cuda, k_budget) else {
+                return;
+            };
+            let Ok(vb) = DeviceBuffer::alloc(GpuBackend::Cuda, v_budget) else {
+                return;
+            };
+            nk.push(kb);
+            nv.push(vb);
+        }
+        st.k_cache = nk;
+        st.v_cache = nv;
+    }
 
     fn forward(
         &self,
@@ -305,22 +445,24 @@ impl ModelArch for GpuDense {
         ) else {
             return Err(err("CUDA dispatch table incomplete"));
         };
-        let st = self.state.lock().map_err(|_| err("gpu state lock"))?;
-        let w = |name: &str| {
-            st.weights
-                .get(name)
-                .map(DeviceWeight::tensor)
-                .ok_or_else(|| ModelError::MissingWeight(name.into()))
-        };
-        let opt = |name: &str| st.weights.get(name).map(DeviceWeight::tensor);
+        let mut st = self.state.lock().map_err(|_| err("gpu state lock"))?;
 
         let mut h_t = f32_tensor(&st.h, d);
         let mut n_t = f32_tensor(&st.n, d);
         let mut logits_t = f32_tensor(&st.logits, vocab);
-        let out_norm = w("output_norm.weight")?;
+        let out_norm = st
+            .weights
+            .get("output_norm.weight")
+            .map(DeviceWeight::tensor)
+            .ok_or_else(|| ModelError::MissingWeight("output_norm.weight".into()))?;
         // Tied embeddings: fall back to token_embd as the LM head.
-        let out_w = w("output.weight").or_else(|_| w("token_embd.weight"))?;
-        let kv_row = cfg.n_kv_heads * self.head_dim;
+        let out_w = st
+            .weights
+            .get("output.weight")
+            .or_else(|| st.weights.get("token_embd.weight"))
+            .map(DeviceWeight::tensor)
+            .ok_or_else(|| ModelError::MissingWeight("output.weight".into()))?;
+        let kv_row = self.kv_row;
         let act = match self.activation {
             Activation::SwiGlu => FfnActivation::SiluGate,
             Activation::GeGlu => FfnActivation::GeluGate,
@@ -335,6 +477,31 @@ impl ModelArch for GpuDense {
                     self.n_ctx
                 )));
             }
+            // VBR: before writing row `pos`, step the whole cache down a tier
+            // when this depth crosses a schedule threshold.
+            // The schedule is always evaluated from the configured start tier,
+            // not the current one, so the cache steps down once per threshold.
+            let depth = pos + 1;
+            let want_k = kv_tier_at(&st.k_degrade_at, depth, st.k_start);
+            if want_k != st.k_quant {
+                requantize_kv(&st.k_cache, pos, kv_row, st.k_quant, want_k)?;
+                st.k_quant = want_k;
+            }
+            let want_v = kv_tier_at(&st.v_degrade_at, depth, st.v_start);
+            if want_v != st.v_quant {
+                requantize_kv(&st.v_cache, pos, kv_row, st.v_quant, want_v)?;
+                st.v_quant = want_v;
+            }
+            let (k_kind, v_kind) = (kvq_spite(st.k_quant), kvq_spite(st.v_quant));
+            // Weight lookups borrow `st` immutably; create them after the
+            // degradation mutation above so the borrows do not overlap.
+            let w = |name: &str| {
+                st.weights
+                    .get(name)
+                    .map(DeviceWeight::tensor)
+                    .ok_or_else(|| ModelError::MissingWeight(name.into()))
+            };
+            let opt = |name: &str| st.weights.get(name).map(DeviceWeight::tensor);
             let kctx = SpiteCtx {
                 n_ctx: self.n_ctx as c_int,
                 n_batch: 1,
@@ -378,14 +545,14 @@ impl ModelArch for GpuDense {
                     k: SpiteTensor {
                         data: st.k_cache[layer].as_ptr().cast(),
                         ne: kv_ne,
-                        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &kv_ne),
-                        kind: SpiteType::F32,
+                        nb: SpiteTensor::contiguous_strides(k_kind, &kv_ne),
+                        kind: k_kind,
                     },
                     v: SpiteTensor {
                         data: st.v_cache[layer].as_ptr().cast(),
                         ne: kv_ne,
-                        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &kv_ne),
-                        kind: SpiteType::F32,
+                        nb: SpiteTensor::contiguous_strides(v_kind, &kv_ne),
+                        kind: v_kind,
                     },
                     layer: layer as c_int,
                 };

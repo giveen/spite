@@ -494,7 +494,15 @@ fn cmd_run(
         kernels_dir: &hw.kernels_dir,
         gpu_arch: &gpu_arch,
     };
-    let text = generate(&target_gguf, prompt, max_tokens, temperature, ctx, &place)?;
+    let text = generate(
+        &target_gguf,
+        prompt,
+        max_tokens,
+        temperature,
+        ctx,
+        &place,
+        &kv_cfg,
+    )?;
     println!("\n{text}");
     Ok(())
 }
@@ -508,6 +516,7 @@ pub fn generate(
     temperature: f32,
     ctx_len: Option<usize>,
     place: &Placement,
+    kv_cfg: &KvQuantConfig,
 ) -> Result<String> {
     use spite_executor::{Executor, ExecutorConfig};
     use spite_tokenizer::Tokenizer;
@@ -516,9 +525,11 @@ pub fn generate(
     if let Some(n) = ctx_len {
         exec_cfg.ctx_len = n;
     }
+    // Carried to the model by `Executor::load_model`, which enables VBR.
+    exec_cfg.kv_quant = kv_cfg.clone();
 
     let t_load = std::time::Instant::now();
-    let model = build_model(gguf, exec_cfg.ctx_len, place)?;
+    let model = build_model(gguf, exec_cfg.ctx_len, place, kv_cfg)?;
     eprintln!("load time    : {:.2} s", t_load.elapsed().as_secs_f64());
 
     let tokenizer = Tokenizer::from_gguf(gguf)?;
@@ -554,18 +565,22 @@ fn build_model(
     gguf: &GgufModel,
     ctx_len: usize,
     place: &Placement,
+    kv_cfg: &KvQuantConfig,
 ) -> Result<Box<dyn spite_models::ModelArch>> {
     use spite_models::gpu_dense::GpuDense;
     use spite_models::{ArchRegistry, ModelConfig};
 
     let hp = spite_loader::config::ModelHyperparams::from_gguf(gguf);
-    let cfg = ModelConfig::from(hp);
+    let mut cfg = ModelConfig::from(hp);
+    // The effective context is what VBR sizes its degradation thresholds to;
+    // never exceed the context the executor will actually allow.
+    cfg.max_seq_len = cfg.max_seq_len.min(ctx_len).max(1);
 
     if place.device != Device::Cpu {
         match GpuDense::resolve_table(&cfg.arch, place.gpu_arch, place.kernels_dir) {
             Some(table) => {
                 let qk_norm = cfg.arch == "qwen3";
-                let (model, r) = GpuDense::load(cfg, gguf, table, ctx_len, qk_norm)
+                let (model, r) = GpuDense::load(cfg, gguf, table, ctx_len, qk_norm, kv_cfg)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
                 let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
                 println!(
@@ -739,9 +754,8 @@ fn resolve_kv_quant(hw: &HardwareArgs) -> KvQuantConfig {
 }
 
 fn print_kv_quant_summary(cfg: &KvQuantConfig) {
-    if cfg.is_default() {
-        return;
-    }
+    // VBR is always active: the tier shown is the starting point before the
+    // cache degrades with depth (f16 → q8 → q5_1 → q4).
     if cfg.key == cfg.val {
         println!("kv cache     : {} start  (auto-VBR)", cfg.key);
     } else {
@@ -842,7 +856,16 @@ mod tests {
         };
         let tmp = fake.write_to_tempfile().unwrap();
         let gguf = GgufModel::open(tmp.path()).unwrap();
-        let text = generate(&gguf, "AB", 4, 0.0, None, &Placement::cpu()).unwrap();
+        let text = generate(
+            &gguf,
+            "AB",
+            4,
+            0.0,
+            None,
+            &Placement::cpu(),
+            &KvQuantConfig::default(),
+        )
+        .unwrap();
         assert!(!text.is_empty(), "expected generated text, got empty");
     }
 }
