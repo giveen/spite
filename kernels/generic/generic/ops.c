@@ -191,10 +191,55 @@ int spite_generic_ffn(
 /* ── Attention ────────────────────────────────────────────────────────── */
 
 /*
- * Return -1: the Rust spite-compute scalar GQA fallback handles this.
- * A correct-but-simple C implementation would be substantial; the Rust
- * version in spite-compute/src/flash_attn.rs is the reference for attention.
+ * Reference implementation of the ABI v4 attention op for one token at
+ * ctx->pos. It mirrors kernels/qwen/qwen3/nvidia/kv_attn.inl step for step,
+ * which is what makes it usable as the numeric oracle for GPU attention in
+ * tools/verify/verify.py:
+ *
+ *   q = Wq·x                         k = Wk·x      v = Wv·x
+ *   q = RoPE(NEOX, pos)( RMSNorm_hd(q) * q_norm )   when q_norm != NULL
+ *   k = RoPE(NEOX, pos)( RMSNorm_hd(k) * k_norm )   when k_norm != NULL
+ *   K[pos] = k,  V[pos] = v
+ *   scores[h,t] = (q_h · K[t][h/group]) / sqrt(hd)   for t in [0, pos]
+ *   att[h,:]    = softmax_t scores[h,:] · V[t][h/group]
+ *   out += Wo·att                                    (residual fused)
+ *
+ * Deviation from the GPU path, deliberate and load-bearing: the KV cache is
+ * F32 only. This kernel leaves `kv_cache_kinds` NULL, which the host reads as
+ * "F32 tiers only", so the contract and the declared capability agree. The
+ * block-quantised tiers belong to the GPU kernels; their layout is pinned
+ * separately by crates/spite-kvcache/tests/portable_codec_parity.rs.
+ *
+ * Also deliberately independent of ctx->scratchpad: this runs on the CPU
+ * reference path and under verify.py, where ctx carries no device scratchpad.
  */
+
+/* dst and src may alias. NEOX RoPE: pairs (i, i + hd/2), as in GGUF/llama.cpp. */
+static void qk_norm_rope(float *dst, const float *src, const float *norm_w,
+                         float eps, int hd, int pos, float theta) {
+    const int half = hd / 2;
+    float scale = 1.0f;
+    if (norm_w) {
+        float sum_sq = 0.0f;
+        for (int i = 0; i < hd; i++) sum_sq += src[i] * src[i];
+        scale = 1.0f / sqrtf(sum_sq / (float)hd + eps);
+    }
+    for (int i = 0; i < half; i++) {
+        float x0 = src[i] * scale;
+        float x1 = src[i + half] * scale;
+        if (norm_w) {
+            x0 *= norm_w[i];
+            x1 *= norm_w[i + half];
+        }
+        const float freq = powf(theta, -2.0f * (float)i / (float)hd);
+        const float angle = (float)pos * freq;
+        const float sn = sinf(angle);
+        const float cs = cosf(angle);
+        dst[i]        = x0 * cs - x1 * sn;
+        dst[i + half] = x0 * sn + x1 * cs;
+    }
+}
+
 int spite_generic_attention(
     SpiteTensor       *out,
     const SpiteTensor *x,
@@ -209,10 +254,125 @@ int spite_generic_attention(
     float              rope_freq_base,
     const SpiteCtx    *ctx
 ) {
-    (void)out; (void)x; (void)wq; (void)wk; (void)wv; (void)wo;
-    (void)q_norm; (void)k_norm; (void)norm_eps;
-    (void)kvcache; (void)rope_freq_base; (void)ctx;
-    return -1; /* defer to Rust scalar fallback */
+    if (!out || !x || !wq || !wk || !wv || !wo || !kvcache || !ctx) return -1;
+    if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
+    if (ctx->n_heads <= 0 || ctx->n_kv_heads <= 0) return -1;
+
+    const int nh  = ctx->n_heads;
+    const int nkv = ctx->n_kv_heads;
+    const int hd  = (int)wq->ne[1] / nh;
+    const int pos = ctx->pos;
+    const int kv_stride = nkv * hd;
+
+    /* Same acceptance domain as kvattn_run, so a mismatch shows up as a
+     * numeric difference rather than a spurious -1 from the reference. */
+    if (hd <= 0 || (hd & 1) || (nh % nkv)) return -1;
+    if ((int)kvcache->k.ne[0] != kv_stride) return -1;
+    if ((int)kvcache->v.ne[0] != kv_stride) return -1;
+    if (kvcache->k.kind != kvcache->v.kind) return -1;
+    if (kvcache->k.kind != SPITE_TYPE_F32) return -1; /* see note above */
+    const int n_ctx = (int)kvcache->k.ne[1];
+    if (pos < 0 || pos >= n_ctx) return -2;
+
+    float *wf_q = dequant_to_f32(wq);
+    float *wf_k = dequant_to_f32(wk);
+    float *wf_v = dequant_to_f32(wv);
+    float *wf_o = dequant_to_f32(wo);
+    float *nw_q = q_norm ? dequant_to_f32(q_norm) : NULL;
+    float *nw_k = k_norm ? dequant_to_f32(k_norm) : NULL;
+    if (!wf_q || !wf_k || !wf_v || !wf_o || (q_norm && !nw_q) || (k_norm && !nw_k)) {
+        free(wf_q); free(wf_k); free(wf_v); free(wf_o); free(nw_q); free(nw_k);
+        return -1;
+    }
+
+    /* q[nh*hd] k_stage[kv_stride] att[nh*hd] scores[nh*n_ctx] */
+    const size_t n_q      = (size_t)nh * hd;
+    const size_t n_att    = n_q;
+    const size_t n_scores = (size_t)nh * n_ctx;
+    float *buf = (float *)malloc((n_q + (size_t)kv_stride + n_att + n_scores) * sizeof(float));
+    if (!buf) {
+        free(wf_q); free(wf_k); free(wf_v); free(wf_o); free(nw_q); free(nw_k);
+        return -1;
+    }
+    float *q       = buf;
+    float *k_stage = q + n_q;
+    float *att     = k_stage + kv_stride;
+    float *scores  = att + n_att;
+
+    const float *xin     = (const float *)x->data;
+    const int    d_model = (int)x->ne[0];
+    const int    group   = nh / nkv;
+    const int    n_tok   = pos + 1;
+
+    /* Row `pos` of the cache, addressed by byte stride exactly as the GPU
+     * kernel does — nb[1] is not assumed to be 4 * kv_stride. */
+    float *k_row = (float *)((uint8_t *)kvcache->k.data + (size_t)pos * kvcache->k.nb[1]);
+    float *v_row = (float *)((uint8_t *)kvcache->v.data + (size_t)pos * kvcache->v.nb[1]);
+
+    /* Projections. V goes straight into its cache row, as on the GPU. */
+    matmul_f32(q, wf_q, xin, (int)n_q, d_model, 1);
+    matmul_f32(k_stage, wf_k, xin, kv_stride, d_model, 1);
+    matmul_f32(v_row, wf_v, xin, kv_stride, d_model, 1);
+
+    /* Per-head QK RMSNorm + NEOX RoPE. K lands in the cache row. */
+    for (int h = 0; h < nh; h++)
+        qk_norm_rope(q + (size_t)h * hd, q + (size_t)h * hd, nw_q, norm_eps, hd, pos,
+                     rope_freq_base);
+    for (int h = 0; h < nkv; h++)
+        qk_norm_rope(k_row + (size_t)h * hd, k_stage + (size_t)h * hd, nw_k, norm_eps, hd, pos,
+                     rope_freq_base);
+
+    const float scale = 1.0f / sqrtf((float)hd);
+
+    /* scores -> online softmax -> weighted V, per head. Fusing these three
+     * passes is a GPU concern; the reference keeps them separate so it reads
+     * like the maths. */
+    for (int h = 0; h < nh; h++) {
+        const float *qh = q + (size_t)h * hd;
+        const int    kh = h / group;
+        float       *sc = scores + (size_t)h * n_ctx;
+
+        for (int t = 0; t < n_tok; t++) {
+            const float *kt = (const float *)((const uint8_t *)kvcache->k.data +
+                                              (size_t)t * kvcache->k.nb[1]) + (size_t)kh * hd;
+            float acc = 0.0f;
+            for (int i = 0; i < hd; i++) acc += qh[i] * kt[i];
+            sc[t] = acc * scale;
+        }
+
+        float m = -INFINITY;
+        for (int t = 0; t < n_tok; t++) m = fmaxf(m, sc[t]);
+        float sum = 0.0f;
+        for (int t = 0; t < n_tok; t++) { sc[t] = expf(sc[t] - m); sum += sc[t]; }
+        const float inv = 1.0f / sum;
+        for (int t = 0; t < n_tok; t++) sc[t] *= inv;
+
+        const int vh = h / group;
+        float    *ah = att + (size_t)h * hd;
+        for (int i = 0; i < hd; i++) {
+            float acc = 0.0f;
+            for (int t = 0; t < n_tok; t++) {
+                const float *vt = (const float *)((const uint8_t *)kvcache->v.data +
+                                                  (size_t)t * kvcache->v.nb[1]) + (size_t)vh * hd;
+                acc += sc[t] * vt[i];
+            }
+            ah[i] = acc;
+        }
+    }
+
+    /* out += Wo·att (ABI v4 residual fusion). */
+    const int o_cols = (int)wo->ne[0];
+    const int o_rows = (int)wo->ne[1];
+    float *outp = (float *)out->data;
+    for (int r = 0; r < o_rows; r++) {
+        float acc = 0.0f;
+        for (int c = 0; c < o_cols; c++) acc += wf_o[(size_t)r * o_cols + c] * att[c];
+        outp[r] += acc;
+    }
+
+    free(buf);
+    free(wf_q); free(wf_k); free(wf_v); free(wf_o); free(nw_q); free(nw_k);
+    return 0;
 }
 
 /* ── Matmul ───────────────────────────────────────────────────────────── */

@@ -7,7 +7,9 @@
  * This kernel handles:
  *   rms_norm  — scalar C, any F32/Q8_0/Q4_K weight
  *   ffn       — scalar C, any F32/Q8_0/Q4_K weight
- *   attention — returns -1 (Rust spite-compute scalar GQA takes over)
+ *   attention — scalar C, F32 KV only (the numeric reference for GPU
+ *               attention; see the note in ops.c). `kv_cache_kinds` stays
+ *               NULL, which the host reads as "F32 tiers only".
  *   matmul    — scalar C, any F32/Q8_0/Q4_K weight (LM head)
  *   layer     — NULL  (individual ops are dispatched separately)
  *   prefill   — NULL  (Rust handles chunked prefill)

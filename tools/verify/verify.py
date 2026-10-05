@@ -507,15 +507,186 @@ def verify_ffn(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
     return True
 
 
-def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo) -> bool:
-    print("\n  [attention]")
+def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
+                     cuda: CudaHelper, is_cuda: bool,
+                     d_model: int = 64, head_dim: int = 16,
+                     n_heads: int = 4, n_kv_heads: int = 2,
+                     n_ctx: int = 8, pos: int = 3,
+                     use_qk_norm: bool = True) -> bool:
+    """One decode token at `pos` against a pre-populated KV cache.
+
+    Exercises the whole op: Q/K/V projections, optional per-head QK RMSNorm,
+    NEOX RoPE, the KV-cache write at row `pos`, GQA score/softmax/weighted-V
+    over rows [0, pos], and the fused `out += Wo*att` residual.
+
+    The reference is the scalar C kernel in kernels/generic/generic/ops.c.
+    KV is F32 on both sides: that is the tier the generic kernel declares
+    (kv_cache_kinds left NULL), and F32 is the highest-fidelity path each GPU
+    kernel offers, so this pins the maths rather than the block codec.
+    """
+    tag = "" if use_qk_norm else " (no QK norm)"
+    print(f"\n  [attention] d_model={d_model} heads={n_heads} kv_heads={n_kv_heads} "
+          f"head_dim={head_dim} ctx={n_ctx} pos={pos}{tag}")
     if not test_info.attention:
         print("    SKIP: test kernel has no attention")
         return True
     if not ref_info.attention:
         print("    SKIP: reference kernel has no attention")
         return True
-    print("    SKIP: generic C reference defers attention to Rust scalar fallback")
+
+    kv_stride = n_kv_heads * head_dim
+    nh_hd     = n_heads * head_dim
+    eps       = 1e-5
+    rope_base = 10000.0
+
+    rng = random.Random(42)
+    w_scale = 1.0 / math.sqrt(d_model)
+    x_data   = [rng.gauss(0, 1.0) for _ in range(d_model)]
+    wq_data  = [rng.gauss(0, w_scale) for _ in range(d_model * nh_hd)]
+    wk_data  = [rng.gauss(0, w_scale) for _ in range(d_model * kv_stride)]
+    wv_data  = [rng.gauss(0, w_scale) for _ in range(d_model * kv_stride)]
+    wo_data  = [rng.gauss(0, w_scale) for _ in range(nh_hd * d_model)]
+    qn_data  = [rng.uniform(0.5, 1.5) for _ in range(head_dim)]
+    kn_data  = [rng.uniform(0.5, 1.5) for _ in range(head_dim)]
+    out_init = [rng.gauss(0, 0.1) for _ in range(d_model)]
+    # Rows [0, pos) are given; both sides write row `pos` themselves.
+    k_init = [rng.gauss(0, 1.0) for _ in range(n_ctx * kv_stride)]
+    v_init = [rng.gauss(0, 1.0) for _ in range(n_ctx * kv_stride)]
+
+    def fresh_out():
+        arr = (ctypes.c_float * d_model)(*out_init)
+        t, _ = make_tensor([0.0] * d_model, [d_model, 1, 1, 1])
+        t.data = ctypes.cast(arr, ctypes.c_void_p)
+        return t, arr
+
+    def fresh_kv():
+        ka = (ctypes.c_float * (n_ctx * kv_stride))(*k_init)
+        va = (ctypes.c_float * (n_ctx * kv_stride))(*v_init)
+        tk, _ = make_tensor([0.0] * (n_ctx * kv_stride), [kv_stride, n_ctx, 1, 1])
+        tv, _ = make_tensor([0.0] * (n_ctx * kv_stride), [kv_stride, n_ctx, 1, 1])
+        tk.data = ctypes.cast(ka, ctypes.c_void_p)
+        tv.data = ctypes.cast(va, ctypes.c_void_p)
+        kv = SpiteKvCache()
+        kv.k, kv.v, kv.layer = tk, tv, 0
+        return kv, ka, va
+
+    def make_ctx_for(pos_arg):
+        c = make_ctx()
+        c.n_ctx      = n_ctx
+        c.pos        = pos_arg
+        c.n_heads    = n_heads
+        c.n_kv_heads = n_kv_heads
+        return c
+
+    tx, _ = make_tensor(x_data, [d_model, 1, 1, 1])
+    twq, _ = make_tensor(wq_data, [d_model, nh_hd, 1, 1])
+    twk, _ = make_tensor(wk_data, [d_model, kv_stride, 1, 1])
+    twv, _ = make_tensor(wv_data, [d_model, kv_stride, 1, 1])
+    two, _ = make_tensor(wo_data, [nh_hd, d_model, 1, 1])
+    tqn, _ = make_tensor(qn_data, [head_dim, 1, 1, 1])
+    tkn, _ = make_tensor(kn_data, [head_dim, 1, 1, 1])
+    p_qn = ctypes.byref(tqn) if use_qk_norm else None
+    p_kn = ctypes.byref(tkn) if use_qk_norm else None
+
+    # ── reference (scalar C, host memory) ──
+    to_ref, out_ref_arr = fresh_out()
+    kv_ref, _, _ = fresh_kv()
+    ref_fn = AttentionFn(ref_info.attention)
+    ret_ref = ref_fn(ctypes.byref(to_ref), ctypes.byref(tx), ctypes.byref(twq),
+                     ctypes.byref(twk), ctypes.byref(twv), ctypes.byref(two),
+                     p_qn, p_kn, eps, ctypes.byref(kv_ref), rope_base,
+                     ctypes.byref(make_ctx_for(pos)))
+    if ret_ref != 0:
+        print(f"    FAIL: reference attention returned {ret_ref}")
+        return False
+
+    test_fn = AttentionFn(test_info.attention)
+    if not is_cuda:
+        to_test, test_out_arr = fresh_out()
+        kv_test, _, _ = fresh_kv()
+        ret_test = test_fn(ctypes.byref(to_test), ctypes.byref(tx), ctypes.byref(twq),
+                           ctypes.byref(twk), ctypes.byref(twv), ctypes.byref(two),
+                           p_qn, p_kn, eps, ctypes.byref(kv_test), rope_base,
+                           ctypes.byref(make_ctx_for(pos)))
+        if ret_test != 0:
+            print(f"    FAIL: test attention returned {ret_test}")
+            return False
+        test_out = list(test_out_arr)
+    else:
+        if not cuda.available:
+            print("    SKIP: CUDA runtime not available")
+            return True
+        n_kv_elems = n_ctx * kv_stride
+        # Sizing mirror of kvattn_run's requirement, so a too-small scratchpad
+        # shows up here as -2 rather than as a silent pass.
+        scratch_sz = 4 * (nh_hd * 2 + kv_stride * 2 + n_heads * n_ctx)
+        d_x  = cuda.malloc(d_model * 4)
+        d_wq = cuda.malloc(len(wq_data) * 4)
+        d_wk = cuda.malloc(len(wk_data) * 4)
+        d_wv = cuda.malloc(len(wv_data) * 4)
+        d_wo = cuda.malloc(len(wo_data) * 4)
+        d_qn = cuda.malloc(head_dim * 4) if use_qk_norm else None
+        d_kn = cuda.malloc(head_dim * 4) if use_qk_norm else None
+        d_o  = cuda.malloc(d_model * 4)
+        d_k  = cuda.malloc(n_kv_elems * 4)
+        d_v  = cuda.malloc(n_kv_elems * 4)
+        d_scratch = cuda.malloc(scratch_sz)
+        try:
+            cuda.h2d(d_x, (ctypes.c_float * d_model)(*x_data), d_model * 4)
+            cuda.h2d(d_wq, (ctypes.c_float * len(wq_data))(*wq_data), len(wq_data) * 4)
+            cuda.h2d(d_wk, (ctypes.c_float * len(wk_data))(*wk_data), len(wk_data) * 4)
+            cuda.h2d(d_wv, (ctypes.c_float * len(wv_data))(*wv_data), len(wv_data) * 4)
+            cuda.h2d(d_wo, (ctypes.c_float * len(wo_data))(*wo_data), len(wo_data) * 4)
+            if use_qk_norm:
+                cuda.h2d(d_qn, (ctypes.c_float * head_dim)(*qn_data), head_dim * 4)
+                cuda.h2d(d_kn, (ctypes.c_float * head_dim)(*kn_data), head_dim * 4)
+            cuda.h2d(d_o, (ctypes.c_float * d_model)(*out_init), d_model * 4)
+            cuda.h2d(d_k, (ctypes.c_float * n_kv_elems)(*k_init), n_kv_elems * 4)
+            cuda.h2d(d_v, (ctypes.c_float * n_kv_elems)(*v_init), n_kv_elems * 4)
+
+            g_x, _  = make_tensor([0.0] * d_model, [d_model, 1, 1, 1])
+            g_wq, _ = make_tensor([0.0] * len(wq_data), [d_model, nh_hd, 1, 1])
+            g_wk, _ = make_tensor([0.0] * len(wk_data), [d_model, kv_stride, 1, 1])
+            g_wv, _ = make_tensor([0.0] * len(wv_data), [d_model, kv_stride, 1, 1])
+            g_wo, _ = make_tensor([0.0] * len(wo_data), [nh_hd, d_model, 1, 1])
+            g_qn, _ = make_tensor([0.0] * head_dim, [head_dim, 1, 1, 1])
+            g_kn, _ = make_tensor([0.0] * head_dim, [head_dim, 1, 1, 1])
+            g_o, _  = make_tensor([0.0] * d_model, [d_model, 1, 1, 1])
+            g_k, _  = make_tensor([0.0] * n_kv_elems, [kv_stride, n_ctx, 1, 1])
+            g_v, _  = make_tensor([0.0] * n_kv_elems, [kv_stride, n_ctx, 1, 1])
+            g_x.data, g_wq.data, g_wk.data, g_wv.data = d_x, d_wq, d_wk, d_wv
+            g_wo.data, g_o.data, g_k.data, g_v.data = d_wo, d_o, d_k, d_v
+            if use_qk_norm:
+                g_qn.data, g_kn.data = d_qn, d_kn
+
+            g_kv = SpiteKvCache()
+            g_kv.k, g_kv.v, g_kv.layer = g_k, g_v, 0
+            ctx_gpu = make_ctx_for(pos)
+            ctx_gpu.scratchpad = d_scratch
+            ctx_gpu.scratchpad_bytes = scratch_sz
+
+            ret_test = test_fn(ctypes.byref(g_o), ctypes.byref(g_x), ctypes.byref(g_wq),
+                               ctypes.byref(g_wk), ctypes.byref(g_wv), ctypes.byref(g_wo),
+                               ctypes.byref(g_qn) if use_qk_norm else None,
+                               ctypes.byref(g_kn) if use_qk_norm else None,
+                               eps, ctypes.byref(g_kv), rope_base, ctypes.byref(ctx_gpu))
+            cuda.sync()
+            if ret_test != 0:
+                print(f"    FAIL: test attention returned {ret_test}")
+                return False
+            test_out_arr = (ctypes.c_float * d_model)()
+            cuda.d2h(test_out_arr, d_o, d_model * 4)
+            test_out = list(test_out_arr)
+        finally:
+            for p in (d_x, d_wq, d_wk, d_wv, d_wo, d_qn, d_kn, d_o, d_k, d_v, d_scratch):
+                if p:
+                    cuda.free(p)
+
+    err = max_abs_diff(list(out_ref_arr), test_out)
+    if err > 1e-4:
+        print(f"    FAIL: max_abs_diff={err:.2e} (threshold 1e-4)")
+        return False
+    print(f"    OK: max_abs_diff={err:.2e}")
     return True
 
 
@@ -577,7 +748,8 @@ def main():
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=64, ffn_dim=128)
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=2048, ffn_dim=4096)
 
-    passed &= verify_attention(ref_info, test_info)
+    passed &= verify_attention(ref_info, test_info, cuda, is_cuda, use_qk_norm=True)
+    passed &= verify_attention(ref_info, test_info, cuda, is_cuda, use_qk_norm=False)
 
     print("\n── Result ─────────────────────────────────────────────────────────")
     if passed:
