@@ -86,6 +86,20 @@ impl KvQuant {
             Self::Q4 => None,
         }
     }
+
+    /// Next tier up the ladder (`None` if already at the top).
+    ///
+    /// Used when a kernel cannot read the requested tier: the start tier is
+    /// walked up until one the kernel accepts is found.
+    pub fn upgrade(self) -> Option<Self> {
+        match self {
+            Self::F32 => None,
+            Self::F16 => Some(Self::F32),
+            Self::Q8 => Some(Self::F16),
+            Self::Q5_1 => Some(Self::Q8),
+            Self::Q4 => Some(Self::Q5_1),
+        }
+    }
 }
 
 impl std::fmt::Display for KvQuant {

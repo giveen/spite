@@ -83,6 +83,8 @@ struct GpuState {
 pub struct GpuDense {
     config: ModelConfig,
     table: DispatchTable,
+    /// KV tiers the loaded attention kernel accepts (from the ABI).
+    support: KvSupport,
     activation: Activation,
     apply_qk_norm: bool,
     n_ctx: usize,
@@ -102,6 +104,10 @@ pub struct VramReport {
     pub scratch_bytes: usize,
     pub free_after: usize,
     pub total: usize,
+    /// Start tier actually in effect. Differs from the requested one when the
+    /// loaded kernel cannot read a quantized KV cache, in which case the host
+    /// clamps it rather than failing every attention call.
+    pub kv_quant_effective: KvQuantConfig,
 }
 
 impl GpuDense {
@@ -167,10 +173,18 @@ impl GpuDense {
             weights_bytes += bytes;
             sizes.push((name.to_owned(), t, bytes));
         }
+        // Clamp the configured tiers to what this kernel's attention op can
+        // actually read; a kernel that cannot read the request would reject
+        // every attention call, so start at the best tier it accepts.
+        let support = KvSupport::of(table.kv_cache_kinds);
+        let kv = KvQuantConfig {
+            key: support.clamp_up(kv.key).unwrap_or(KvQuant::F32),
+            val: support.clamp_up(kv.val).unwrap_or(KvQuant::F32),
+        };
         let k_degrade_at = VbrPolicy::from_ctx(n_ctx, kv.key).degrade_at;
         let v_degrade_at = VbrPolicy::from_ctx(n_ctx, kv.val).degrade_at;
-        let k_budget = kv_budget_bytes(n_ctx, kv_row, kv.key);
-        let v_budget = kv_budget_bytes(n_ctx, kv_row, kv.val);
+        let k_budget = kv_budget_bytes(n_ctx, kv_row, kv.key, support);
+        let v_budget = kv_budget_bytes(n_ctx, kv_row, kv.val, support);
         let kv_bytes = config.n_layers * (k_budget + v_budget);
         // q + k + att + scores + vtmp
         let attn_scratch = (2 * n_heads * head_dim + 2 * kv_row + n_heads * n_ctx) * 4;
@@ -253,11 +267,13 @@ impl GpuDense {
             scratch_bytes,
             free_after,
             total,
+            kv_quant_effective: kv.clone(),
         };
         Ok((
             Self {
                 config,
                 table,
+                support,
                 activation: Activation::SwiGlu,
                 apply_qk_norm,
                 n_ctx,
@@ -301,9 +317,55 @@ fn kvq_spite(q: KvQuant) -> SpiteType {
     }
 }
 
+/// KV-cache tiers the resolved attention kernel can read and write.
+///
+/// The mask comes from the kernel's ABI declaration; a kernel that declares
+/// nothing is taken to accept F32 only. The VBR start tier and the degrade
+/// ladder are clamped to this set, so a kernel (or a third-party kernel, or
+/// one built before VBR) that supports fewer tiers still runs instead of
+/// failing every attention call.
+#[derive(Clone, Copy)]
+struct KvSupport(u64);
+
+impl KvSupport {
+    fn of(mask: u64) -> Self {
+        Self(mask)
+    }
+
+    fn supports(self, q: KvQuant) -> bool {
+        self.0 & (1u64 << kvq_spite(q) as u32) != 0
+    }
+
+    /// Best tier at or above `q` that the kernel accepts; `None` when it
+    /// accepts none of the ladder.
+    fn clamp_up(self, q: KvQuant) -> Option<KvQuant> {
+        let mut t = Some(q);
+        while let Some(x) = t {
+            if self.supports(x) {
+                return Some(x);
+            }
+            t = x.upgrade();
+        }
+        None
+    }
+
+    /// Next tier the kernel accepts below `q`, or `None` at the lowest one it
+    /// accepts — the point where degradation must stop.
+    fn step_down(self, q: KvQuant) -> Option<KvQuant> {
+        let mut t = q.degrade();
+        while let Some(x) = t {
+            if self.supports(x) {
+                return Some(x);
+            }
+            t = x.degrade();
+        }
+        None
+    }
+}
+
 /// Reserve enough for the peak of `depth × row_bytes(tier(depth))` over the
 /// whole window, so the cache never overflows as it degrades.
-fn kv_budget_bytes(n_ctx: usize, row_elems: usize, start: KvQuant) -> usize {
+fn kv_budget_bytes(n_ctx: usize, row_elems: usize, start: KvQuant, sup: KvSupport) -> usize {
     let policy = VbrPolicy::from_ctx(n_ctx, start);
     let mut peak = 0usize;
     let mut q = start;
@@ -314,9 +376,9 @@ fn kv_budget_bytes(n_ctx: usize, row_elems: usize, start: KvQuant) -> usize {
             peak = peak.max(hi * quant::packed_bytes(q, row_elems));
             lo = hi;
         }
-        match q.degrade() {
+        match sup.step_down(q) {
             Some(n) => q = n,
-            // At the floor the tier holds for the rest of the window.
+            // At the lowest supported tier the tier holds for the rest of the window.
             None => break,
         }
     }
@@ -328,11 +390,11 @@ fn kv_budget_bytes(n_ctx: usize, row_elems: usize, start: KvQuant) -> usize {
 }
 
 /// Tier selected at `depth` by a degradation schedule.
-fn kv_tier_at(degrade_at: &[usize], depth: usize, start: KvQuant) -> KvQuant {
+fn kv_tier_at(degrade_at: &[usize], depth: usize, start: KvQuant, sup: KvSupport) -> KvQuant {
     let mut q = start;
     for &th in degrade_at {
         if depth >= th {
-            match q.degrade() {
+            match sup.step_down(q) {
                 Some(n) => q = n,
                 None => break,
             }
@@ -398,18 +460,21 @@ impl ModelArch for GpuDense {
         let Ok(mut st) = self.state.lock() else {
             return;
         };
-        if st.k_start == cfg.key && st.v_start == cfg.val {
+        // Clamp to what the loaded attention kernel can read, as in `load`.
+        let key = self.support.clamp_up(cfg.key).unwrap_or(KvQuant::F32);
+        let val = self.support.clamp_up(cfg.val).unwrap_or(KvQuant::F32);
+        if st.k_start == key && st.v_start == val {
             return;
         }
-        st.k_start = cfg.key;
-        st.v_start = cfg.val;
-        st.k_quant = cfg.key;
-        st.v_quant = cfg.val;
-        st.k_degrade_at = VbrPolicy::from_ctx(self.n_ctx, cfg.key).degrade_at;
-        st.v_degrade_at = VbrPolicy::from_ctx(self.n_ctx, cfg.val).degrade_at;
+        st.k_start = key;
+        st.v_start = val;
+        st.k_quant = key;
+        st.v_quant = val;
+        st.k_degrade_at = VbrPolicy::from_ctx(self.n_ctx, key).degrade_at;
+        st.v_degrade_at = VbrPolicy::from_ctx(self.n_ctx, val).degrade_at;
         // The budget depends on the start tier, so reallocate the KV buffers.
-        let k_budget = kv_budget_bytes(self.n_ctx, self.kv_row, cfg.key);
-        let v_budget = kv_budget_bytes(self.n_ctx, self.kv_row, cfg.val);
+        let k_budget = kv_budget_bytes(self.n_ctx, self.kv_row, key, self.support);
+        let v_budget = kv_budget_bytes(self.n_ctx, self.kv_row, val, self.support);
         let mut nk = Vec::with_capacity(self.config.n_layers);
         let mut nv = Vec::with_capacity(self.config.n_layers);
         for _ in 0..self.config.n_layers {
@@ -482,12 +547,12 @@ impl ModelArch for GpuDense {
             // The schedule is always evaluated from the configured start tier,
             // not the current one, so the cache steps down once per threshold.
             let depth = pos + 1;
-            let want_k = kv_tier_at(&st.k_degrade_at, depth, st.k_start);
+            let want_k = kv_tier_at(&st.k_degrade_at, depth, st.k_start, self.support);
             if want_k != st.k_quant {
                 requantize_kv(&st.k_cache, pos, kv_row, st.k_quant, want_k)?;
                 st.k_quant = want_k;
             }
-            let want_v = kv_tier_at(&st.v_degrade_at, depth, st.v_start);
+            let want_v = kv_tier_at(&st.v_degrade_at, depth, st.v_start, self.support);
             if want_v != st.v_quant {
                 requantize_kv(&st.v_cache, pos, kv_row, st.v_quant, want_v)?;
                 st.v_quant = want_v;

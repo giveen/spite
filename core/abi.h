@@ -277,6 +277,15 @@ typedef struct {
 
 /* ── Kernel descriptor ────────────────────────────────────────────────── */
 
+/*
+ * Optional: KV-cache tiers this kernel's attention op can read and write, as a
+ * bitmask with bit (SpiteType) set. A kernel that leaves this NULL predates
+ * VBR and is taken to accept F32 KV only — the conservative reading. The host
+ * clamps the VBR start tier and the degrade ladder to this set, so a kernel
+ * that supports fewer tiers still runs rather than failing the attention op.
+ */
+typedef uint64_t (*SpiteKvCacheKindsFn)(void);
+
 typedef struct {
     uint32_t    abi_version;
     const char* model_arch;       /* e.g. "llama3" */
@@ -296,6 +305,8 @@ typedef struct {
     SpiteLayerFn     prefill;
     /* Dense projection (LM head). Added in ABI v4. */
     SpiteMatmulFn    matmul;
+    /* KV-cache tiers this attention op accepts; NULL = F32 only. */
+    SpiteKvCacheKindsFn kv_cache_kinds;
 } SpiteKernelInfo;
 
 /* Every kernel .so must export this symbol. */

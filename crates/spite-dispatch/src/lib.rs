@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use spite_abi::{
     ABI_VERSION, AttentionFn, FfnFn, KERNEL_ENTRY_SYMBOL, KernelInfoFn, LayerFn, MatmulFn,
-    RmsNormFn, SpecVerifyFn, SpiteKernelInfo,
+    RmsNormFn, SpecVerifyFn, SpiteKernelInfo, SpiteType,
 };
 
 pub mod cards;
@@ -100,6 +100,10 @@ pub struct DispatchTable {
     // ── Model-specific ops ────────────────────────────────────────────────
     pub rms_norm: (Option<RmsNormFn>, OpSource),
     pub attention: (Option<AttentionFn>, OpSource),
+    /// KV-cache tiers the resolved attention op accepts, as a bitmask over
+    /// `SpiteType` values. A kernel that does not declare support reads as
+    /// F32-only, so the host never hands it a tier it cannot read.
+    pub kv_cache_kinds: u64,
     pub ffn: (Option<FfnFn>, OpSource),
     pub layer: (Option<LayerFn>, OpSource),
     pub matmul: (Option<MatmulFn>, OpSource),
@@ -179,9 +183,11 @@ impl DispatchBuilder {
             path: kdir.join("generic").join("generic"),
         };
 
-        // Model ops resolved from model candidate chain
+        // Model ops resolved from model candidate chain.
         let rms_norm = find_op(&model_libs, |k| k.info.rms_norm, generic_src.clone());
-        let attention = find_op(&model_libs, |k| k.info.attention, generic_src.clone());
+        // Attention carries the KV-tier capability, so resolve the two together:
+        // the mask must come from the kernel that actually won the slot.
+        let (attention, kv_cache_kinds) = resolve_attention(&model_libs, &generic_src);
         let ffn = find_op(&model_libs, |k| k.info.ffn, generic_src.clone());
         let layer = find_op(&model_libs, |k| k.info.layer, generic_src.clone());
         let matmul = find_op(&model_libs, |k| k.info.matmul, generic_src.clone());
@@ -201,6 +207,7 @@ impl DispatchBuilder {
         Ok(DispatchTable {
             rms_norm,
             attention,
+            kv_cache_kinds,
             ffn,
             layer,
             matmul,
@@ -229,6 +236,32 @@ fn try_load_dir(dir: &Path) -> Option<LoadedKernel> {
         }
     }
     None
+}
+
+/// Resolve the attention slot together with the KV tiers its kernel accepts.
+///
+/// A kernel that does not export the capability predates VBR and is taken to
+/// accept F32 KV only — never advertise more than the kernel can read.
+fn resolve_attention(
+    libs: &[LoadedKernel],
+    fallback: &OpSource,
+) -> ((Option<AttentionFn>, OpSource), u64) {
+    const F32_ONLY: u64 = 1u64 << SpiteType::F32 as u32;
+    for lib in libs {
+        if let Some(f) = lib.info.attention {
+            let kinds = match lib.info.kv_cache_kinds {
+                // SAFETY: the kernel exports this as a plain query function.
+                Some(cap) => unsafe { cap() },
+                None => F32_ONLY,
+            };
+            let src = OpSource {
+                gpu_arch: lib.gpu_arch().to_owned(),
+                path: lib.dir.clone(),
+            };
+            return ((Some(f), src), kinds);
+        }
+    }
+    ((None, fallback.clone()), F32_ONLY)
 }
 
 fn find_op<T: Copy>(

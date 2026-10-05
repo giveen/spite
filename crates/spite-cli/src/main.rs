@@ -592,6 +592,15 @@ fn build_model(
                     gib(r.free_after),
                     gib(r.total)
                 );
+                // The kernel may not be able to read the requested tier; say so
+                // rather than letting the summary above contradict what runs.
+                if r.kv_quant_effective.key != kv_cfg.key || r.kv_quant_effective.val != kv_cfg.val
+                {
+                    println!(
+                        "kv cache     : kernel accepts fewer tiers; using K={} V={} (requested K={} V={})",
+                        r.kv_quant_effective.key, r.kv_quant_effective.val, kv_cfg.key, kv_cfg.val
+                    );
+                }
                 return Ok(Box::new(model));
             }
             None if place.device == Device::Cuda => bail!(

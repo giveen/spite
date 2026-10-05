@@ -352,6 +352,12 @@ extern "C" int qwen3_cuda_matmul(SpiteTensor* out, const SpiteTensor* x, const S
     return finish();
 }
 
+/* KV-cache tiers this attention op reads and writes (bit = SpiteType). */
+extern "C" uint64_t qwen3_cuda_kv_cache_kinds() {
+    return (1ull << SPITE_TYPE_F32) | (1ull << SPITE_TYPE_F16) | (1ull << SPITE_TYPE_Q8_0) |
+           (1ull << SPITE_TYPE_Q5_1) | (1ull << SPITE_TYPE_Q4_0);
+}
+
 static const SpiteKernelInfo KERNEL_INFO = {
     SPITE_ABI_VERSION,
     "qwen3",
@@ -366,6 +372,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     nullptr, /* speculative_verify */
     nullptr, /* prefill */
     qwen3_cuda_matmul,
+    qwen3_cuda_kv_cache_kinds,
 };
 
 extern "C" const SpiteKernelInfo* spite_kernel_info() { return &KERNEL_INFO; }
