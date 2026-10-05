@@ -397,9 +397,25 @@ def verify_rms_norm(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
     return True
 
 
+def pack_q8_0(values: list[float]) -> bytes:
+    """Pack a flat Q8_0 row into GGUF blocks: fp16 scale then 32 signed bytes."""
+    assert len(values) % 32 == 0
+    out = bytearray()
+    for i in range(0, len(values), 32):
+        group = values[i:i + 32]
+        amax = max(abs(v) for v in group) or 1.0
+        scale = amax / 127.0
+        out += struct.pack("<e", scale)
+        for v in group:
+            out += bytes([max(-128, min(127, round(v / scale))) & 0xFF])
+    return bytes(out)
+
+
 def verify_matmul(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
-                  cuda: CudaHelper, is_cuda: bool, cols: int = 64, rows: int = 128) -> bool:
-    print(f"\n  [matmul] shape=[{rows}, {cols}]")
+                  cuda: CudaHelper, is_cuda: bool, cols: int = 64, rows: int = 128,
+                  q8: bool = False) -> bool:
+    tag = " q8_0" if q8 else ""
+    print(f"\n  [matmul] shape=[{rows}, {cols}]{tag}")
     if not ref_info.matmul:
         print("    SKIP: reference kernel has no matmul")
         return True
@@ -414,10 +430,21 @@ def verify_matmul(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
     out_ref_arr = (ctypes.c_float * rows)()
 
     tx, _ = make_tensor(x_data, [cols, 1, 1, 1])
-    tw, _ = make_tensor(w_data, [cols, rows, 1, 1])
     to, _ = make_tensor([0.0] * rows, [rows, 1, 1, 1])
     to.data = ctypes.cast(out_ref_arr, ctypes.c_void_p)
     ctx_ref = make_ctx()
+    if q8:
+        # Both sides read the packed bytes, so this is a differential check of
+        # the kernel's Q8_0 decode path against the reference's own dequant.
+        assert cols % 32 == 0
+        w_bytes = pack_q8_0(w_data)
+        w_buf = ctypes.create_string_buffer(w_bytes)
+        tw, _ = make_tensor([0.0] * (rows * cols), [cols, rows, 1, 1], kind=SPITE_TYPE_Q8_0)
+        tw.data = ctypes.cast(w_buf, ctypes.c_void_p)
+    else:
+        w_bytes = None
+        w_buf = None
+        tw, _ = make_tensor(w_data, [cols, rows, 1, 1])
 
     ref_fn = MatmulFn(ref_info.matmul)
     ret_ref = ref_fn(ctypes.byref(to), ctypes.byref(tx), ctypes.byref(tw), ctypes.byref(ctx_ref))
@@ -441,13 +468,17 @@ def verify_matmul(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
             print("    SKIP: CUDA runtime not available")
             return True
         d_x = cuda.malloc(cols * 4)
-        d_w = cuda.malloc(rows * cols * 4)
+        d_w = cuda.malloc(len(w_bytes) if q8 else rows * cols * 4)
         d_o = cuda.malloc(rows * 4)
         try:
             cuda.h2d(d_x, (ctypes.c_float * cols)(*x_data), cols * 4)
-            cuda.h2d(d_w, (ctypes.c_float * (rows * cols))(*w_data), rows * cols * 4)
+            if q8:
+                cuda.h2d(d_w, (ctypes.c_ubyte * len(w_bytes))(*w_bytes), len(w_bytes))
+            else:
+                cuda.h2d(d_w, (ctypes.c_float * (rows * cols))(*w_data), rows * cols * 4)
             tx_gpu, _ = make_tensor([0.0] * cols, [cols, 1, 1, 1])
-            tw_gpu, _ = make_tensor([0.0] * (rows * cols), [cols, rows, 1, 1])
+            tw_gpu, _ = make_tensor([0.0] * (rows * cols), [cols, rows, 1, 1],
+                                    kind=SPITE_TYPE_Q8_0 if q8 else SPITE_TYPE_F32)
             to_gpu, _ = make_tensor([0.0] * rows, [rows, 1, 1, 1])
             tx_gpu.data = d_x
             tw_gpu.data = d_w
@@ -858,6 +889,22 @@ def main():
 
     passed &= verify_matmul(ref_info, test_info, cuda, is_cuda, cols=64, rows=128)
     passed &= verify_matmul(ref_info, test_info, cuda, is_cuda, cols=4096, rows=4096)
+
+    # Q8_0 is the format the shipped model actually uses for every projection,
+    # so the F32 cases above never touch the decode matvec.  These column counts
+    # step through a K-split kernel's instantiations (512 -> 2 warps per row,
+    # 1024 -> 4, 2048/4096 -> 8) and 64 covers the staged one-warp-per-row path.
+    if SPITE_TYPE_Q8_0 in tuple(test_info.supported_quants):
+        for cols_q8 in (64, 512, 1024, 2048, 4096):
+            passed &= verify_matmul(ref_info, test_info, cuda, is_cuda,
+                                    cols=cols_q8, rows=256, q8=True)
+        # Rows above the row-axis crossover take the staged one-warp-per-row
+        # kernel instead of a K-split, so pin that shape too (the column count
+        # is deliberately small: it is the row count that selects the path).
+        passed &= verify_matmul(ref_info, test_info, cuda, is_cuda,
+                                cols=64, rows=16384, q8=True)
+    else:
+        print("\n  [matmul] q8_0 shapes: SKIP - under-test kernel does not declare Q8_0")
 
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=64, ffn_dim=128)
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=2048, ffn_dim=4096)
