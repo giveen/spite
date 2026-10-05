@@ -6,7 +6,11 @@
  *
  * Improvements over kernels/qwen/qwen3/nvidia/ (generic CUDA baseline):
  *   • Vectorized 128-bit memory transactions — float4 in rms_norm,
- *     F32 dense matvec, and attention score dot-products.
+ *     F32 dense matvec, and the whole flash attention tile (staging, Q.K
+ *     dot-products, P.V accumulation), plus __half2 F16 staging.
+ *   • KV-tier-specialized attention staging: q8_0/q5_1/q4_0 block decoders are
+ *     compiled in rather than switched on per element (see
+ *     kv_attn_flash_sm120.inl).
  *   • __half2 pair loads + arithmetic in the F16 dense matvec path.
  *   • Fully unrolled warp reductions (5 explicit shuffles, no loop)
  *     exploiting Blackwell's dual-warp issue scheduler.
@@ -282,6 +286,17 @@ inline int finish() { return cudaGetLastError() == cudaSuccess ? 0 : -2; }
 // threads_for, stream_of, attn_softmax, block_sum and load_w.
 #include "kernels/qwen/qwen3/nvidia/kv_attn.inl"
 
+// Blackwell flash tile kernel + hd dispatch. Defines SPITE_KVFLASH_ARCH so the
+// shared scaffolding below does not emit the portable tile kernel as well.
+#define SPITE_KVFLASH_ARCH 1
+#include "kernels/qwen/qwen3/nvidia/sm_120/kv_attn_flash_sm120.inl"
+
+// Flash-decoding scaffolding shared by every level: KV-axis chunking, the
+// split-K workspace carved out of the scores reservation, the combine pass and
+// kvflash_run(). Uses this file's warp_max, warp_sum, threads_for, stream_of
+// and launch_matvec, plus kv_attn.inl's kvattn_prologue.
+#include "kernels/qwen/qwen3/nvidia/kv_attn_flash.inl"
+
 // ── ABI ops ───────────────────────────────────────────────────────────────
 
 extern "C" int qwen3_sm120_rms_norm(SpiteTensor* out, const SpiteTensor* x,
@@ -302,7 +317,7 @@ extern "C" int qwen3_sm120_attention(SpiteTensor* out, const SpiteTensor* x,
                                     const SpiteTensor* q_norm, const SpiteTensor* k_norm,
                                     float norm_eps, SpiteKvCache* kv, float rope_freq_base,
                                     const SpiteCtx* ctx) {
-    return kvattn_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
+    return kvflash_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
 }
 
 extern "C" int qwen3_sm120_ffn(SpiteTensor* out, const SpiteTensor* x,

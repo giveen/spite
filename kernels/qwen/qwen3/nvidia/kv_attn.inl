@@ -263,17 +263,33 @@ __global__ void kvattn_weighted_v(float* __restrict__ att, const float* __restri
     }
 }
 
+/* Everything both attention back ends need: shape validation, the scratchpad
+ * budget, and this token's Q/K/V projections, per-head QK-norm/RoPE and KV-row
+ * write.  kvattn_prologue() fills it; kvattn_run() (below) and the flash
+ * kernels in kv_attn_flash.inl both start from it, so neither can drift on
+ * validation or on what the host was asked to reserve. */
+struct KvattnArgs {
+    int nh, nkv, hd, kv_stride, n_ctx, n_tok, pos, group, kind;
+    int row_bytes;   /* bytes per K (== V) row of the cache */
+    float scale;     /* 1 / sqrt(hd) */
+    const uint8_t* kc;  /* KV cache row 0, key side   */
+    const uint8_t* vc;  /* KV cache row 0, value side */
+    float* q;        /* [nh*hd]    */
+    float* k;        /* [nkv*hd]   */
+    float* att;      /* [nh*hd]    */
+    float* scores;   /* [nh*n_ctx] VBR score vector; the flash back end reuses
+                      *            this region as its split-K workspace */
+    float* vtmp;     /* [nkv*hd]   */
+};
+
 /*
- * Full attention op for one token at `ctx->pos`, KV stored at `kv->k.kind` /
- * `kv->v.kind` (must match). F32 keeps the vectorized path; every other tier
- * quantizes the new row and dequantizes the history in the read kernels.
- *
  * Scratchpad (floats): q[nh*hd] k[nkv*hd] att[nh*hd] scores[nh*n_ctx] vtmp[nkv*hd]
+ * Returns 0, -1 (bad shape/kind) or -2 (bad scratchpad / launch failure).
  */
-inline int kvattn_run(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor* wq,
-                      const SpiteTensor* wk, const SpiteTensor* wv, const SpiteTensor* wo,
-                      const SpiteTensor* q_norm, const SpiteTensor* k_norm, float norm_eps,
-                      SpiteKvCache* kv, float rope_freq_base, const SpiteCtx* ctx) {
+inline int kvattn_prologue(KvattnArgs* a, const SpiteTensor* x, const SpiteTensor* wq,
+                           const SpiteTensor* wk, const SpiteTensor* wv,
+                           const SpiteTensor* q_norm, const SpiteTensor* k_norm, float norm_eps,
+                           SpiteKvCache* kv, float rope_freq_base, const SpiteCtx* ctx) {
     if (!ctx || !kv || ctx->n_heads <= 0 || ctx->n_kv_heads <= 0) return -1;
     const int nh = ctx->n_heads, nkv = ctx->n_kv_heads;
     const int hd = static_cast<int>(wq->ne[1]) / nh;
@@ -302,9 +318,6 @@ inline int kvattn_run(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor*
     uint8_t* k_row = static_cast<uint8_t*>(kv->k.data) + static_cast<size_t>(pos) * kv->k.nb[1];
     uint8_t* v_row = static_cast<uint8_t*>(kv->v.data) + static_cast<size_t>(pos) * kv->v.nb[1];
     const int rt = threads_for(hd / 2);
-    const int n_tok = pos + 1;
-    const int group = nh / nkv;
-    const float scale = rsqrtf(static_cast<float>(hd));
     const void* qn = q_norm ? q_norm->data : nullptr;
     const void* kn = k_norm ? k_norm->data : nullptr;
 
@@ -333,23 +346,64 @@ inline int kvattn_run(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor*
             vtmp, v_row, kind, kv_stride);
     }
 
-    const size_t krow_bytes = kvq_row_bytes(kind, kv_stride);
+    a->nh = nh;
+    a->nkv = nkv;
+    a->hd = hd;
+    a->kv_stride = kv_stride;
+    a->n_ctx = n_ctx;
+    a->n_tok = pos + 1;
+    a->pos = pos;
+    a->group = nh / nkv;
+    a->kind = kind;
+    a->row_bytes = static_cast<int>(kvq_row_bytes(kind, kv_stride));
+    a->scale = rsqrtf(static_cast<float>(hd));
+    a->kc = static_cast<const uint8_t*>(kv->k.data);
+    a->vc = static_cast<const uint8_t*>(kv->v.data);
+    a->q = q;
+    a->k = k;
+    a->att = att;
+    a->scores = scores;
+    a->vtmp = vtmp;
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+/*
+ * Full attention op for one token at `ctx->pos`, KV stored at `kv->k.kind` /
+ * `kv->v.kind` (must match). F32 keeps the vectorized path; every other tier
+ * quantizes the new row and dequantizes the history in the read kernels.
+ *
+ * This is the portable VBR back end: it materializes the score vector and then
+ * walks it three times (write, softmax, weighted-V).  kv_attn_flash.inl fuses
+ * those passes; this one remains the fallback for shapes the flash kernel does
+ * not cover, and the differential reference the flash kernel is tested against.
+ */
+inline int kvattn_run(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor* wq,
+                      const SpiteTensor* wk, const SpiteTensor* wv, const SpiteTensor* wo,
+                      const SpiteTensor* q_norm, const SpiteTensor* k_norm, float norm_eps,
+                      SpiteKvCache* kv, float rope_freq_base, const SpiteCtx* ctx) {
+    KvattnArgs a;
+    const int rc = kvattn_prologue(&a, x, wq, wk, wv, q_norm, k_norm, norm_eps, kv,
+                                  rope_freq_base, ctx);
+    if (rc) return rc;
+
+    cudaStream_t s = stream_of(ctx);
+    const int nh = a.nh, hd = a.hd, n_tok = a.n_tok, n_ctx = a.n_ctx, group = a.group;
     kvattn_scores<<<dim3((n_tok + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, nh),
                     dim3(WARP, ROWS_PER_BLOCK), 0, s>>>(
-        scores, q, static_cast<const uint8_t*>(kv->k.data), n_tok, n_ctx, hd, group,
-        static_cast<int>(krow_bytes), kind, scale);
-    attn_softmax<<<nh, threads_for(n_tok > 256 ? 256 : n_tok), 0, s>>>(scores, n_tok, n_ctx);
-    if (kind == SPITE_TYPE_F32) {
+        a.scores, a.q, static_cast<const uint8_t*>(kv->k.data), n_tok, n_ctx, hd, group,
+        a.row_bytes, a.kind, a.scale);
+    attn_softmax<<<nh, threads_for(n_tok > 256 ? 256 : n_tok), 0, s>>>(a.scores, n_tok, n_ctx);
+    if (a.kind == SPITE_TYPE_F32) {
         kvattn_weighted_v_f32<<<nh, threads_for(hd), 0, s>>>(
-            att, scores, static_cast<const float*>(kv->v.data), n_tok, n_ctx, hd, group,
-            kv_stride);
+            a.att, a.scores, static_cast<const float*>(kv->v.data), n_tok, n_ctx, hd, group,
+            a.kv_stride);
     } else {
         kvattn_weighted_v<<<nh, threads_for(hd), 0, s>>>(
-            att, scores, static_cast<const uint8_t*>(kv->v.data), n_tok, n_ctx, hd, group,
-            static_cast<int>(kvq_row_bytes(kind, kv_stride)), kind);
+            a.att, a.scores, static_cast<const uint8_t*>(kv->v.data), n_tok, n_ctx, hd, group,
+            a.row_bytes, a.kind);
     }
 
-    if (launch_matvec(wo, att, static_cast<float*>(out->data), true, s)) return -1;
+    if (launch_matvec(wo, a.att, static_cast<float*>(out->data), true, s)) return -1;
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 

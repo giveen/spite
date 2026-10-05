@@ -14,6 +14,10 @@
  *     the 8 warps in a block read from L1 instead of L2/DRAM for every
  *     subsequent matvec row.
  *
+ * Attention is the sm_120 flash tile kernel (kv_attn_flash_sm120.inl) driven by
+ * the shared flash-decoding scaffolding: this card's own tuning stays in the
+ * projections, which is where its 8-warp blocks and smem x-staging pay off.
+ *
  * Weight types: F32, F16, Q8_0. Activations: F32.
  * KV cache: F32, F16, Q8_0, Q5_1 or Q4_0 (see kv_attn.inl).
  * Single-token decode semantics (prefill = repeated decode by the host).
@@ -334,6 +338,15 @@ inline int finish() { return cudaGetLastError() == cudaSuccess ? 0 : -2; }
 // threads_for, stream_of, attn_softmax, block_sum and load_w.
 #include "kernels/qwen/qwen3/nvidia/kv_attn.inl"
 
+// sm_120 flash tile kernel + hd dispatch (this card shares the arch-level tile
+// kernel; SPITE_KVFLASH_ARCH keeps the shared scaffolding from emitting the
+// portable tile kernel too).
+#define SPITE_KVFLASH_ARCH 1
+#include "kernels/qwen/qwen3/nvidia/sm_120/kv_attn_flash_sm120.inl"
+
+// Flash-decoding scaffolding: chunking, split-K workspace, combine, entry point.
+#include "kernels/qwen/qwen3/nvidia/kv_attn_flash.inl"
+
 // ── ABI ops ───────────────────────────────────────────────────────────────
 
 extern "C" int qwen3_rtx5090_rms_norm(SpiteTensor* out, const SpiteTensor* x,
@@ -354,7 +367,7 @@ extern "C" int qwen3_rtx5090_attention(SpiteTensor* out, const SpiteTensor* x,
                                     const SpiteTensor* q_norm, const SpiteTensor* k_norm,
                                     float norm_eps, SpiteKvCache* kv, float rope_freq_base,
                                     const SpiteCtx* ctx) {
-    return kvattn_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
+    return kvflash_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
 }
 
 extern "C" int qwen3_rtx5090_ffn(SpiteTensor* out, const SpiteTensor* x,

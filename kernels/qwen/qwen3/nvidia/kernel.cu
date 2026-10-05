@@ -9,15 +9,21 @@
  *
  *   rms_norm  — row-wise RMSNorm (also used for per-head QK norm)
  *   attention — Q/K/V matvec → per-head QK RMSNorm → NEOX RoPE → KV write
- *               at ctx->pos → causal GQA softmax → out-proj, out += result
+ *               at ctx->pos → causal GQA attention → out-proj, out += result
  *   ffn       — SwiGLU / GeGLU, out += down(act(gate) * up)
  *   matmul    — out = W · x (LM head)
+ *
+ * Attention is the flash-decoding back end from kv_attn_flash.inl: the KV axis
+ * is split across blocks, each block stages one KV tile in shared memory and
+ * shares it across the whole GQA group, and the softmax is folded into the
+ * weighted-V pass (no nh*n_ctx score vector).  kv_attn.inl keeps the portable
+ * VBR back end that it falls back to for shapes the tile kernel does not cover.
  *
  * Weight types: F32, F16, Q8_0. Activations and KV cache: F32.
  * Single-token decode semantics (prefill = repeated decode by the host).
  *
  * Scratchpad (ctx->scratchpad, device, floats):
- *   attention: q[nh*hd] k[nkv*hd] att[nh*hd] scores[nh*n_ctx]
+ *   attention: q[nh*hd] k[nkv*hd] att[nh*hd] workspace[nh*n_ctx] vtmp[nkv*hd]
  *   ffn:       gate[d_ffn] up[d_ffn]
  */
 
@@ -219,6 +225,12 @@ inline int finish() {
 // threads_for, stream_of, attn_softmax, block_sum and load_w.
 #include "kernels/qwen/qwen3/nvidia/kv_attn.inl"
 
+// Flash-decoding attention (portable CUDA C++): split-KV over the KV axis,
+// GQA-group tile reuse, fused online softmax. Uses this file's warp_max,
+// warp_sum, threads_for, stream_of and launch_matvec, plus kv_attn.inl's
+// kvq_get/kvq_row_bytes/kvattn_prologue.
+#include "kernels/qwen/qwen3/nvidia/kv_attn_flash.inl"
+
 // ── ABI ops ──────────────────────────────────────────────────────────────
 
 extern "C" int qwen3_cuda_rms_norm(SpiteTensor* out, const SpiteTensor* x,
@@ -239,7 +251,7 @@ extern "C" int qwen3_cuda_attention(SpiteTensor* out, const SpiteTensor* x,
                                     const SpiteTensor* q_norm, const SpiteTensor* k_norm,
                                     float norm_eps, SpiteKvCache* kv, float rope_freq_base,
                                     const SpiteCtx* ctx) {
-    return kvattn_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
+    return kvflash_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
 }
 
 extern "C" int qwen3_cuda_ffn(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor* w_gate,

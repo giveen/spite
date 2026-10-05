@@ -178,7 +178,17 @@ def make_ctx() -> SpiteCtx:
 
 
 def max_abs_diff(a: list[float], b: list[float]) -> float:
-    return max(abs(x - y) for x, y in zip(a, b))
+    """Max element-wise |a - b|, and inf if either side produced a NaN.
+
+    A NaN must fail: `nan > 1e-4` is False, so returning the NaN straight from
+    `max()` would let a kernel with an uninitialized accumulator pass.
+    """
+    err = 0.0
+    for x, y in zip(a, b):
+        if math.isnan(x) or math.isnan(y):
+            return math.inf
+        err = max(err, abs(x - y))
+    return err
 
 
 def load_kernel(path: str):
@@ -523,6 +533,11 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
     KV is F32 on both sides: that is the tier the generic kernel declares
     (kv_cache_kinds left NULL), and F32 is the highest-fidelity path each GPU
     kernel offers, so this pins the maths rather than the block codec.
+
+    The GPU kernels dispatch on shape: a small head_dim / short context takes
+    the portable VBR back end, a supported head_dim with room for the split-K
+    workspace takes the flash back end, and `pos` past one KV tile exercises
+    the tiled loop and the multi-chunk combine.  Call it once per path.
     """
     tag = "" if use_qk_norm else " (no QK norm)"
     print(f"\n  [attention] d_model={d_model} heads={n_heads} kv_heads={n_kv_heads} "
@@ -748,8 +763,15 @@ def main():
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=64, ffn_dim=128)
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=2048, ffn_dim=4096)
 
+    # head_dim=16 is outside every GPU kernel's flash dispatch, so this pair
+    # pins the portable VBR back end; the two below pin the flash back end
+    # (one tile + tail, then a multi-tile history that splits across chunks).
     passed &= verify_attention(ref_info, test_info, cuda, is_cuda, use_qk_norm=True)
     passed &= verify_attention(ref_info, test_info, cuda, is_cuda, use_qk_norm=False)
+    passed &= verify_attention(ref_info, test_info, cuda, is_cuda, head_dim=64, n_ctx=96, pos=7,
+                               use_qk_norm=True)
+    passed &= verify_attention(ref_info, test_info, cuda, is_cuda, head_dim=64, n_ctx=320, pos=140,
+                               use_qk_norm=True)
 
     print("\n── Result ─────────────────────────────────────────────────────────")
     if passed:
