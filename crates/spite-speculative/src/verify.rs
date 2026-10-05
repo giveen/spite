@@ -78,7 +78,7 @@ fn softmax_prob(logits: &[f32], idx: usize, temperature: f32) -> f32 {
         return if logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
             .is_some_and(|(i, _)| i == idx)
         {
             1.0

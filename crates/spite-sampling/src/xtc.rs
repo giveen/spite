@@ -56,7 +56,11 @@ pub fn apply_xtc(
 
     // Sort indices by descending probability.
     let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+    idx.sort_unstable_by(|&a, &b| {
+        probs[b]
+            .partial_cmp(&probs[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Walk sorted list; accumulate prob mass, exclude tokens above threshold.
     // The token that pushes cumulative mass over `threshold` is also excluded.

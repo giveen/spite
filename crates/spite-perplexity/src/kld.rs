@@ -165,7 +165,11 @@ fn kld_from_logprobs(ref_lp: &[f32], cand_lp: &[f32], top_k: usize) -> f64 {
     // If top_k, only sum over the top-k tokens by reference probability.
     let indices: Vec<usize> = if top_k > 0 && top_k < len {
         let mut idx: Vec<usize> = (0..len).collect();
-        idx.sort_unstable_by(|&a, &b| ref_exp[b].partial_cmp(&ref_exp[a]).unwrap());
+        idx.sort_unstable_by(|&a, &b| {
+            ref_exp[b]
+                .partial_cmp(&ref_exp[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         idx.truncate(top_k);
         idx
     } else {
@@ -202,7 +206,7 @@ fn summarise(mut positions: Vec<PositionKld>, cfg: &KldConfig) -> KldResult {
     let max_kld = positions.iter().map(|p| p.kld).fold(0.0f64, f64::max);
 
     let mut sorted_klds: Vec<f64> = positions.iter().map(|p| p.kld).collect();
-    sorted_klds.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap());
+    sorted_klds.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let p95_idx = ((n as f64) * 0.95) as usize;
     let p95_kld = sorted_klds[p95_idx.min(n - 1)];
 
@@ -214,7 +218,11 @@ fn summarise(mut positions: Vec<PositionKld>, cfg: &KldConfig) -> KldResult {
         KldVerdict::Fail
     };
 
-    positions.sort_unstable_by(|a, b| b.kld.partial_cmp(&a.kld).unwrap());
+    positions.sort_unstable_by(|a, b| {
+        b.kld
+            .partial_cmp(&a.kld)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let worst = positions.into_iter().take(10).collect();
 
     KldResult {

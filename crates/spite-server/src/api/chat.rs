@@ -156,7 +156,7 @@ async fn blocking_response(state: Arc<AppState>, req: ChatRequest) -> Json<ChatC
         .collect::<Vec<_>>()
         .join("\n");
 
-    let mut exec = state.executor.lock().unwrap();
+    let mut exec = state.executor.lock().unwrap_or_else(|e| e.into_inner());
     let ids = match state.tokenizer.encode(&prompt, true) {
         Ok(ids) => ids,
         Err(e) => return error_completion(&req.model, &e.to_string()),
@@ -231,7 +231,7 @@ async fn stream_response(
     // ponytail: generation runs to completion, then pieces stream; true
     // token-by-token streaming when the executor supports async steps.
     let pieces: Vec<String> = {
-        let mut exec = state.executor.lock().unwrap();
+        let mut exec = state.executor.lock().unwrap_or_else(|e| e.into_inner());
         match state.tokenizer.encode(&prompt, true) {
             Ok(ids) => exec
                 .generate(&state.tokenizer, &ids, req.max_tokens, req.temperature, 0)

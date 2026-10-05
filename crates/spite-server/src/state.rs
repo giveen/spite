@@ -32,8 +32,11 @@ impl AppState {
         let model = GgufModel::open(model_path)?;
         let model_arch = model.arch().to_owned();
 
-        let _spec = KernelSpec::from_arch(&model_arch, gpu_arch);
-        let _dispatch = DispatchBuilder::new(kernels_dir, _spec).build()?;
+        let mut spec = KernelSpec::from_arch(&model_arch, gpu_arch);
+        if spec.card_id.is_empty() {
+            spec.card_id = spite_dispatch::detect_card_id("");
+        }
+        let _dispatch = DispatchBuilder::new(kernels_dir, spec).build()?;
 
         let hp = spite_loader::config::ModelHyperparams::from_gguf(&model);
         let mut arch = ArchRegistry::default().build(ModelConfig::from(hp))?;
