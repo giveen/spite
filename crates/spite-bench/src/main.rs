@@ -5,8 +5,18 @@
 //!
 //! Outputs JSON to stdout when --json is given; human table otherwise.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+enum Device {
+    #[default]
+    Auto,
+    Cpu,
+    Cuda,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "spite-bench", about = "Benchmark spite kernel throughput")]
@@ -30,6 +40,22 @@ struct Args {
     /// Print which kernel won each dispatch slot.
     #[arg(long)]
     verbose: bool,
+
+    /// Execution device.
+    #[arg(long, value_enum, default_value_t = Device::Auto)]
+    device: Device,
+
+    /// GPU card (e.g. RTX_5090).
+    #[arg(long)]
+    card: Option<String>,
+
+    /// GPU architecture override (e.g. sm_120).
+    #[arg(long)]
+    gpu_arch: Option<String>,
+
+    /// Path to kernels directory.
+    #[arg(long, default_value = "kernels")]
+    kernels_dir: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -40,14 +66,68 @@ fn main() -> Result<()> {
     let args = Args::parse();
     let gguf = spite_loader::GgufModel::open(&args.model)?;
     let hp = spite_loader::config::ModelHyperparams::from_gguf(&gguf);
-    let mut model = ArchRegistry::default().build(ModelConfig::from(hp))?;
-    model.load_weights(&gguf)?;
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
 
+    let gpu_arch = args
+        .gpu_arch
+        .clone()
+        .or_else(|| {
+            args.card
+                .as_deref()
+                .map(spite_dispatch::normalize_card_name)
+        })
+        .unwrap_or_else(spite_dispatch::detect_gpu_arch);
+
+    let mut peak_mem_mib = 0u64;
+
+    let (model, device_label): (Box<dyn spite_models::ModelArch>, String) = match args.device {
+        Device::Cpu => {
+            let mut m = ArchRegistry::default().build(ModelConfig::from(hp))?;
+            m.load_weights(&gguf)?;
+            (m, "cpu".into())
+        }
+        Device::Cuda | Device::Auto => {
+            match spite_models::gpu_dense::GpuDense::resolve_table(
+                &hp.arch,
+                &gpu_arch,
+                &args.kernels_dir,
+            ) {
+                Some(table) => {
+                    let qk_norm = hp.arch == "qwen3";
+                    let (m, r) = spite_models::gpu_dense::GpuDense::load(
+                        ModelConfig::from(hp),
+                        &gguf,
+                        table,
+                        4096,
+                        qk_norm,
+                    )
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    peak_mem_mib =
+                        ((r.weights_bytes + r.kv_bytes + r.scratch_bytes) / (1024 * 1024)) as u64;
+                    (Box::new(m), format!("cuda ({gpu_arch})"))
+                }
+                None if args.device == Device::Cuda => {
+                    anyhow::bail!(
+                        "--device cuda: no CUDA kernel for arch '{}' on '{}' under {}",
+                        hp.arch,
+                        gpu_arch,
+                        args.kernels_dir.display()
+                    );
+                }
+                None => {
+                    let mut m = ArchRegistry::default().build(ModelConfig::from(hp))?;
+                    m.load_weights(&gguf)?;
+                    (m, "cpu".into())
+                }
+            }
+        }
+    };
+
     if args.verbose {
-        let spec = spite_dispatch::KernelSpec::from_arch(model.config().arch.as_str(), "generic");
-        let table = spite_dispatch::DispatchBuilder::new("kernels", spec).build()?;
-        table.print_sources();
+        let spec = spite_dispatch::KernelSpec::from_arch(model.config().arch.as_str(), &gpu_arch);
+        if let Ok(table) = spite_dispatch::DispatchBuilder::new(&args.kernels_dir, spec).build() {
+            table.print_sources();
+        }
     }
 
     // Fixed prompt keeps runs comparable; real-model runs use --n-tokens.
@@ -96,10 +176,10 @@ fn main() -> Result<()> {
     }
     let runs = args.n_runs.max(1) as f64;
     let result = spite_bench::BenchResult {
-        label: args.model.clone(),
+        label: format!("{} [{}]", args.model, device_label),
         tps: n_tok as f64 / decode_s.max(1e-9),
         ttft_ms: ttft_ms / runs,
-        peak_mem_mib: 0,
+        peak_mem_mib,
         n_runs: args.n_runs,
     };
     if args.json {

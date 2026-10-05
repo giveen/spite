@@ -41,7 +41,9 @@ pub fn require_contiguous(t: &SpiteTensor, name: &str) {
         "tensor '{name}' passed to kernel dispatch is not contiguous \
          (ne={:?} nb={:?} kind={:?}). \
          Materialise strided views before dispatch.",
-        t.ne, t.nb, t.kind,
+        t.ne,
+        t.nb,
+        t.kind,
     );
 }
 

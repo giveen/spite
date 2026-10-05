@@ -34,15 +34,15 @@ impl SpiteType {
     /// bytes-per-block for block-quantised types).
     pub fn block_bytes(self) -> u64 {
         match self {
-            Self::F32  => 4,
-            Self::F16  => 2,
+            Self::F32 => 4,
+            Self::F16 => 2,
             Self::Bf16 => 2,
-            Self::Q8_0 => 34,   // 32-elem block: f16 scale + 32×i8
-            Self::Q5_1 => 24,   // 32-elem block: f16 d + f16 m + u32 qh + 16×u8
-            Self::Q4_0 => 18,   // 32-elem block: f16 scale + 16×u8
-            Self::Q4K  => 144,  // 256-elem super-block
-            Self::Q5K  => 176,  // 256-elem super-block
-            Self::Q6K  => 210,  // 256-elem super-block
+            Self::Q8_0 => 34, // 32-elem block: f16 scale + 32×i8
+            Self::Q5_1 => 24, // 32-elem block: f16 d + f16 m + u32 qh + 16×u8
+            Self::Q4_0 => 18, // 32-elem block: f16 scale + 16×u8
+            Self::Q4K => 144, // 256-elem super-block
+            Self::Q5K => 176, // 256-elem super-block
+            Self::Q6K => 210, // 256-elem super-block
         }
     }
 
@@ -50,7 +50,7 @@ impl SpiteType {
     pub fn block_elements(self) -> u64 {
         match self {
             Self::Q8_0 | Self::Q5_1 | Self::Q4_0 => 32,
-            Self::Q4K  | Self::Q5K  | Self::Q6K  => 256,
+            Self::Q4K | Self::Q5K | Self::Q6K => 256,
             _ => 1,
         }
     }
@@ -73,9 +73,9 @@ impl SpiteType {
 pub struct SpiteTensor {
     pub data: *mut c_void,
     /// Dimensions: ne[0]=cols, ne[1]=rows, ne[2]=matrices, ne[3]=batch.
-    pub ne:   [u32; 4],
+    pub ne: [u32; 4],
     /// Byte strides — see struct comment. nb[0]=0 means zero-sized tensor.
-    pub nb:   [u64; 4],
+    pub nb: [u64; 4],
     pub kind: SpiteType,
 }
 
@@ -87,8 +87,8 @@ impl SpiteTensor {
     pub const fn null() -> Self {
         Self {
             data: core::ptr::null_mut(),
-            ne:   [0; 4],
-            nb:   [0; 4],
+            ne: [0; 4],
+            nb: [0; 4],
             kind: SpiteType::F32,
         }
     }

@@ -58,6 +58,8 @@ pub struct FakeGguf {
     pub max_seq_len: u32,
     pub rope_theta: f32,
     pub norm_eps: f32,
+    /// When true (or when arch == "qwen3"), emits `attn_q_norm` and `attn_k_norm` weights.
+    pub qk_norm: bool,
 }
 
 impl Default for FakeGguf {
@@ -73,11 +75,27 @@ impl Default for FakeGguf {
             max_seq_len: 512,
             rope_theta: 10_000.0,
             norm_eps: 1e-5,
+            qk_norm: false,
         }
     }
 }
 
 impl FakeGguf {
+    /// Convenient pre-configured FakeGguf for Qwen3 architectures.
+    pub fn qwen3() -> Self {
+        Self {
+            arch: "qwen3".to_string(),
+            qk_norm: true,
+            ..Self::default()
+        }
+    }
+
+    /// Builder method to toggle QK normalization weights.
+    pub fn with_qk_norm(mut self, qk_norm: bool) -> Self {
+        self.qk_norm = qk_norm;
+        self
+    }
+
     /// Write the fake GGUF to `path`.
     pub fn write(&self, path: &Path) -> io::Result<()> {
         let bytes = self.encode();
@@ -239,6 +257,11 @@ impl FakeGguf {
             t.push(Tensor::new(format!("{b}.ffn_gate.weight"), vec![d, ff]));
             t.push(Tensor::new(format!("{b}.ffn_up.weight"), vec![d, ff]));
             t.push(Tensor::new(format!("{b}.ffn_down.weight"), vec![ff, d]));
+            if self.qk_norm || self.arch == "qwen3" {
+                let hd = (self.d_model / self.n_heads.max(1)) as u64;
+                t.push(Tensor::new(format!("{b}.attn_q_norm.weight"), vec![hd]));
+                t.push(Tensor::new(format!("{b}.attn_k_norm.weight"), vec![hd]));
+            }
         }
 
         t
@@ -383,5 +406,20 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), bytes).unwrap();
         assert!(GgufModel::open(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn qk_norm_tensors_present() {
+        let fake = FakeGguf::qwen3();
+        let tmp = fake.write_to_tempfile().unwrap();
+        let model = GgufModel::open(tmp.path()).unwrap();
+        let q_norm = model.tensor("blk.0.attn_q_norm.weight");
+        let k_norm = model.tensor("blk.0.attn_k_norm.weight");
+        assert!(!q_norm.is_null());
+        assert!(!k_norm.is_null());
+        assert_eq!(q_norm.ne[0], 32); // 64 / 2
+        assert_eq!(k_norm.ne[0], 32);
+        // 3 global + 11 per layer * 2 = 25
+        assert_eq!(model.n_tensors(), 25);
     }
 }
