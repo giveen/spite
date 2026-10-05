@@ -1,18 +1,15 @@
 /*
- * kernels/qwen/qwen3/nvidia/sm_120/rtx_5090/kernel.cu
+ * kernels/qwen/qwen3/nvidia/sm_120/kernel.cu
  *
- * RTX 5090-specific kernel for Qwen3 dense decoders.
- * Scope: exclusively NVIDIA GeForce RTX 5090.
+ * Blackwell (sm_120) architecture kernel for Qwen3 dense decoders.
+ * Scope: all sm_120-family GPUs (RTX 5090, 5080, 5070, 5060, …).
  *
- * Physical constraints exploited on top of sm_120 vectorization:
- *   • 192 SMs: grid dimensions padded to multiples of 192 blocks so all
- *     multiprocessors stay 100% occupied with no tail-wave stalls.
- *   • 96 MB L2 cache: larger ROWS_PER_BLOCK (8 warps/block) doubles
- *     register reuse of cached weight data per SM.
- *   • Shared memory staging: the activation vector x is loaded once into
- *     per-block shared memory (fits for d_model ≤ 32768 → 128 KB), so
- *     the 8 warps in a block read from L1 instead of L2/DRAM for every
- *     subsequent matvec row.
+ * Improvements over kernels/qwen/qwen3/nvidia/ (generic CUDA baseline):
+ *   • Vectorized 128-bit memory transactions — float4 in rms_norm,
+ *     F32 dense matvec, and attention score dot-products.
+ *   • __half2 pair loads + arithmetic in the F16 dense matvec path.
+ *   • Fully unrolled warp reductions (5 explicit shuffles, no loop)
+ *     exploiting Blackwell's dual-warp issue scheduler.
  *
  * Weight types: F32, F16, Q8_0. Activations and KV cache: F32.
  * Single-token decode semantics (prefill = repeated decode by the host).
@@ -33,15 +30,15 @@ struct BlockQ8_0 {
 };
 static_assert(sizeof(BlockQ8_0) == 34, "Q8_0 block must be 34 bytes");
 
-constexpr int WARP          = 32;
-constexpr int ROWS_PER_BLOCK = 8;   /* 8 warps/block — double sm_120 baseline */
-constexpr int RTX5090_SMS   = 192;  /* physical SM count on RTX 5090 */
+constexpr int WARP = 32;
+constexpr int ROWS_PER_BLOCK = 4;
 
 inline cudaStream_t stream_of(const SpiteCtx* ctx) {
     return ctx ? static_cast<cudaStream_t>(ctx->gpu_stream) : nullptr;
 }
 
-/* Fully unrolled warp reductions (same as sm_120). */
+/* Fully unrolled warp reduction — Blackwell dual-issue scheduler fires both
+ * halves of the shuffle tree without stalls when the loop is removed. */
 __device__ __forceinline__ float warp_sum(float v) {
     v += __shfl_xor_sync(0xffffffffu, v, 16);
     v += __shfl_xor_sync(0xffffffffu, v,  8);
@@ -60,7 +57,6 @@ __device__ __forceinline__ float warp_max(float v) {
     return v;
 }
 
-/* block_sum / block_max support up to 32 warps (1024 threads). */
 __device__ float block_sum(float v) {
     __shared__ float red[WARP];
     const int lane = threadIdx.x % WARP, wid = threadIdx.x / WARP;
@@ -98,47 +94,8 @@ __device__ __forceinline__ float load_w(const void* w, int kind, int i) {
     return static_cast<const float*>(w)[i];
 }
 
-/* Round n up to the nearest multiple of RTX5090_SMS so every SM gets at
- * least one block.  Extra blocks that fall out of range early-exit cheaply. */
-inline int pad192(int n) {
-    return ((n + RTX5090_SMS - 1) / RTX5090_SMS) * RTX5090_SMS;
-}
-
 // ── Matvec ─────────────────────────────────────────────────────────────────
 
-/* Q8_0 matvec with shared-memory staging of the activation vector x.
- * All ROWS_PER_BLOCK warps in the block collaboratively load x into smem
- * once, then each warp reads its row's weights from global memory while
- * feeding activations from fast L1 rather than L2/DRAM.
- *
- * Dynamic shared memory must be allocated by the caller:
- *   cols * sizeof(float) bytes. */
-__global__ void matvec_q8_0_smem(const BlockQ8_0* __restrict__ w, const float* __restrict__ x,
-                                  float* __restrict__ y, int rows, int cols, int accumulate) {
-    extern __shared__ float sx[];  /* cached activation vector */
-
-    /* Collaborative load: all threads fill sx[0..cols-1]. */
-    const int tid = threadIdx.y * WARP + threadIdx.x;
-    const int blk_threads = ROWS_PER_BLOCK * WARP;
-    for (int i = tid; i < cols; i += blk_threads)
-        sx[i] = x[i];
-    __syncthreads();
-
-    const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
-    if (row >= rows) return;  /* safe after __syncthreads */
-
-    const int nb = cols / QK8_0;
-    const BlockQ8_0* wr = w + static_cast<size_t>(row) * nb;
-    float acc = 0.0f;
-    for (int b = 0; b < nb; ++b) {
-        const float d = __half2float(wr[b].d);
-        acc += d * static_cast<float>(wr[b].qs[threadIdx.x]) * sx[b * QK8_0 + threadIdx.x];
-    }
-    acc = warp_sum(acc);
-    if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
-}
-
-/* Fallback Q8_0 matvec (no smem) for large projections that exceed 64 KB. */
 __global__ void matvec_q8_0(const BlockQ8_0* __restrict__ w, const float* __restrict__ x,
                             float* __restrict__ y, int rows, int cols, int accumulate) {
     const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
@@ -154,7 +111,7 @@ __global__ void matvec_q8_0(const BlockQ8_0* __restrict__ w, const float* __rest
     if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
 }
 
-/* F32 dense matvec: float4 vectorized. */
+/* F32 dense matvec: 128-bit float4 loads cut memory transactions by 4×. */
 __global__ void matvec_f32(const float* __restrict__ w, const float* __restrict__ x,
                            float* __restrict__ y, int rows, int cols, int accumulate) {
     const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
@@ -176,7 +133,8 @@ __global__ void matvec_f32(const float* __restrict__ w, const float* __restrict_
     if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
 }
 
-/* F16 dense matvec: __half2 weight loads + float2 activation loads. */
+/* F16 dense matvec: __half2 weight loads + float2 activation loads halve
+ * load instructions versus element-by-element __half access. */
 __global__ void matvec_f16(const __half* __restrict__ w, const float* __restrict__ x,
                            float* __restrict__ y, int rows, int cols, int accumulate) {
     const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
@@ -200,28 +158,18 @@ __global__ void matvec_f16(const __half* __restrict__ w, const float* __restrict
     if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
 }
 
-/* Launch matvec with 192-SM grid padding and smem staging for Q8_0. */
 int launch_matvec(const SpiteTensor* w, const float* x, float* y, bool accumulate,
                   cudaStream_t s) {
     const int cols = static_cast<int>(w->ne[0]);
     const int rows = static_cast<int>(w->ne[1] ? w->ne[1] : 1);
     const dim3 block(WARP, ROWS_PER_BLOCK);
-    /* Pad to multiple of 192 so all SMs receive at least one block. */
-    const dim3 grid(pad192((rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK));
+    const dim3 grid((rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
     switch (w->kind) {
-    case SPITE_TYPE_Q8_0: {
+    case SPITE_TYPE_Q8_0:
         if (cols % QK8_0) return -1;
-        const size_t smem = static_cast<size_t>(cols) * sizeof(float);
-        if (smem <= 65536) {
-            /* Fits in 64 KB: use shared-memory x staging. */
-            matvec_q8_0_smem<<<grid, block, smem, s>>>(
-                static_cast<const BlockQ8_0*>(w->data), x, y, rows, cols, accumulate);
-        } else {
-            matvec_q8_0<<<grid, block, 0, s>>>(
-                static_cast<const BlockQ8_0*>(w->data), x, y, rows, cols, accumulate);
-        }
+        matvec_q8_0<<<grid, block, 0, s>>>(static_cast<const BlockQ8_0*>(w->data), x, y, rows,
+                                           cols, accumulate);
         break;
-    }
     case SPITE_TYPE_F32:
         matvec_f32<<<grid, block, 0, s>>>(static_cast<const float*>(w->data), x, y, rows,
                                           cols, accumulate);
@@ -236,11 +184,11 @@ int launch_matvec(const SpiteTensor* w, const float* x, float* y, bool accumulat
     return 0;
 }
 
-// ── RMSNorm: vectorized float4 + half2 (same as sm_120) ──────────────────
+// ── RMSNorm: vectorized float4 (F32 weight) or half2+float2 (F16 weight) ──
 
 __global__ void rms_norm_rows(float* __restrict__ out, const float* __restrict__ x,
                               const void* __restrict__ w, int wkind, int cols, float eps) {
-    const float* xr   = x   + static_cast<size_t>(blockIdx.x) * cols;
+    const float* xr  = x   + static_cast<size_t>(blockIdx.x) * cols;
     float*       orow = out + static_cast<size_t>(blockIdx.x) * cols;
     float ss = 0.0f;
     if (cols % 4 == 0) {
@@ -316,14 +264,12 @@ __global__ void qk_norm_rope(float* dst, const float* src, const void* __restric
     }
 }
 
-/* float4 vectorized dot-product; grid padded to 192 via launch_matvec's
- * logic (attn_scores uses ROWS_PER_BLOCK=4 to match warp geometry). */
+/* Vectorized dot-product: float4 loads when hd % 4 == 0. */
 __global__ void attn_scores(float* __restrict__ scores, const float* __restrict__ q,
                             const float* __restrict__ kc, int n_tok, int n_ctx, int hd,
                             int group, int kv_stride, float scale) {
-    constexpr int RPB = 4;  /* keep 4 per attn block for correct warp layout */
     const int h = blockIdx.y;
-    const int t = blockIdx.x * RPB + threadIdx.y;
+    const int t = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
     if (t >= n_tok) return;
     const float* qh = q  + static_cast<size_t>(h) * hd;
     const float* kt = kc + static_cast<size_t>(t) * kv_stride
@@ -396,8 +342,8 @@ inline int finish() { return cudaGetLastError() == cudaSuccess ? 0 : -2; }
 
 // ── ABI ops ───────────────────────────────────────────────────────────────
 
-extern "C" int qwen3_rtx5090_rms_norm(SpiteTensor* out, const SpiteTensor* x,
-                                      const SpiteTensor* weight, float eps, const SpiteCtx* ctx) {
+extern "C" int qwen3_sm120_rms_norm(SpiteTensor* out, const SpiteTensor* x,
+                                    const SpiteTensor* weight, float eps, const SpiteCtx* ctx) {
     if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
     const int cols = static_cast<int>(x->ne[0]);
     const int rows = static_cast<int>(x->ne[1] ? x->ne[1] : 1);
@@ -408,12 +354,12 @@ extern "C" int qwen3_rtx5090_rms_norm(SpiteTensor* out, const SpiteTensor* x,
     return finish();
 }
 
-extern "C" int qwen3_rtx5090_attention(SpiteTensor* out, const SpiteTensor* x,
-                                       const SpiteTensor* wq, const SpiteTensor* wk,
-                                       const SpiteTensor* wv, const SpiteTensor* wo,
-                                       const SpiteTensor* q_norm, const SpiteTensor* k_norm,
-                                       float norm_eps, SpiteKvCache* kv, float rope_freq_base,
-                                       const SpiteCtx* ctx) {
+extern "C" int qwen3_sm120_attention(SpiteTensor* out, const SpiteTensor* x,
+                                     const SpiteTensor* wq, const SpiteTensor* wk,
+                                     const SpiteTensor* wv, const SpiteTensor* wo,
+                                     const SpiteTensor* q_norm, const SpiteTensor* k_norm,
+                                     float norm_eps, SpiteKvCache* kv, float rope_freq_base,
+                                     const SpiteCtx* ctx) {
     if (!ctx || !kv || ctx->n_heads <= 0 || ctx->n_kv_heads <= 0) return -1;
     if (kv->k.kind != SPITE_TYPE_F32 || kv->v.kind != SPITE_TYPE_F32) return -1;
     const int nh = ctx->n_heads, nkv = ctx->n_kv_heads;
@@ -454,10 +400,10 @@ extern "C" int qwen3_rtx5090_attention(SpiteTensor* out, const SpiteTensor* x,
     const int n_tok = pos + 1;
     const int group = nh / nkv;
     const float scale = rsqrtf(static_cast<float>(hd));
-    constexpr int RPB = 4;
-    attn_scores<<<dim3((n_tok + RPB - 1) / RPB, nh), dim3(WARP, RPB), 0, s>>>(
+    attn_scores<<<dim3((n_tok + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, nh),
+                  dim3(WARP, ROWS_PER_BLOCK), 0, s>>>(
         scores, q, kc, n_tok, n_ctx, hd, group, kv_stride, scale);
-    attn_softmax<<<nh, threads_for(n_tok > 512 ? 512 : n_tok), 0, s>>>(scores, n_tok, n_ctx);
+    attn_softmax<<<nh, threads_for(n_tok > 256 ? 256 : n_tok), 0, s>>>(scores, n_tok, n_ctx);
     attn_weighted_v<<<nh, threads_for(hd), 0, s>>>(att, scores, vc, n_tok, n_ctx, hd, group,
                                                    kv_stride);
 
@@ -465,10 +411,10 @@ extern "C" int qwen3_rtx5090_attention(SpiteTensor* out, const SpiteTensor* x,
     return finish();
 }
 
-extern "C" int qwen3_rtx5090_ffn(SpiteTensor* out, const SpiteTensor* x,
-                                 const SpiteTensor* w_gate, const SpiteTensor* w_up,
-                                 const SpiteTensor* w_down, SpiteFfnActivation act,
-                                 const SpiteCtx* ctx) {
+extern "C" int qwen3_sm120_ffn(SpiteTensor* out, const SpiteTensor* x,
+                               const SpiteTensor* w_gate, const SpiteTensor* w_up,
+                               const SpiteTensor* w_down, SpiteFfnActivation act,
+                               const SpiteCtx* ctx) {
     if (act != SPITE_FFN_SILU_GATE && act != SPITE_FFN_GELU_GATE) return -1;
     if (!ctx) return -1;
     const int d_ffn = static_cast<int>(w_gate->ne[1]);
@@ -486,8 +432,8 @@ extern "C" int qwen3_rtx5090_ffn(SpiteTensor* out, const SpiteTensor* x,
     return finish();
 }
 
-extern "C" int qwen3_rtx5090_matmul(SpiteTensor* out, const SpiteTensor* x,
-                                    const SpiteTensor* w, const SpiteCtx* ctx) {
+extern "C" int qwen3_sm120_matmul(SpiteTensor* out, const SpiteTensor* x,
+                                  const SpiteTensor* w, const SpiteCtx* ctx) {
     if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
     if (launch_matvec(w, static_cast<const float*>(x->data),
                       static_cast<float*>(out->data), false, stream_of(ctx)))
@@ -500,17 +446,17 @@ extern "C" int qwen3_rtx5090_matmul(SpiteTensor* out, const SpiteTensor* x,
 static const SpiteKernelInfo KERNEL_INFO = {
     SPITE_ABI_VERSION,
     "qwen3",
-    "rtx_5090",
-    "spite project (RTX 5090: 192-SM grid, smem x-staging, 8-warp blocks)",
+    "sm_120",
+    "spite project (Blackwell sm_120: float4 + half2 vectorized)",
     {SPITE_TYPE_F32, SPITE_TYPE_F16, SPITE_TYPE_Q8_0, 0, 0, 0, 0, 0},
-    qwen3_rtx5090_rms_norm,
-    qwen3_rtx5090_attention,
+    qwen3_sm120_rms_norm,
+    qwen3_sm120_attention,
     nullptr, /* mla */
-    qwen3_rtx5090_ffn,
+    qwen3_sm120_ffn,
     nullptr, /* layer */
     nullptr, /* speculative_verify */
     nullptr, /* prefill */
-    qwen3_rtx5090_matmul,
+    qwen3_sm120_matmul,
 };
 
 extern "C" const SpiteKernelInfo* spite_kernel_info() { return &KERNEL_INFO; }
