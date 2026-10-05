@@ -7,12 +7,18 @@
  * Physical constraints exploited on top of sm_120 vectorization:
  *   • 192 SMs: grid dimensions padded to multiples of 192 blocks so all
  *     multiprocessors stay 100% occupied with no tail-wave stalls.
- *   • 96 MB L2 cache: larger ROWS_PER_BLOCK (8 warps/block) doubles
- *     register reuse of cached weight data per SM.
- *   • Shared memory staging: the activation vector x is loaded once into
- *     per-block shared memory (fits for d_model ≤ 32768 → 128 KB), so
- *     the 8 warps in a block read from L1 instead of L2/DRAM for every
- *     subsequent matvec row.
+ *   • The Q8_0 matvec, which is 90% of a decode token, is run as a K-split:
+ *     the op is latency-bound at 40% occupancy, and the warp count is what
+ *     hides that latency, so below the crossover the row's K range is split
+ *     across 8 warps (see pick_wpr).  Measured 1.22x cold on one Qwen3-8B
+ *     layer, 1.08x..1.57x depending on the projection.
+ *   • Shared memory staging of the activation vector is kept for the shapes
+ *     whose row axis already fills the part, where it divides the activation
+ *     reads across a whole 8-row block.
+ *
+ * Attention is the sm_120 flash tile kernel (kv_attn_flash_sm120.inl) driven by
+ * the shared flash-decoding scaffolding: this card's own tuning stays in the
+ * projections, which are 90% of a decode token.
  *
  * Weight types: F32, F16, Q8_0. Activations: F32.
  * KV cache: F32, F16, Q8_0, Q5_1 or Q4_0 (see kv_attn.inl).
@@ -105,12 +111,99 @@ inline int pad192(int n) {
     return ((n + RTX5090_SMS - 1) / RTX5090_SMS) * RTX5090_SMS;
 }
 
+/* K-split factor for the Q8_0 matvec: how many warps share one output row.
+ *
+ * The op is latency-bound, not DRAM-bound.  Profiled on the 4096x4096
+ * projection it runs at 46.9% of DRAM peak with L1TEX at 47.6% and 40%
+ * occupancy: the load path is half empty and short of warps to cover it.  One
+ * warp per row gives the matvec exactly `rows` warps of parallelism, so the
+ * 1024-row k/v projections put 5.3 warps/SM on a 192-SM part and read 4.2 MiB
+ * in 8.9 us -- 461 GB/s, 26% of this card's 1792 GB/s ceiling -- while the
+ * 12288-row projections, identical in every other respect, reach 1451 GB/s
+ * (81%) at 64 warps/SM.  Splitting each row's K range across WPR warps
+ * multiplies the warp count by WPR and closes that gap.
+ *
+ * Measured cold, one Qwen3-8B layer (195.5 MiB, weights outside the 96 MB L2),
+ * sum of the seven projections in us and the resulting weight-read rate:
+ *
+ *   schedule    1x1     1x2     1x4     1x8    2x1     2x4     4x1
+ *   us        174.5   156.5   144.9   142.9  191.7   145.5   296.5
+ *   GB/s       1175    1310    1415    1434   1070    1409     691
+ *
+ * The 2x1/4x1 columns are register blocking (R rows per warp, reusing one
+ * activation element across them).  It divides the activation traffic as
+ * intended and still loses badly, because it divides the warp count too: the
+ * warp count is what this op is actually short of.  WPR=8 is the whole win.
+ *
+ * Above RTX5090_SMS*64 rows the row axis fills the part on its own (64
+ * warps/SM is every warp a Blackwell SM has), and there the one-row-per-warp
+ * shared-memory kernel wins instead: at 151936 rows it reads 1763 GB/s against
+ * the split's 1707, because 8 warps in a block can share one staged activation
+ * tile rather than re-reading it per row.  So the split is used below that
+ * crossover and the staged kernel above it.  The 12288-row projections sit
+ * just under it and take the split (12% faster); 16384 rows and up measured
+ * within 1.4% of the staged kernel and 24576+ slightly behind it.
+ *
+ * Never splits below 8 VBR blocks of K per warp, so the partial reduce stays a
+ * rounding error next to the loop. */
+inline int pick_wpr(int rows, int nb) {
+    if (rows > RTX5090_SMS * 64) return 1;
+    for (int wpr = 8; wpr >= 2; wpr >>= 1) {
+        if (ROWS_PER_BLOCK % wpr == 0 && nb % wpr == 0 && nb / wpr >= 8) return wpr;
+    }
+    return 1;
+}
+
 // ── Matvec ─────────────────────────────────────────────────────────────────
 
-/* Q8_0 matvec with shared-memory staging of the activation vector x.
- * All ROWS_PER_BLOCK warps in the block collaboratively load x into smem
- * once, then each warp reads its row's weights from global memory while
- * feeding activations from fast L1 rather than L2/DRAM.
+/* Q8_0 matvec with the K dimension split across WPR warps per row.
+ *
+ * Deliberately has no shared memory.  With WPR > 1 each warp owns a disjoint
+ * K range and reads every activation element exactly once, so a per-block
+ * staging copy would be dead weight; the only cross-warp traffic is the
+ * ROWS_PER_BLOCK/WPR partials per row, which meet in a small static array. */
+template <int WPR>
+__global__ void matvec_q8_0_ksplit(const BlockQ8_0* __restrict__ w, const float* __restrict__ x,
+                                   float* __restrict__ y, int rows, int cols, int accumulate) {
+    static_assert(WPR >= 2 && WPR <= 8 && ROWS_PER_BLOCK % WPR == 0);
+    constexpr int ROWS_PER_CTA = ROWS_PER_BLOCK / WPR;
+    __shared__ float partial[ROWS_PER_CTA][WPR];
+
+    const int lane        = threadIdx.x;
+    const int row_in_cta  = threadIdx.y / WPR;
+    const int warp_in_row = threadIdx.y % WPR;
+    const int row         = blockIdx.x * ROWS_PER_CTA + row_in_cta;
+    /* Not an early return: the padding blocks pad192() adds have to reach the
+     * __syncthreads that collects the partials too. */
+    const bool active = row < rows;
+
+    const int nb    = cols / QK8_0;
+    const int chunk = nb / WPR;
+    float acc       = 0.0f;
+    if (active) {
+        const BlockQ8_0* wr = w + static_cast<size_t>(row) * nb;
+        const int b0        = warp_in_row * chunk;
+        const int b1        = b0 + chunk;
+        for (int b = b0; b < b1; ++b) {
+            const float d = __half2float(wr[b].d);
+            acc += d * static_cast<float>(wr[b].qs[lane]) * x[b * QK8_0 + lane];
+        }
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) partial[row_in_cta][warp_in_row] = acc;
+    __syncthreads();
+    if (active && warp_in_row == 0 && lane == 0) {
+        float tot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < WPR; ++i) tot += partial[row_in_cta][i];
+        y[row] = accumulate ? y[row] + tot : tot;
+    }
+}
+
+/* Q8_0 matvec, one warp per row, activation vector staged in shared memory.
+ * All ROWS_PER_BLOCK warps in the block load x into smem once, then each warp
+ * reads its row's weights from global memory while feeding activations from
+ * fast L1 rather than L2/DRAM.
  *
  * Dynamic shared memory must be allocated by the caller:
  *   cols * sizeof(float) bytes. */
@@ -139,7 +232,7 @@ __global__ void matvec_q8_0_smem(const BlockQ8_0* __restrict__ w, const float* _
     if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
 }
 
-/* Fallback Q8_0 matvec (no smem) for large projections that exceed 64 KB. */
+/* Fallback Q8_0 matvec (no smem) for tiles too large to stage. */
 __global__ void matvec_q8_0(const BlockQ8_0* __restrict__ w, const float* __restrict__ x,
                             float* __restrict__ y, int rows, int cols, int accumulate) {
     const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
@@ -212,14 +305,30 @@ int launch_matvec(const SpiteTensor* w, const float* x, float* y, bool accumulat
     switch (w->kind) {
     case SPITE_TYPE_Q8_0: {
         if (cols % QK8_0) return -1;
+        const int nb  = cols / QK8_0;
+        const int wpr = pick_wpr(rows, nb);
+        const BlockQ8_0* wq = static_cast<const BlockQ8_0*>(w->data);
+        if (wpr > 1) {
+            const dim3 kblock(WARP, ROWS_PER_BLOCK);
+            const dim3 kgrid(pad192((rows + ROWS_PER_BLOCK / wpr - 1) /
+                                    (ROWS_PER_BLOCK / wpr)));
+            switch (wpr) {
+            case 2: matvec_q8_0_ksplit<2><<<kgrid, kblock, 0, s>>>(wq, x, y, rows, cols,
+                                                                   accumulate); break;
+            case 4: matvec_q8_0_ksplit<4><<<kgrid, kblock, 0, s>>>(wq, x, y, rows, cols,
+                                                                   accumulate); break;
+            default: matvec_q8_0_ksplit<8><<<kgrid, kblock, 0, s>>>(wq, x, y, rows, cols,
+                                                                    accumulate); break;
+            }
+            break;
+        }
         const size_t smem = static_cast<size_t>(cols) * sizeof(float);
-        if (smem <= 65536) {
-            /* Fits in 64 KB: use shared-memory x staging. */
-            matvec_q8_0_smem<<<grid, block, smem, s>>>(
-                static_cast<const BlockQ8_0*>(w->data), x, y, rows, cols, accumulate);
+        /* 48 KB is the default per-block dynamic shared memory cap; asking for
+         * more is a launch failure, not a fallback. */
+        if (smem <= 49152) {
+            matvec_q8_0_smem<<<grid, block, smem, s>>>(wq, x, y, rows, cols, accumulate);
         } else {
-            matvec_q8_0<<<grid, block, 0, s>>>(
-                static_cast<const BlockQ8_0*>(w->data), x, y, rows, cols, accumulate);
+            matvec_q8_0<<<grid, block, 0, s>>>(wq, x, y, rows, cols, accumulate);
         }
         break;
     }
@@ -334,6 +443,15 @@ inline int finish() { return cudaGetLastError() == cudaSuccess ? 0 : -2; }
 // threads_for, stream_of, attn_softmax, block_sum and load_w.
 #include "kernels/qwen/qwen3/nvidia/kv_attn.inl"
 
+// sm_120 flash tile kernel + hd dispatch (this card shares the arch-level tile
+// kernel; SPITE_KVFLASH_ARCH keeps the shared scaffolding from emitting the
+// portable tile kernel too).
+#define SPITE_KVFLASH_ARCH 1
+#include "kernels/qwen/qwen3/nvidia/sm_120/kv_attn_flash_sm120.inl"
+
+// Flash-decoding scaffolding: chunking, split-K workspace, combine, entry point.
+#include "kernels/qwen/qwen3/nvidia/kv_attn_flash.inl"
+
 // ── ABI ops ───────────────────────────────────────────────────────────────
 
 extern "C" int qwen3_rtx5090_rms_norm(SpiteTensor* out, const SpiteTensor* x,
@@ -354,7 +472,7 @@ extern "C" int qwen3_rtx5090_attention(SpiteTensor* out, const SpiteTensor* x,
                                     const SpiteTensor* q_norm, const SpiteTensor* k_norm,
                                     float norm_eps, SpiteKvCache* kv, float rope_freq_base,
                                     const SpiteCtx* ctx) {
-    return kvattn_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
+    return kvflash_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
 }
 
 extern "C" int qwen3_rtx5090_ffn(SpiteTensor* out, const SpiteTensor* x,
@@ -403,7 +521,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     // card here (as this file did) makes that mapping fall through to
     // "generic", which drops the host onto the CPU fallback.
     "sm_120",
-    "spite project (RTX 5090: 192-SM grid, smem x-staging, 8-warp blocks)",
+    "spite project (RTX 5090: 192-SM grid, 8-warp K-split Q8_0 matvec, smem x-staging)",
     {SPITE_TYPE_F32, SPITE_TYPE_F16, SPITE_TYPE_Q8_0, 0, 0, 0, 0, 0},
     qwen3_rtx5090_rms_norm,
     qwen3_rtx5090_attention,
