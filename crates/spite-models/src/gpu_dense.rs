@@ -101,9 +101,11 @@ impl GpuDense {
         if !gpu_arch.starts_with("sm_") || GpuBackend::detect() != GpuBackend::Cuda {
             return None;
         }
-        let table = DispatchBuilder::new(kernels_dir, KernelSpec::from_arch(arch, gpu_arch))
-            .build()
-            .ok()?;
+        let mut spec = KernelSpec::from_arch(arch, gpu_arch);
+        if spec.card_id.is_empty() {
+            spec.card_id = spite_dispatch::detect_card_id("");
+        }
+        let table = DispatchBuilder::new(kernels_dir, spec).build().ok()?;
         let on_gpu = |src: &spite_dispatch::OpSource| src.gpu_arch.starts_with("sm_");
         let ok = table.rms_norm.0.is_some()
             && table.attention.0.is_some()

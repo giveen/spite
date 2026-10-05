@@ -33,6 +33,26 @@ use std::path::{Path, PathBuf};
 
 // ── KernelSpec ─────────────────────────────────────────────────────────────
 
+/// Determine the company/vendor directory name corresponding to a GPU arch.
+pub fn company_from_arch(gpu_arch: &str) -> &'static str {
+    if gpu_arch.starts_with("sm_") {
+        "nvidia"
+    } else if gpu_arch.starts_with("rdna")
+        || gpu_arch.starts_with("cdna")
+        || gpu_arch == "strix_halo"
+    {
+        "amd"
+    } else if gpu_arch.starts_with("arc_") {
+        "intel"
+    } else if gpu_arch == "metal" {
+        "apple"
+    } else if gpu_arch.starts_with("adreno") {
+        "qualcomm"
+    } else {
+        "generic"
+    }
+}
+
 /// All dimensions that determine which kernel binary to load.
 #[derive(Debug, Clone, Default)]
 pub struct KernelSpec {
@@ -40,6 +60,8 @@ pub struct KernelSpec {
     pub family: String,
     /// Model variant directory: "llama4", "v4", "qwen3_5", …
     pub model: String,
+    /// Vendor/company directory: "nvidia", "amd", "intel", "apple", …
+    pub company: String,
     /// GPU architecture: "sm_89", "rdna4", "cdna3", "metal", …
     pub gpu_arch: String,
     /// Specific card id: "rtx_4090", "mi300x", "rx_9900_xtx", …
@@ -61,45 +83,94 @@ impl KernelSpec {
     /// still apply when they don't.
     pub fn from_arch(model_arch: &str, gpu_arch: &str) -> Self {
         let (family, model) = arch_to_family_model(model_arch);
+        let company = company_from_arch(gpu_arch).to_string();
         Self {
             family,
             model,
+            company,
             gpu_arch: gpu_arch.into(),
             card_id: String::new(),
             quant: String::new(),
         }
     }
 
+    /// Return the explicit company or infer it from `gpu_arch`.
+    pub fn effective_company(&self) -> &str {
+        if !self.company.is_empty() {
+            &self.company
+        } else {
+            company_from_arch(&self.gpu_arch)
+        }
+    }
+
     /// Candidate dirs for **model-specific** kernels, most-specific first.
     pub fn model_candidates(&self, kernels_dir: &Path) -> Vec<PathBuf> {
-        let base = kernels_dir
-            .join(&self.family)
-            .join(&self.model)
-            .join(&self.gpu_arch);
+        let company = self.effective_company();
+        let model_dir = kernels_dir.join(&self.family).join(&self.model);
+        let company_arch_base = model_dir.join(company).join(&self.gpu_arch);
+        let legacy_arch_base = model_dir.join(&self.gpu_arch);
 
         let has_card = !self.card_id.is_empty();
         let has_quant = !self.quant.is_empty();
 
-        let mut paths = Vec::with_capacity(6);
+        let mut paths = Vec::with_capacity(12);
 
+        // 1. Company-scoped hierarchy: kernels/<family>/<model>/<company>/<arch>/...
         if has_card && has_quant {
-            paths.push(base.join(&self.card_id).join(&self.quant));
+            paths.push(company_arch_base.join(&self.card_id).join(&self.quant));
         }
         if has_card {
-            paths.push(base.join(&self.card_id));
+            paths.push(company_arch_base.join(&self.card_id));
         }
         if has_quant {
-            paths.push(base.join(&self.quant));
+            paths.push(company_arch_base.join(&self.quant));
         }
-        paths.push(base);
+        paths.push(company_arch_base.clone());
 
-        // Vendor-generic fallbacks (no model knowledge, but right vendor backend)
+        // Also discover any card subdirectories present on disk if card_id was not explicitly specified
+        if !has_card
+            && company_arch_base.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&company_arch_base)
+        {
+            let mut card_dirs: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                .map(|e| e.path())
+                .collect();
+            card_dirs.sort();
+            for cd in card_dirs {
+                if !paths.contains(&cd) {
+                    paths.push(cd);
+                }
+            }
+        }
+
+        // 2. Legacy hierarchy fallback: kernels/<family>/<model>/<arch>/...
+        if has_card && has_quant {
+            paths.push(legacy_arch_base.join(&self.card_id).join(&self.quant));
+        }
+        if has_card {
+            paths.push(legacy_arch_base.join(&self.card_id));
+        }
+        if has_quant {
+            paths.push(legacy_arch_base.join(&self.quant));
+        }
+        paths.push(legacy_arch_base);
+
+        // 3. Vendor-generic fallbacks (no model knowledge, but right vendor backend)
         if self.gpu_arch.starts_with("sm_") {
             paths.push(kernels_dir.join("generic").join("generic_cuda"));
         } else if self.gpu_arch.starts_with("rdna") || self.gpu_arch.starts_with("cdna") {
             paths.push(kernels_dir.join("generic").join("generic_rocm"));
         }
 
+        // 4. Generic company/arch and CPU fallbacks
+        paths.push(
+            kernels_dir
+                .join("generic")
+                .join(company)
+                .join(&self.gpu_arch),
+        );
         paths.push(kernels_dir.join("generic").join(&self.gpu_arch));
         paths.push(kernels_dir.join("generic").join("generic"));
         paths
@@ -111,17 +182,20 @@ impl KernelSpec {
     /// Engine kernels are cross-model — they live under `_engine/<feature>/`
     /// and are selected independently from the model forward-pass kernels.
     pub fn engine_candidates(&self, feature: &str, kernels_dir: &Path) -> Vec<PathBuf> {
-        let base = kernels_dir
-            .join("_engine")
-            .join(feature)
-            .join(&self.gpu_arch);
-        let mut paths = Vec::with_capacity(3);
+        let company = self.effective_company();
+        let engine_dir = kernels_dir.join("_engine").join(feature);
+        let company_arch_base = engine_dir.join(company).join(&self.gpu_arch);
+        let legacy_arch_base = engine_dir.join(&self.gpu_arch);
+
+        let mut paths = Vec::with_capacity(6);
 
         if !self.card_id.is_empty() {
-            paths.push(base.join(&self.card_id));
+            paths.push(company_arch_base.join(&self.card_id));
+            paths.push(legacy_arch_base.join(&self.card_id));
         }
-        paths.push(base);
-        paths.push(kernels_dir.join("_engine").join(feature).join("generic"));
+        paths.push(company_arch_base);
+        paths.push(legacy_arch_base);
+        paths.push(engine_dir.join("generic"));
         paths
     }
 }
@@ -194,10 +268,35 @@ pub fn arch_to_family_model(arch: &str) -> (String, String) {
 /// Returns `""` if the name cannot be normalised; callers treat that as
 /// "no card-specific override".
 pub fn detect_card_id(gpu_display_name: &str) -> String {
-    if let Ok(v) = std::env::var("SPITE_CARD_ID") {
+    if let Ok(v) = std::env::var("SPITE_CARD_ID")
+        && !v.is_empty()
+    {
         return v;
     }
-    normalize_card_name(gpu_display_name)
+    if !gpu_display_name.is_empty() {
+        return normalize_card_name(gpu_display_name);
+    }
+    if let Some(name) = detect_nvidia_card_name() {
+        let card = normalize_card_name(&name);
+        if !card.is_empty() {
+            return card;
+        }
+    }
+    String::new()
+}
+
+fn detect_nvidia_card_name() -> Option<String> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name", "--format=csv,noheader"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let name = text.lines().next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_owned())
+    }
 }
 
 pub fn normalize_card_name(name: &str) -> String {
@@ -249,6 +348,7 @@ mod tests {
         KernelSpec {
             family: "llama".into(),
             model: "llama4".into(),
+            company: "nvidia".into(),
             gpu_arch: "sm_89".into(),
             card_id: "rtx_4090".into(),
             quant: "Q4_K_M".into(),
@@ -268,24 +368,33 @@ mod tests {
     fn model_candidates_full_spec() {
         let root = PathBuf::from("/k");
         let c = spec_full().model_candidates(&root);
-        assert_eq!(c[0], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090/Q4_K_M"));
-        assert_eq!(c[1], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090"));
-        assert_eq!(c[2], PathBuf::from("/k/llama/llama4/sm_89/Q4_K_M"));
-        assert_eq!(c[3], PathBuf::from("/k/llama/llama4/sm_89"));
-        // generic_cuda before generic/<arch>
-        assert_eq!(c[4], PathBuf::from("/k/generic/generic_cuda"));
-        assert_eq!(c[5], PathBuf::from("/k/generic/sm_89"));
-        assert_eq!(c[6], PathBuf::from("/k/generic/generic"));
+        assert_eq!(
+            c[0],
+            PathBuf::from("/k/llama/llama4/nvidia/sm_89/rtx_4090/Q4_K_M")
+        );
+        assert_eq!(c[1], PathBuf::from("/k/llama/llama4/nvidia/sm_89/rtx_4090"));
+        assert_eq!(c[2], PathBuf::from("/k/llama/llama4/nvidia/sm_89/Q4_K_M"));
+        assert_eq!(c[3], PathBuf::from("/k/llama/llama4/nvidia/sm_89"));
+        assert_eq!(c[4], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090/Q4_K_M"));
+        assert_eq!(c[5], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090"));
+        assert_eq!(c[6], PathBuf::from("/k/llama/llama4/sm_89/Q4_K_M"));
+        assert_eq!(c[7], PathBuf::from("/k/llama/llama4/sm_89"));
+        assert_eq!(c[8], PathBuf::from("/k/generic/generic_cuda"));
+        assert_eq!(c[9], PathBuf::from("/k/generic/nvidia/sm_89"));
+        assert_eq!(c[10], PathBuf::from("/k/generic/sm_89"));
+        assert_eq!(c[11], PathBuf::from("/k/generic/generic"));
     }
 
     #[test]
     fn model_candidates_arch_only() {
         let root = PathBuf::from("/k");
         let c = spec_arch_only().model_candidates(&root);
-        assert_eq!(c[0], PathBuf::from("/k/deepseek/v4/sm_89"));
-        assert_eq!(c[1], PathBuf::from("/k/generic/generic_cuda"));
-        assert_eq!(c[2], PathBuf::from("/k/generic/sm_89"));
-        assert_eq!(c[3], PathBuf::from("/k/generic/generic"));
+        assert_eq!(c[0], PathBuf::from("/k/deepseek/v4/nvidia/sm_89"));
+        assert_eq!(c[1], PathBuf::from("/k/deepseek/v4/sm_89"));
+        assert_eq!(c[2], PathBuf::from("/k/generic/generic_cuda"));
+        assert_eq!(c[3], PathBuf::from("/k/generic/nvidia/sm_89"));
+        assert_eq!(c[4], PathBuf::from("/k/generic/sm_89"));
+        assert_eq!(c[5], PathBuf::from("/k/generic/generic"));
     }
 
     #[test]
@@ -297,9 +406,11 @@ mod tests {
             ..Default::default()
         };
         let c = spec.engine_candidates("prefill", &root);
-        assert_eq!(c[0], PathBuf::from("/k/_engine/prefill/cdna3/mi300x"));
-        assert_eq!(c[1], PathBuf::from("/k/_engine/prefill/cdna3"));
-        assert_eq!(c[2], PathBuf::from("/k/_engine/prefill/generic"));
+        assert_eq!(c[0], PathBuf::from("/k/_engine/prefill/amd/cdna3/mi300x"));
+        assert_eq!(c[1], PathBuf::from("/k/_engine/prefill/cdna3/mi300x"));
+        assert_eq!(c[2], PathBuf::from("/k/_engine/prefill/amd/cdna3"));
+        assert_eq!(c[3], PathBuf::from("/k/_engine/prefill/cdna3"));
+        assert_eq!(c[4], PathBuf::from("/k/_engine/prefill/generic"));
     }
 
     #[test]
@@ -310,8 +421,9 @@ mod tests {
             ..Default::default()
         };
         let c = spec.engine_candidates("speculative", &root);
-        assert_eq!(c[0], PathBuf::from("/k/_engine/speculative/sm_89"));
-        assert_eq!(c[1], PathBuf::from("/k/_engine/speculative/generic"));
+        assert_eq!(c[0], PathBuf::from("/k/_engine/speculative/nvidia/sm_89"));
+        assert_eq!(c[1], PathBuf::from("/k/_engine/speculative/sm_89"));
+        assert_eq!(c[2], PathBuf::from("/k/_engine/speculative/generic"));
     }
 
     #[test]
@@ -351,10 +463,10 @@ mod tests {
     fn from_arch_resolves_nested_dir() {
         let root = PathBuf::from("/k");
         let c = KernelSpec::from_arch("qwen35", "sm_120").model_candidates(&root);
-        assert_eq!(c[0], PathBuf::from("/k/qwen/qwen3_5/sm_120"));
+        assert_eq!(c[0], PathBuf::from("/k/qwen/qwen3_5/nvidia/sm_120"));
         // Unknown arch keeps the flat (family == model == arch) layout.
         let c = KernelSpec::from_arch("mystery", "sm_120").model_candidates(&root);
-        assert_eq!(c[0], PathBuf::from("/k/mystery/mystery/sm_120"));
+        assert_eq!(c[0], PathBuf::from("/k/mystery/mystery/nvidia/sm_120"));
     }
 
     #[test]
