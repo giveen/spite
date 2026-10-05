@@ -64,7 +64,10 @@ pub fn apply_rope(qk: &mut [f32], pos: u32, cfg: &RopeConfig) -> Result<(), Rope
         RopeVariant::Yarn { scale, .. } => scale,
         _ => 1.0,
     };
-    rope_range(qk, pos, 0, d, cfg.theta * theta_scale, false);
+    // Rotate every head: `qk` holds `n_heads` contiguous `head_dim` slices.
+    for head in qk.chunks_exact_mut(d) {
+        rope_range(head, pos, 0, d, cfg.theta * theta_scale, false);
+    }
     Ok(())
 }
 

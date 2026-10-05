@@ -155,12 +155,16 @@ static int attention(
     const SpiteTensor* wk,
     const SpiteTensor* wv,
     const SpiteTensor* wo,
+    const SpiteTensor* q_norm,     // optional per-head QK norm (NULL if none)
+    const SpiteTensor* k_norm,
+    float              norm_eps,
     SpiteKvCache*      kvcache,
     float              rope_freq_base,
     const SpiteCtx*    ctx
 ) {
-    // TODO: implement
+    // TODO: implement. ABI v4: accumulate into out (out += attn(x)).
     (void)out; (void)x; (void)wq; (void)wk; (void)wv; (void)wo;
+    (void)q_norm; (void)k_norm; (void)norm_eps;
     (void)kvcache; (void)rope_freq_base; (void)ctx;
     return -1;
 }
@@ -187,6 +191,9 @@ static constexpr SpiteKernelInfo KERNEL_INFO {
     .mla              = nullptr,   // DeepSeek-style latent attention (optional)
     .ffn              = nullptr,
     .layer            = nullptr,   // optional: fuse the whole layer
+    .speculative_verify = nullptr,
+    .prefill          = nullptr,
+    .matmul           = nullptr,   // dense projection (LM head), ABI v4
 };
 
 extern "C" [[nodiscard]]

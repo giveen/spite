@@ -12,6 +12,7 @@ spite-abi      = { workspace = true }
 spite-loader   = { workspace = true }
 spite-compute  = { workspace = true }
 spite-dispatch = { workspace = true }
+spite-gpu      = { workspace = true }
 spite-rope     = { workspace = true }
 thiserror      = { workspace = true }
 

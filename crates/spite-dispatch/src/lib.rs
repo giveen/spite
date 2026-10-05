@@ -23,8 +23,8 @@ use libloading::{Library, Symbol};
 use thiserror::Error;
 
 use spite_abi::{
-    ABI_VERSION, AttentionFn, FfnFn, KERNEL_ENTRY_SYMBOL, KernelInfoFn, LayerFn, RmsNormFn,
-    SpecVerifyFn, SpiteKernelInfo,
+    ABI_VERSION, AttentionFn, FfnFn, KERNEL_ENTRY_SYMBOL, KernelInfoFn, LayerFn, MatmulFn,
+    RmsNormFn, SpecVerifyFn, SpiteKernelInfo,
 };
 
 pub mod cards;
@@ -53,6 +53,8 @@ struct LoadedKernel {
     // Library must stay alive; dropping it unloads the .so.
     _lib: Library,
     info: &'static SpiteKernelInfo,
+    /// Candidate directory this kernel was loaded from.
+    dir: PathBuf,
 }
 
 impl LoadedKernel {
@@ -66,7 +68,12 @@ impl LoadedKernel {
                 host: ABI_VERSION,
             });
         }
-        Ok(Self { _lib: lib, info })
+        let dir = path.parent().map(Path::to_owned).unwrap_or_default();
+        Ok(Self {
+            _lib: lib,
+            info,
+            dir,
+        })
     }
 
     fn gpu_arch(&self) -> &str {
@@ -91,6 +98,7 @@ pub struct DispatchTable {
     pub attention: (Option<AttentionFn>, OpSource),
     pub ffn: (Option<FfnFn>, OpSource),
     pub layer: (Option<LayerFn>, OpSource),
+    pub matmul: (Option<MatmulFn>, OpSource),
     // ── Engine-level ops (cross-model, card/arch/generic chain) ──────────
     pub speculative_verify: (Option<SpecVerifyFn>, OpSource),
     pub prefill: (Option<LayerFn>, OpSource), // chunked prefill
@@ -106,6 +114,7 @@ impl DispatchTable {
             ("attention", &self.attention.1),
             ("ffn", &self.ffn.1),
             ("layer", &self.layer.1),
+            ("matmul", &self.matmul.1),
             ("spec_verify", &self.speculative_verify.1),
             ("prefill", &self.prefill.1),
         ];
@@ -167,44 +176,19 @@ impl DispatchBuilder {
         };
 
         // Model ops resolved from model candidate chain
-        let rms_norm = find_op(
-            &model_libs,
-            |k| k.info.rms_norm,
-            &model_cands,
-            generic_src.clone(),
-        );
-        let attention = find_op(
-            &model_libs,
-            |k| k.info.attention,
-            &model_cands,
-            generic_src.clone(),
-        );
-        let ffn = find_op(
-            &model_libs,
-            |k| k.info.ffn,
-            &model_cands,
-            generic_src.clone(),
-        );
-        let layer = find_op(
-            &model_libs,
-            |k| k.info.layer,
-            &model_cands,
-            generic_src.clone(),
-        );
+        let rms_norm = find_op(&model_libs, |k| k.info.rms_norm, generic_src.clone());
+        let attention = find_op(&model_libs, |k| k.info.attention, generic_src.clone());
+        let ffn = find_op(&model_libs, |k| k.info.ffn, generic_src.clone());
+        let layer = find_op(&model_libs, |k| k.info.layer, generic_src.clone());
+        let matmul = find_op(&model_libs, |k| k.info.matmul, generic_src.clone());
 
         // Engine ops resolved from their own candidate chains
         let speculative_verify = find_op(
             &spec_libs,
             |k| k.info.speculative_verify,
-            &spec_cands,
             generic_src.clone(),
         );
-        let prefill = find_op(
-            &prefill_libs,
-            |k| k.info.prefill,
-            &prefill_cands,
-            generic_src.clone(),
-        );
+        let prefill = find_op(&prefill_libs, |k| k.info.prefill, generic_src.clone());
 
         let mut all_libs = model_libs;
         all_libs.extend(spec_libs);
@@ -215,6 +199,7 @@ impl DispatchBuilder {
             attention,
             ffn,
             layer,
+            matmul,
             speculative_verify,
             prefill,
             _libs: all_libs,
@@ -245,16 +230,18 @@ fn try_load_dir(dir: &Path) -> Option<LoadedKernel> {
 fn find_op<T: Copy>(
     libs: &[LoadedKernel],
     getter: impl Fn(&LoadedKernel) -> Option<T>,
-    candidates: &[PathBuf],
     fallback: OpSource,
 ) -> (Option<T>, OpSource) {
-    for (lib, dir) in libs.iter().zip(candidates.iter()) {
+    // `libs` holds only the candidates that actually loaded, in priority
+    // order; each remembers its own dir (zipping with the candidate list
+    // would misattribute paths whenever an earlier candidate is missing).
+    for lib in libs {
         if let Some(f) = getter(lib) {
             return (
                 Some(f),
                 OpSource {
                     gpu_arch: lib.gpu_arch().to_owned(),
-                    path: dir.clone(),
+                    path: lib.dir.clone(),
                 },
             );
         }

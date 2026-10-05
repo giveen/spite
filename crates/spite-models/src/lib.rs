@@ -24,6 +24,7 @@ pub mod dense;
 pub mod eagle;
 pub mod gemma;
 pub mod glm;
+pub mod gpu_dense;
 pub mod kimi;
 pub mod llama;
 pub mod mellum;

@@ -122,6 +122,16 @@ foreach(_spec ${_model_specs})
             endif()
         endif()
 
+        # CUDA kernels share the host's libcudart (dlopen'd by spite-gpu) so
+        # device pointers and the primary context are one runtime instance.
+        if(_arch MATCHES "^sm_")
+            find_package(CUDAToolkit REQUIRED)
+            set_target_properties(${_target} PROPERTIES
+                CUDA_RUNTIME_LIBRARY Shared
+                INSTALL_RPATH        "${CUDAToolkit_LIBRARY_DIR}"
+            )
+        endif()
+
         set_target_properties(${_target} PROPERTIES
             OUTPUT_NAME      "kernel_${_family}_${_model}_${_arch}"
             LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/kernels/${_family}/${_model}/${_arch}"

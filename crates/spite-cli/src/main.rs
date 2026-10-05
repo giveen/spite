@@ -122,6 +122,44 @@ struct HardwareArgs {
         hide = true
     )]
     vram_reserve_gib: u32,
+
+    /// [advanced] Compute device: auto (CUDA when a GPU kernel resolves,
+    /// else CPU), cpu, or cuda (fail if the CUDA path is unavailable).
+    #[arg(
+        long = "device",
+        env = "SPITE_DEVICE",
+        value_enum,
+        default_value_t = Device::Auto,
+        hide = true
+    )]
+    device: Device,
+}
+
+/// Where the forward pass runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, clap::ValueEnum)]
+enum Device {
+    #[default]
+    Auto,
+    Cpu,
+    Cuda,
+}
+
+/// Device selection resolved from CLI args, passed to `generate`.
+pub struct Placement<'a> {
+    device: Device,
+    kernels_dir: &'a Path,
+    gpu_arch: &'a str,
+}
+
+impl Placement<'_> {
+    /// CPU-only placement (tests, hosts without a GPU).
+    pub fn cpu() -> Placement<'static> {
+        Placement {
+            device: Device::Cpu,
+            kernels_dir: Path::new("kernels"),
+            gpu_arch: "generic",
+        }
+    }
 }
 
 // ── Model feature args ─────────────────────────────────────────────────────
@@ -446,7 +484,17 @@ fn cmd_run(
     println!("max tokens   : {max_tokens}");
     println!("temperature  : {temperature}");
 
-    let text = generate(&target_gguf, prompt, max_tokens, temperature, ctx)?;
+    let gpu_arch = mgpu
+        .nodes
+        .first()
+        .map(|n| n.gpu_arch.clone())
+        .unwrap_or_default();
+    let place = Placement {
+        device: hw.device,
+        kernels_dir: &hw.kernels_dir,
+        gpu_arch: &gpu_arch,
+    };
+    let text = generate(&target_gguf, prompt, max_tokens, temperature, ctx, &place)?;
     println!("\n{text}");
     Ok(())
 }
@@ -459,30 +507,27 @@ pub fn generate(
     max_tokens: usize,
     temperature: f32,
     ctx_len: Option<usize>,
+    place: &Placement,
 ) -> Result<String> {
     use spite_executor::{Executor, ExecutorConfig};
-    use spite_models::{ArchRegistry, ModelConfig};
     use spite_tokenizer::Tokenizer;
-
-    let hp = spite_loader::config::ModelHyperparams::from_gguf(gguf);
-    let cfg = ModelConfig::from(hp);
-    let mut model = ArchRegistry::default()
-        .build(cfg)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    model
-        .load_weights(gguf)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let tokenizer = Tokenizer::from_gguf(gguf)?;
-    let ids = tokenizer.encode(prompt, tokenizer.add_bos())?;
 
     let mut exec_cfg = ExecutorConfig::default();
     if let Some(n) = ctx_len {
         exec_cfg.ctx_len = n;
     }
+
+    let t_load = std::time::Instant::now();
+    let model = build_model(gguf, exec_cfg.ctx_len, place)?;
+    eprintln!("load time    : {:.2} s", t_load.elapsed().as_secs_f64());
+
+    let tokenizer = Tokenizer::from_gguf(gguf)?;
+    let ids = tokenizer.encode(prompt, tokenizer.add_bos())?;
+
     let mut exec = Executor::new(exec_cfg);
     exec.load_model(model);
 
+    let t_gen = std::time::Instant::now();
     let pieces = exec.generate(
         &tokenizer,
         &ids,
@@ -490,7 +535,70 @@ pub fn generate(
         temperature,
         0x1234_5678_9abc_def0,
     )?;
+    let secs = t_gen.elapsed().as_secs_f64();
+    eprintln!(
+        "generate     : {} prompt + {} new tokens in {secs:.2} s ({:.2} tok/s)",
+        ids.len(),
+        pieces.len(),
+        (ids.len() + pieces.len()) as f64 / secs.max(1e-9)
+    );
     Ok(pieces.into_iter().map(|(_, s)| s).collect())
+}
+
+/// Build the model on the requested device.
+///
+/// CUDA: weights are uploaded to VRAM as stored (no host dequant) and every
+/// op runs through the resolved `sm_*` kernel. CPU: the existing dequantized
+/// F32 path.
+fn build_model(
+    gguf: &GgufModel,
+    ctx_len: usize,
+    place: &Placement,
+) -> Result<Box<dyn spite_models::ModelArch>> {
+    use spite_models::gpu_dense::GpuDense;
+    use spite_models::{ArchRegistry, ModelConfig};
+
+    let hp = spite_loader::config::ModelHyperparams::from_gguf(gguf);
+    let cfg = ModelConfig::from(hp);
+
+    if place.device != Device::Cpu {
+        match GpuDense::resolve_table(&cfg.arch, place.gpu_arch, place.kernels_dir) {
+            Some(table) => {
+                let qk_norm = cfg.arch == "qwen3";
+                let (model, r) = GpuDense::load(cfg, gguf, table, ctx_len, qk_norm)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+                println!(
+                    "device       : cuda ({}) — weights {:.2} GiB + KV {:.2} GiB + scratch {:.2} MiB in VRAM; {:.2}/{:.2} GiB free",
+                    place.gpu_arch,
+                    gib(r.weights_bytes),
+                    gib(r.kv_bytes),
+                    r.scratch_bytes as f64 / (1u64 << 20) as f64,
+                    gib(r.free_after),
+                    gib(r.total)
+                );
+                return Ok(Box::new(model));
+            }
+            None if place.device == Device::Cuda => bail!(
+                "--device cuda: no CUDA kernel for arch '{}' on '{}' under {} \
+                 (build with cmake -DSPITE_MODELS=<family>/<model> -DSPITE_GPU_ARCHS=<card> \
+                 and `cmake --install build --prefix .`)",
+                cfg.arch,
+                place.gpu_arch,
+                place.kernels_dir.display()
+            ),
+            None => {}
+        }
+    }
+
+    println!("device       : cpu");
+    let mut model = ArchRegistry::default()
+        .build(cfg)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    model
+        .load_weights(gguf)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(model)
 }
 
 fn cmd_serve(
@@ -734,7 +842,7 @@ mod tests {
         };
         let tmp = fake.write_to_tempfile().unwrap();
         let gguf = GgufModel::open(tmp.path()).unwrap();
-        let text = generate(&gguf, "AB", 4, 0.0, None).unwrap();
+        let text = generate(&gguf, "AB", 4, 0.0, None, &Placement::cpu()).unwrap();
         assert!(!text.is_empty(), "expected generated text, got empty");
     }
 }

@@ -84,7 +84,7 @@ impl DenseWeights {
 
 /// Packed byte length of `n_elem` elements, or None if unsupported.
 /// Block sizes from llama.cpp ggml.
-fn packed_bytes(kind: SpiteType, n_elem: usize) -> Option<usize> {
+pub(crate) fn packed_bytes(kind: SpiteType, n_elem: usize) -> Option<usize> {
     let (el_per_block, bytes_per_block): (usize, usize) = match kind {
         SpiteType::F32 => return n_elem.checked_mul(4),
         SpiteType::F16 | SpiteType::Bf16 => return n_elem.checked_mul(2),
