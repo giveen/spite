@@ -5,3 +5,4 @@
 *.dll
 __pycache__/
 *.pyc
+*.bench
