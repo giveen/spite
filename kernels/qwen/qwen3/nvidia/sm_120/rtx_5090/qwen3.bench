@@ -1,1 +1,1 @@
-/mnt/storage/models/qwen3/Qwen3-8B-Q8_0.gguf [cuda (sm_120, kv f16/f16)]       89.7 tok/s  TTFT    48.9 ms  mem   8462 MiB  (n=5)
+/mnt/storage/models/qwen3/Qwen3-8B-Q8_0.gguf [cuda (sm_120, kv f16/f16)]       87.3 tok/s  TTFT    52.0 ms  mem   8462 MiB  (n=5)

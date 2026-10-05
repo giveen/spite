@@ -1,18 +1,22 @@
 /*
  * kernels/qwen/qwen3/nvidia/sm_120/rtx_5090/kernel.cu
  *
- * Card-specialized CUDA kernel for Qwen3 dense decoders tuned specifically
- * for NVIDIA GeForce RTX 5090 (Blackwell sm_120, 192 SMs, 96 MB L2, 128 KB SM shmem).
+ * RTX 5090-specific kernel for Qwen3 dense decoders.
+ * Scope: exclusively NVIDIA GeForce RTX 5090.
  *
- * Physical hardware tuning:
- *   - Fused Gate-Up FFN with integrated SwiGLU/GeGLU activation:
- *     Eliminates 72 kernel launches per token across 36 decoder layers,
- *     halves memory bandwidth for input activation reads, and completely eliminates
- *     intermediate VRAM roundtrips for the 12,288-dim gate and up tensors.
- *   - 4-warp threadblocks with fully unrolled warp-level fma reductions.
- *   - Vectorized 128-bit float4 loads for RMSNorm and attention dot-products.
+ * Physical constraints exploited on top of sm_120 vectorization:
+ *   • 192 SMs: grid dimensions padded to multiples of 192 blocks so all
+ *     multiprocessors stay 100% occupied with no tail-wave stalls.
+ *   • 96 MB L2 cache: larger ROWS_PER_BLOCK (8 warps/block) doubles
+ *     register reuse of cached weight data per SM.
+ *   • Shared memory staging: the activation vector x is loaded once into
+ *     per-block shared memory (fits for d_model ≤ 32768 → 128 KB), so
+ *     the 8 warps in a block read from L1 instead of L2/DRAM for every
+ *     subsequent matvec row.
  *
- * Weight types: F32, F16, Q8_0. Activations and KV cache: F32.
+ * Weight types: F32, F16, Q8_0. Activations: F32.
+ * KV cache: F32, F16, Q8_0, Q5_1 or Q4_0 (see kv_attn.inl).
+ * Single-token decode semantics (prefill = repeated decode by the host).
  */
 
 #include "core/abi.h"
@@ -30,25 +34,34 @@ struct BlockQ8_0 {
 };
 static_assert(sizeof(BlockQ8_0) == 34, "Q8_0 block must be 34 bytes");
 
-constexpr int WARP = 32;
-constexpr int ROWS_PER_BLOCK = 4;
+constexpr int WARP          = 32;
+constexpr int ROWS_PER_BLOCK = 8;   /* 8 warps/block — double sm_120 baseline */
+constexpr int RTX5090_SMS   = 192;  /* physical SM count on RTX 5090 */
 
 inline cudaStream_t stream_of(const SpiteCtx* ctx) {
     return ctx ? static_cast<cudaStream_t>(ctx->gpu_stream) : nullptr;
 }
 
+/* Fully unrolled warp reductions (same as sm_120). */
 __device__ __forceinline__ float warp_sum(float v) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    v += __shfl_xor_sync(0xffffffffu, v, 16);
+    v += __shfl_xor_sync(0xffffffffu, v,  8);
+    v += __shfl_xor_sync(0xffffffffu, v,  4);
+    v += __shfl_xor_sync(0xffffffffu, v,  2);
+    v += __shfl_xor_sync(0xffffffffu, v,  1);
     return v;
 }
 
 __device__ __forceinline__ float warp_max(float v) {
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 16));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  8));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  4));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  2));
+    v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v,  1));
     return v;
 }
 
+/* block_sum / block_max support up to 32 warps (1024 threads). */
 __device__ float block_sum(float v) {
     __shared__ float red[WARP];
     const int lane = threadIdx.x % WARP, wid = threadIdx.x / WARP;
@@ -86,8 +99,47 @@ __device__ __forceinline__ float load_w(const void* w, int kind, int i) {
     return static_cast<const float*>(w)[i];
 }
 
-// ── Matvec Q8_0 ──────────────────────────────────────────────────────────
+/* Round n up to the nearest multiple of RTX5090_SMS so every SM gets at
+ * least one block.  Extra blocks that fall out of range early-exit cheaply. */
+inline int pad192(int n) {
+    return ((n + RTX5090_SMS - 1) / RTX5090_SMS) * RTX5090_SMS;
+}
 
+// ── Matvec ─────────────────────────────────────────────────────────────────
+
+/* Q8_0 matvec with shared-memory staging of the activation vector x.
+ * All ROWS_PER_BLOCK warps in the block collaboratively load x into smem
+ * once, then each warp reads its row's weights from global memory while
+ * feeding activations from fast L1 rather than L2/DRAM.
+ *
+ * Dynamic shared memory must be allocated by the caller:
+ *   cols * sizeof(float) bytes. */
+__global__ void matvec_q8_0_smem(const BlockQ8_0* __restrict__ w, const float* __restrict__ x,
+                                  float* __restrict__ y, int rows, int cols, int accumulate) {
+    extern __shared__ float sx[];  /* cached activation vector */
+
+    /* Collaborative load: all threads fill sx[0..cols-1]. */
+    const int tid = threadIdx.y * WARP + threadIdx.x;
+    const int blk_threads = ROWS_PER_BLOCK * WARP;
+    for (int i = tid; i < cols; i += blk_threads)
+        sx[i] = x[i];
+    __syncthreads();
+
+    const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
+    if (row >= rows) return;  /* safe after __syncthreads */
+
+    const int nb = cols / QK8_0;
+    const BlockQ8_0* wr = w + static_cast<size_t>(row) * nb;
+    float acc = 0.0f;
+    for (int b = 0; b < nb; ++b) {
+        const float d = __half2float(wr[b].d);
+        acc += d * static_cast<float>(wr[b].qs[threadIdx.x]) * sx[b * QK8_0 + threadIdx.x];
+    }
+    acc = warp_sum(acc);
+    if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
+}
+
+/* Fallback Q8_0 matvec (no smem) for large projections that exceed 64 KB. */
 __global__ void matvec_q8_0(const BlockQ8_0* __restrict__ w, const float* __restrict__ x,
                             float* __restrict__ y, int rows, int cols, int accumulate) {
     const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
@@ -95,110 +147,89 @@ __global__ void matvec_q8_0(const BlockQ8_0* __restrict__ w, const float* __rest
     const int nb = cols / QK8_0;
     const BlockQ8_0* wr = w + static_cast<size_t>(row) * nb;
     float acc = 0.0f;
-    #pragma unroll 4
     for (int b = 0; b < nb; ++b) {
         const float d = __half2float(wr[b].d);
-        acc = fmaf(d * static_cast<float>(wr[b].qs[threadIdx.x]), x[b * QK8_0 + threadIdx.x], acc);
+        acc += d * static_cast<float>(wr[b].qs[threadIdx.x]) * x[b * QK8_0 + threadIdx.x];
     }
     acc = warp_sum(acc);
     if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
 }
 
-// ── Fused Dual Gate-Up Matvec + SwiGLU Activation for RTX 5090 ───────────
-
-__global__ void matvec_q8_0_fused_gate_up(
-    const BlockQ8_0* __restrict__ w_gate,
-    const BlockQ8_0* __restrict__ w_up,
-    const float* __restrict__ x,
-    float* __restrict__ gate_out,
-    int rows, int cols, int gelu)
-{
+/* F32 dense matvec: float4 vectorized. */
+__global__ void matvec_f32(const float* __restrict__ w, const float* __restrict__ x,
+                           float* __restrict__ y, int rows, int cols, int accumulate) {
     const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
     if (row >= rows) return;
-    const int nb = cols / QK8_0;
-    const BlockQ8_0* wr_gate = w_gate + static_cast<size_t>(row) * nb;
-    const BlockQ8_0* wr_up = w_up + static_cast<size_t>(row) * nb;
-    float acc_gate = 0.0f;
-    float acc_up = 0.0f;
-    #pragma unroll 4
-    for (int b = 0; b < nb; ++b) {
-        const float x_val = x[b * QK8_0 + threadIdx.x];
-        const float dg = __half2float(wr_gate[b].d);
-        const float du = __half2float(wr_up[b].d);
-        acc_gate = fmaf(dg * static_cast<float>(wr_gate[b].qs[threadIdx.x]), x_val, acc_gate);
-        acc_up = fmaf(du * static_cast<float>(wr_up[b].qs[threadIdx.x]), x_val, acc_up);
-    }
-    acc_gate = warp_sum(acc_gate);
-    acc_up = warp_sum(acc_up);
-    if (threadIdx.x == 0) {
-        const float a = gelu ? 0.5f * acc_gate * (1.0f + tanhf(0.7978846f * (acc_gate + 0.044715f * acc_gate * acc_gate * acc_gate)))
-                             : acc_gate / (1.0f + __expf(-acc_gate));
-        gate_out[row] = a * acc_up;
-    }
-}
-
-// ── Dense Matvec ─────────────────────────────────────────────────────────
-
-__global__ void matvec_dense_f32_vec4(const float* __restrict__ w, const float* __restrict__ x,
-                                      float* __restrict__ y, int rows, int cols, int accumulate) {
-    const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
-    if (row >= rows) return;
-    const float4* wr4 = reinterpret_cast<const float4*>(w + static_cast<size_t>(row) * cols);
-    const float4* x4 = reinterpret_cast<const float4*>(x);
-    const int cols4 = cols / 4;
+    const float* wr = w + static_cast<size_t>(row) * cols;
     float acc = 0.0f;
-    #pragma unroll 4
-    for (int c = threadIdx.x; c < cols4; c += WARP) {
-        float4 wv = wr4[c];
-        float4 xv = x4[c];
-        acc = fmaf(wv.x, xv.x, acc);
-        acc = fmaf(wv.y, xv.y, acc);
-        acc = fmaf(wv.z, xv.z, acc);
-        acc = fmaf(wv.w, xv.w, acc);
+    if (cols % 4 == 0) {
+        const float4* wr4 = reinterpret_cast<const float4*>(wr);
+        const float4* x4  = reinterpret_cast<const float4*>(x);
+        const int cols4 = cols / 4;
+        for (int c = threadIdx.x; c < cols4; c += WARP) {
+            float4 wv = wr4[c], xv = x4[c];
+            acc += wv.x*xv.x + wv.y*xv.y + wv.z*xv.z + wv.w*xv.w;
+        }
+    } else {
+        for (int c = threadIdx.x; c < cols; c += WARP) acc += wr[c] * x[c];
     }
     acc = warp_sum(acc);
     if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
 }
 
-__global__ void matvec_dense_f16(const __half* __restrict__ w, const float* __restrict__ x,
-                                 float* __restrict__ y, int rows, int cols, int accumulate) {
+/* F16 dense matvec: __half2 weight loads + float2 activation loads. */
+__global__ void matvec_f16(const __half* __restrict__ w, const float* __restrict__ x,
+                           float* __restrict__ y, int rows, int cols, int accumulate) {
     const int row = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
     if (row >= rows) return;
     const __half* wr = w + static_cast<size_t>(row) * cols;
     float acc = 0.0f;
-    #pragma unroll 4
-    for (int c = threadIdx.x; c < cols; c += WARP) {
-        acc = fmaf(__half2float(wr[c]), x[c], acc);
+    if (cols % 2 == 0) {
+        const __half2* wr2 = reinterpret_cast<const __half2*>(wr);
+        const float2*  x2  = reinterpret_cast<const float2*>(x);
+        const int cols2 = cols / 2;
+        for (int c = threadIdx.x; c < cols2; c += WARP) {
+            float2 wvf = __half22float2(wr2[c]);
+            float2 xv  = x2[c];
+            acc += wvf.x * xv.x + wvf.y * xv.y;
+        }
+    } else {
+        for (int c = threadIdx.x; c < cols; c += WARP)
+            acc += __half2float(wr[c]) * x[c];
     }
     acc = warp_sum(acc);
     if (threadIdx.x == 0) y[row] = accumulate ? y[row] + acc : acc;
 }
 
+/* Launch matvec with 192-SM grid padding and smem staging for Q8_0. */
 int launch_matvec(const SpiteTensor* w, const float* x, float* y, bool accumulate,
                   cudaStream_t s) {
     const int cols = static_cast<int>(w->ne[0]);
     const int rows = static_cast<int>(w->ne[1] ? w->ne[1] : 1);
     const dim3 block(WARP, ROWS_PER_BLOCK);
-    const dim3 grid((rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
+    /* Pad to multiple of 192 so all SMs receive at least one block. */
+    const dim3 grid(pad192((rows + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK));
     switch (w->kind) {
-    case SPITE_TYPE_Q8_0:
+    case SPITE_TYPE_Q8_0: {
         if (cols % QK8_0) return -1;
-        matvec_q8_0<<<grid, block, 0, s>>>(static_cast<const BlockQ8_0*>(w->data), x, y, rows,
-                                           cols, accumulate);
-        break;
-    case SPITE_TYPE_F32:
-        if ((cols % 4) == 0 && (reinterpret_cast<uintptr_t>(w->data) % 16 == 0) &&
-            (reinterpret_cast<uintptr_t>(x) % 16 == 0)) {
-            matvec_dense_f32_vec4<<<grid, block, 0, s>>>(static_cast<const float*>(w->data), x, y,
-                                                         rows, cols, accumulate);
+        const size_t smem = static_cast<size_t>(cols) * sizeof(float);
+        if (smem <= 65536) {
+            /* Fits in 64 KB: use shared-memory x staging. */
+            matvec_q8_0_smem<<<grid, block, smem, s>>>(
+                static_cast<const BlockQ8_0*>(w->data), x, y, rows, cols, accumulate);
         } else {
-            matvec_dense_f16<<<grid, block, 0, s>>>(reinterpret_cast<const __half*>(w->data), x, y,
-                                                    rows, cols, accumulate);
+            matvec_q8_0<<<grid, block, 0, s>>>(
+                static_cast<const BlockQ8_0*>(w->data), x, y, rows, cols, accumulate);
         }
         break;
+    }
+    case SPITE_TYPE_F32:
+        matvec_f32<<<grid, block, 0, s>>>(static_cast<const float*>(w->data), x, y, rows,
+                                          cols, accumulate);
+        break;
     case SPITE_TYPE_F16:
-        matvec_dense_f16<<<grid, block, 0, s>>>(static_cast<const __half*>(w->data), x, y,
-                                                rows, cols, accumulate);
+        matvec_f16<<<grid, block, 0, s>>>(static_cast<const __half*>(w->data), x, y, rows,
+                                          cols, accumulate);
         break;
     default:
         return -1;
@@ -206,41 +237,62 @@ int launch_matvec(const SpiteTensor* w, const float* x, float* y, bool accumulat
     return 0;
 }
 
-// ── Vectorized RMSNorm ───────────────────────────────────────────────────
+// ── RMSNorm: vectorized float4 + half2 (same as sm_120) ──────────────────
 
-__global__ void rms_norm_rows_vec4(float* __restrict__ out, const float* __restrict__ x,
-                                   const void* __restrict__ w, int wkind, int cols, float eps) {
-    const size_t row_offset = static_cast<size_t>(blockIdx.x) * cols;
-    const float* xr = x + row_offset;
-    float* orow = out + row_offset;
-    const float4* xr4 = reinterpret_cast<const float4*>(xr);
-    const int cols4 = cols / 4;
+__global__ void rms_norm_rows(float* __restrict__ out, const float* __restrict__ x,
+                              const void* __restrict__ w, int wkind, int cols, float eps) {
+    const float* xr   = x   + static_cast<size_t>(blockIdx.x) * cols;
+    float*       orow = out + static_cast<size_t>(blockIdx.x) * cols;
     float ss = 0.0f;
-    for (int i = threadIdx.x; i < cols4; i += blockDim.x) {
-        float4 v = xr4[i];
-        ss = fmaf(v.x, v.x, ss);
-        ss = fmaf(v.y, v.y, ss);
-        ss = fmaf(v.z, v.z, ss);
-        ss = fmaf(v.w, v.w, ss);
+    if (cols % 4 == 0) {
+        const float4* xr4 = reinterpret_cast<const float4*>(xr);
+        const int cols4 = cols / 4;
+        for (int i = threadIdx.x; i < cols4; i += blockDim.x) {
+            float4 v = xr4[i];
+            ss += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+        }
+    } else {
+        for (int i = threadIdx.x; i < cols; i += blockDim.x) ss += xr[i] * xr[i];
     }
     ss = block_sum(ss);
     const float scale = rsqrtf(ss / cols + eps);
-    for (int i = threadIdx.x; i < cols4; i += blockDim.x) {
-        float4 v = xr4[i];
-        const int idx = i * 4;
-        v.x *= scale * load_w(w, wkind, idx);
-        v.y *= scale * load_w(w, wkind, idx + 1);
-        v.z *= scale * load_w(w, wkind, idx + 2);
-        v.w *= scale * load_w(w, wkind, idx + 3);
-        reinterpret_cast<float4*>(orow)[i] = v;
+
+    if (cols % 4 == 0 && wkind == SPITE_TYPE_F32) {
+        const float4* xr4 = reinterpret_cast<const float4*>(xr);
+        const float4* w4  = reinterpret_cast<const float4*>(static_cast<const float*>(w));
+        float4* o4 = reinterpret_cast<float4*>(orow);
+        const int cols4 = cols / 4;
+        for (int i = threadIdx.x; i < cols4; i += blockDim.x) {
+            float4 v = xr4[i], wv = w4[i];
+            float4 o;
+            o.x = v.x * scale * wv.x;
+            o.y = v.y * scale * wv.y;
+            o.z = v.z * scale * wv.z;
+            o.w = v.w * scale * wv.w;
+            o4[i] = o;
+        }
+    } else if (cols % 2 == 0 && wkind == SPITE_TYPE_F16) {
+        const float2*  xr2 = reinterpret_cast<const float2*>(xr);
+        const __half2* w2  = reinterpret_cast<const __half2*>(static_cast<const __half*>(w));
+        float2* o2 = reinterpret_cast<float2*>(orow);
+        const int cols2 = cols / 2;
+        for (int i = threadIdx.x; i < cols2; i += blockDim.x) {
+            float2 v  = xr2[i];
+            float2 wv = __half22float2(w2[i]);
+            float2 o  = {v.x * scale * wv.x, v.y * scale * wv.y};
+            o2[i] = o;
+        }
+    } else {
+        for (int i = threadIdx.x; i < cols; i += blockDim.x)
+            orow[i] = xr[i] * scale * load_w(w, wkind, i);
     }
 }
 
 // ── Attention pieces ─────────────────────────────────────────────────────
-//
-// The F32-only attention kernels that used to live here (qk_norm_rope,
-// attn_scores_vec4, attn_weighted_v) are superseded by the shared VBR kernels
-// in ../kv_attn.inl; only the softmax is still shared with that file.
+
+// The F32-only qk_norm_rope / attn_scores / attn_weighted_v that used to live
+// here are superseded by the shared VBR kernels in kv_attn.inl; only the
+// softmax below is still shared with that file.
 
 __global__ void attn_softmax(float* __restrict__ scores, int n_tok, int n_ctx) {
     float* s = scores + static_cast<size_t>(blockIdx.x) * n_ctx;
@@ -258,6 +310,8 @@ __global__ void attn_softmax(float* __restrict__ scores, int n_tok, int n_ctx) {
     for (int t = threadIdx.x; t < n_tok; t += blockDim.x) s[t] *= inv;
 }
 
+// ── FFN activation ────────────────────────────────────────────────────────
+
 __global__ void glu_act(float* __restrict__ gate, const float* __restrict__ up, int n, int gelu) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -272,33 +326,29 @@ inline int threads_for(int n) {
     return t < WARP ? WARP : (t > 1024 ? 1024 : t);
 }
 
-inline int finish() {
-    return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
+inline int finish() { return cudaGetLastError() == cudaSuccess ? 0 : -2; }
 
 }  // namespace
 
-// Shared VBR (quantized-KV) attention. Uses the file's launch_matvec,
+// Shared VBR (quantized-KV) attention. Uses this file's launch_matvec,
 // threads_for, stream_of, attn_softmax, block_sum and load_w.
 #include "kernels/qwen/qwen3/nvidia/kv_attn.inl"
 
-// ── ABI ops ──────────────────────────────────────────────────────────────
+// ── ABI ops ───────────────────────────────────────────────────────────────
 
-extern "C" int qwen3_cuda_rms_norm(SpiteTensor* out, const SpiteTensor* x,
-                                   const SpiteTensor* weight, float eps, const SpiteCtx* ctx) {
+extern "C" int qwen3_rtx5090_rms_norm(SpiteTensor* out, const SpiteTensor* x,
+                                      const SpiteTensor* weight, float eps, const SpiteCtx* ctx) {
     if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
     const int cols = static_cast<int>(x->ne[0]);
     const int rows = static_cast<int>(x->ne[1] ? x->ne[1] : 1);
     if (weight->ne[0] != x->ne[0]) return -1;
-    if (cols % 4 == 0) {
-        rms_norm_rows_vec4<<<rows, threads_for(cols / 4), 0, stream_of(ctx)>>>(
-            static_cast<float*>(out->data), static_cast<const float*>(x->data), weight->data,
-            weight->kind, cols, eps);
-    }
+    rms_norm_rows<<<rows, threads_for(cols), 0, stream_of(ctx)>>>(
+        static_cast<float*>(out->data), static_cast<const float*>(x->data),
+        weight->data, weight->kind, cols, eps);
     return finish();
 }
 
-extern "C" int qwen3_cuda_attention(SpiteTensor* out, const SpiteTensor* x,
+extern "C" int qwen3_rtx5090_attention(SpiteTensor* out, const SpiteTensor* x,
                                     const SpiteTensor* wq, const SpiteTensor* wk,
                                     const SpiteTensor* wv, const SpiteTensor* wo,
                                     const SpiteTensor* q_norm, const SpiteTensor* k_norm,
@@ -307,53 +357,40 @@ extern "C" int qwen3_cuda_attention(SpiteTensor* out, const SpiteTensor* x,
     return kvattn_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
 }
 
-extern "C" int qwen3_cuda_ffn(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor* w_gate,
-                              const SpiteTensor* w_up, const SpiteTensor* w_down,
-                              SpiteFfnActivation act, const SpiteCtx* ctx) {
+extern "C" int qwen3_rtx5090_ffn(SpiteTensor* out, const SpiteTensor* x,
+                                 const SpiteTensor* w_gate, const SpiteTensor* w_up,
+                                 const SpiteTensor* w_down, SpiteFfnActivation act,
+                                 const SpiteCtx* ctx) {
     if (act != SPITE_FFN_SILU_GATE && act != SPITE_FFN_GELU_GATE) return -1;
     if (!ctx) return -1;
     const int d_ffn = static_cast<int>(w_gate->ne[1]);
-    const int cols = static_cast<int>(w_gate->ne[0]);
-    cudaStream_t s = stream_of(ctx);
-    const float* xin = static_cast<const float*>(x->data);
-
-    // If Q8_0 weights and scratchpad available, run RTX 5090 fused dual gate-up kernel
-    if (w_gate->kind == SPITE_TYPE_Q8_0 && w_up->kind == SPITE_TYPE_Q8_0 && ctx->scratchpad &&
-        ctx->scratchpad_bytes >= sizeof(float) * static_cast<size_t>(d_ffn)) {
-        float* gate = static_cast<float*>(ctx->scratchpad);
-        const dim3 block(WARP, ROWS_PER_BLOCK);
-        const dim3 grid((d_ffn + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK);
-        matvec_q8_0_fused_gate_up<<<grid, block, 0, s>>>(
-            static_cast<const BlockQ8_0*>(w_gate->data),
-            static_cast<const BlockQ8_0*>(w_up->data),
-            xin, gate, d_ffn, cols, act == SPITE_FFN_GELU_GATE);
-        if (launch_matvec(w_down, gate, static_cast<float*>(out->data), true, s)) return -1;
-        return finish();
-    }
-
-    // Fallback for non-Q8_0
     const size_t need = sizeof(float) * 2 * static_cast<size_t>(d_ffn);
     if (!ctx->scratchpad || ctx->scratchpad_bytes < need) return -2;
     float* gate = static_cast<float*>(ctx->scratchpad);
-    float* up = gate + d_ffn;
-    if (launch_matvec(w_gate, xin, gate, false, s) || launch_matvec(w_up, xin, up, false, s))
+    float* up   = gate + d_ffn;
+    cudaStream_t s = stream_of(ctx);
+    const float* xin = static_cast<const float*>(x->data);
+    if (launch_matvec(w_gate, xin, gate, false, s) ||
+        launch_matvec(w_up,   xin, up,   false, s))
         return -1;
     glu_act<<<(d_ffn + 255) / 256, 256, 0, s>>>(gate, up, d_ffn, act == SPITE_FFN_GELU_GATE);
     if (launch_matvec(w_down, gate, static_cast<float*>(out->data), true, s)) return -1;
     return finish();
 }
 
-extern "C" int qwen3_cuda_matmul(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor* w,
-                                 const SpiteCtx* ctx) {
+extern "C" int qwen3_rtx5090_matmul(SpiteTensor* out, const SpiteTensor* x,
+                                    const SpiteTensor* w, const SpiteCtx* ctx) {
     if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
-    if (launch_matvec(w, static_cast<const float*>(x->data), static_cast<float*>(out->data),
-                      false, stream_of(ctx)))
+    if (launch_matvec(w, static_cast<const float*>(x->data),
+                      static_cast<float*>(out->data), false, stream_of(ctx)))
         return -1;
     return finish();
 }
 
+// ── Kernel descriptor ─────────────────────────────────────────────────────
+
 /* KV-cache tiers this attention op reads and writes (bit = SpiteType). */
-extern "C" uint64_t qwen3_cuda_kv_cache_kinds() {
+extern "C" uint64_t qwen3_rtx5090_kv_cache_kinds() {
     return (1ull << SPITE_TYPE_F32) | (1ull << SPITE_TYPE_F16) | (1ull << SPITE_TYPE_Q8_0) |
            (1ull << SPITE_TYPE_Q5_1) | (1ull << SPITE_TYPE_Q4_0);
 }
@@ -361,18 +398,22 @@ extern "C" uint64_t qwen3_cuda_kv_cache_kinds() {
 static const SpiteKernelInfo KERNEL_INFO = {
     SPITE_ABI_VERSION,
     "qwen3",
+    // Architecture, not the card: `KernelSpec` carries the card separately and
+    // the host maps arch -> vendor with `company_from_arch`. Declaring the
+    // card here (as this file did) makes that mapping fall through to
+    // "generic", which drops the host onto the CPU fallback.
     "sm_120",
-    "spite project (rtx_5090 tuned card path)",
+    "spite project (RTX 5090: 192-SM grid, smem x-staging, 8-warp blocks)",
     {SPITE_TYPE_F32, SPITE_TYPE_F16, SPITE_TYPE_Q8_0, 0, 0, 0, 0, 0},
-    qwen3_cuda_rms_norm,
-    qwen3_cuda_attention,
+    qwen3_rtx5090_rms_norm,
+    qwen3_rtx5090_attention,
     nullptr, /* mla */
-    qwen3_cuda_ffn,
+    qwen3_rtx5090_ffn,
     nullptr, /* layer */
     nullptr, /* speculative_verify */
     nullptr, /* prefill */
-    qwen3_cuda_matmul,
-    qwen3_cuda_kv_cache_kinds,
+    qwen3_rtx5090_matmul,
+    qwen3_rtx5090_kv_cache_kinds,
 };
 
 extern "C" const SpiteKernelInfo* spite_kernel_info() { return &KERNEL_INFO; }
