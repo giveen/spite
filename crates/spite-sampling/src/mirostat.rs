@@ -55,7 +55,11 @@ impl MirostatState {
     pub fn sample(&mut self, probs: &[f32], rng: &mut u64) -> usize {
         // Sort indices by probability descending
         let mut indices: Vec<usize> = (0..probs.len()).collect();
-        indices.sort_unstable_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
+        indices.sort_unstable_by(|&a, &b| {
+            probs[b]
+                .partial_cmp(&probs[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Truncate to tokens whose probability > 2^(-μ)
         let threshold = 2f32.powf(-self.mu);

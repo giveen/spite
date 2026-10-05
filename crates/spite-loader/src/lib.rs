@@ -29,6 +29,14 @@ pub enum LoadError {
     UnknownType(u32),
     #[error("malformed metadata key: {0}")]
     MalformedKey(String),
+    #[error(
+        "truncated GGUF file: expected {expected} bytes at offset {offset}, available {available}"
+    )]
+    Truncated {
+        offset: usize,
+        expected: usize,
+        available: usize,
+    },
 }
 
 // ── GGUF constants ─────────────────────────────────────────────────────────
@@ -62,18 +70,18 @@ impl GgufModel {
 
         let mut cursor = 0usize;
 
-        let magic = read_u32(&mmap, &mut cursor);
+        let magic = read_u32(&mmap, &mut cursor)?;
         if magic != GGUF_MAGIC {
             return Err(LoadError::BadMagic);
         }
 
-        let version = read_u32(&mmap, &mut cursor);
+        let version = read_u32(&mmap, &mut cursor)?;
         if version != GGUF_VERSION {
             return Err(LoadError::UnsupportedVersion(version));
         }
 
-        let n_tensors = read_u64(&mmap, &mut cursor) as usize;
-        let n_kv = read_u64(&mmap, &mut cursor) as usize;
+        let n_tensors = read_u64(&mmap, &mut cursor)? as usize;
+        let n_kv = read_u64(&mmap, &mut cursor)? as usize;
 
         let mut meta = HashMap::with_capacity(n_kv);
         for _ in 0..n_kv {
@@ -204,89 +212,141 @@ pub enum MetaValue {
     Array(Vec<MetaValue>),
 }
 
-fn read_u8(buf: &[u8], cur: &mut usize) -> u8 {
-    let v = buf[*cur];
-    *cur += 1;
-    v
-}
-fn read_u16(buf: &[u8], cur: &mut usize) -> u16 {
-    let v = u16::from_le_bytes(buf[*cur..*cur + 2].try_into().unwrap());
-    *cur += 2;
-    v
-}
-fn read_u32(buf: &[u8], cur: &mut usize) -> u32 {
-    let v = u32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap());
-    *cur += 4;
-    v
-}
-fn read_u64(buf: &[u8], cur: &mut usize) -> u64 {
-    let v = u64::from_le_bytes(buf[*cur..*cur + 8].try_into().unwrap());
-    *cur += 8;
-    v
-}
-fn read_f32(buf: &[u8], cur: &mut usize) -> f32 {
-    f32::from_le_bytes(buf[*cur..*cur + 4].try_into().unwrap()).also(|_| *cur += 4)
-}
-fn read_gguf_str(buf: &[u8], cur: &mut usize) -> String {
-    let len = read_u64(buf, cur) as usize;
-    let s = String::from_utf8_lossy(&buf[*cur..*cur + len]).into_owned();
-    *cur += len;
-    s
-}
-
-trait Also: Sized {
-    fn also(self, f: impl FnOnce(&Self)) -> Self {
-        f(&self);
-        self
+fn ensure_bytes(buf: &[u8], cur: usize, n: usize) -> Result<(), LoadError> {
+    if cur.checked_add(n).is_none_or(|end| end > buf.len()) {
+        Err(LoadError::Truncated {
+            offset: cur,
+            expected: n,
+            available: buf.len().saturating_sub(cur),
+        })
+    } else {
+        Ok(())
     }
 }
-impl<T> Also for T {}
+
+fn read_u8(buf: &[u8], cur: &mut usize) -> Result<u8, LoadError> {
+    ensure_bytes(buf, *cur, 1)?;
+    let v = buf[*cur];
+    *cur += 1;
+    Ok(v)
+}
+
+fn read_u16(buf: &[u8], cur: &mut usize) -> Result<u16, LoadError> {
+    ensure_bytes(buf, *cur, 2)?;
+    let slice: [u8; 2] = buf[*cur..*cur + 2]
+        .try_into()
+        .map_err(|_| LoadError::Truncated {
+            offset: *cur,
+            expected: 2,
+            available: buf.len().saturating_sub(*cur),
+        })?;
+    *cur += 2;
+    Ok(u16::from_le_bytes(slice))
+}
+
+fn read_u32(buf: &[u8], cur: &mut usize) -> Result<u32, LoadError> {
+    ensure_bytes(buf, *cur, 4)?;
+    let slice: [u8; 4] = buf[*cur..*cur + 4]
+        .try_into()
+        .map_err(|_| LoadError::Truncated {
+            offset: *cur,
+            expected: 4,
+            available: buf.len().saturating_sub(*cur),
+        })?;
+    *cur += 4;
+    Ok(u32::from_le_bytes(slice))
+}
+
+fn read_u64(buf: &[u8], cur: &mut usize) -> Result<u64, LoadError> {
+    ensure_bytes(buf, *cur, 8)?;
+    let slice: [u8; 8] = buf[*cur..*cur + 8]
+        .try_into()
+        .map_err(|_| LoadError::Truncated {
+            offset: *cur,
+            expected: 8,
+            available: buf.len().saturating_sub(*cur),
+        })?;
+    *cur += 8;
+    Ok(u64::from_le_bytes(slice))
+}
+
+fn read_f32(buf: &[u8], cur: &mut usize) -> Result<f32, LoadError> {
+    ensure_bytes(buf, *cur, 4)?;
+    let slice: [u8; 4] = buf[*cur..*cur + 4]
+        .try_into()
+        .map_err(|_| LoadError::Truncated {
+            offset: *cur,
+            expected: 4,
+            available: buf.len().saturating_sub(*cur),
+        })?;
+    *cur += 4;
+    Ok(f32::from_le_bytes(slice))
+}
+
+fn read_f64(buf: &[u8], cur: &mut usize) -> Result<f64, LoadError> {
+    ensure_bytes(buf, *cur, 8)?;
+    let slice: [u8; 8] = buf[*cur..*cur + 8]
+        .try_into()
+        .map_err(|_| LoadError::Truncated {
+            offset: *cur,
+            expected: 8,
+            available: buf.len().saturating_sub(*cur),
+        })?;
+    *cur += 8;
+    Ok(f64::from_le_bytes(slice))
+}
+
+fn read_gguf_str(buf: &[u8], cur: &mut usize) -> Result<String, LoadError> {
+    let len = read_u64(buf, cur)? as usize;
+    ensure_bytes(buf, *cur, len)?;
+    let s = String::from_utf8_lossy(&buf[*cur..*cur + len]).into_owned();
+    *cur += len;
+    Ok(s)
+}
 
 fn read_kv(buf: &[u8], cur: &mut usize) -> Result<(String, MetaValue), LoadError> {
-    let key = read_gguf_str(buf, cur);
-    let vtype = read_u32(buf, cur);
+    let key = read_gguf_str(buf, cur)?;
+    let vtype = read_u32(buf, cur)?;
     let value = read_meta_value(buf, cur, vtype)?;
     Ok((key, value))
 }
 
 fn read_meta_value(buf: &[u8], cur: &mut usize, vtype: u32) -> Result<MetaValue, LoadError> {
     Ok(match vtype {
-        0 => MetaValue::U8(read_u8(buf, cur)),
-        1 => MetaValue::I8(read_u8(buf, cur) as i8),
-        2 => MetaValue::U16(read_u16(buf, cur)),
-        3 => MetaValue::I16(read_u16(buf, cur) as i16),
-        4 => MetaValue::U32(read_u32(buf, cur)),
-        5 => MetaValue::I32(read_u32(buf, cur) as i32),
-        6 => MetaValue::F32(read_f32(buf, cur)),
-        7 => MetaValue::Bool(read_u8(buf, cur) != 0),
-        8 => MetaValue::Str(read_gguf_str(buf, cur)),
+        0 => MetaValue::U8(read_u8(buf, cur)?),
+        1 => MetaValue::I8(read_u8(buf, cur)? as i8),
+        2 => MetaValue::U16(read_u16(buf, cur)?),
+        3 => MetaValue::I16(read_u16(buf, cur)? as i16),
+        4 => MetaValue::U32(read_u32(buf, cur)?),
+        5 => MetaValue::I32(read_u32(buf, cur)? as i32),
+        6 => MetaValue::F32(read_f32(buf, cur)?),
+        7 => MetaValue::Bool(read_u8(buf, cur)? != 0),
+        8 => MetaValue::Str(read_gguf_str(buf, cur)?),
         9 => {
-            let elem_type = read_u32(buf, cur);
-            let count = read_u64(buf, cur) as usize;
+            let elem_type = read_u32(buf, cur)?;
+            let count = read_u64(buf, cur)? as usize;
             let mut arr = Vec::with_capacity(count);
             for _ in 0..count {
                 arr.push(read_meta_value(buf, cur, elem_type)?);
             }
             MetaValue::Array(arr)
         }
-        10 => MetaValue::U64(read_u64(buf, cur)),
-        11 => MetaValue::I64(read_u64(buf, cur) as i64),
-        12 => MetaValue::F64(
-            f64::from_le_bytes(buf[*cur..*cur + 8].try_into().unwrap()).also(|_| *cur += 8),
-        ),
+        10 => MetaValue::U64(read_u64(buf, cur)?),
+        11 => MetaValue::I64(read_u64(buf, cur)? as i64),
+        12 => MetaValue::F64(read_f64(buf, cur)?),
         t => return Err(LoadError::MalformedKey(format!("unknown value type {t}"))),
     })
 }
 
 fn read_tensor_info(buf: &[u8], cur: &mut usize) -> Result<(String, TensorRecord), LoadError> {
-    let name = read_gguf_str(buf, cur);
-    let ndim = read_u32(buf, cur) as usize;
+    let name = read_gguf_str(buf, cur)?;
+    let ndim = read_u32(buf, cur)? as usize;
     let mut ne = [1u32; 4];
     for elem in ne.iter_mut().take(ndim) {
-        *elem = read_u64(buf, cur) as u32;
+        *elem = read_u64(buf, cur)? as u32;
     }
-    let type_id = read_u32(buf, cur);
-    let offset = read_u64(buf, cur);
+    let type_id = read_u32(buf, cur)?;
+    let offset = read_u64(buf, cur)?;
     let kind = gguf_type(type_id)?;
     Ok((name, TensorRecord { offset, ne, kind }))
 }

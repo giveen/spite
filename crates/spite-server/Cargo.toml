@@ -39,5 +39,5 @@ thiserror      = { workspace = true }
 
 [dev-dependencies]
 spite-testkit = { workspace = true }
-reqwest       = { version = "0.12", features = ["json"] }
+reqwest       = { workspace = true }
 tokio         = { workspace = true }

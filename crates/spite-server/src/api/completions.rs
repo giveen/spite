@@ -57,7 +57,7 @@ pub async fn create_completion(
 ) -> Json<CompletionResponse> {
     let created = super::chat::unix_now();
 
-    let mut exec = state.executor.lock().unwrap();
+    let mut exec = state.executor.lock().unwrap_or_else(|e| e.into_inner());
     let ids = match state.tokenizer.encode(&req.prompt, true) {
         Ok(ids) => ids,
         Err(e) => {

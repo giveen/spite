@@ -128,8 +128,13 @@ impl PagedSeqCache {
 
     /// Ensure the next token position is covered; allocate a new block if needed.
     pub fn prepare_next(&mut self, pool: &mut BlockPool) -> Result<(), CacheError> {
-        let need_new_block = self.block_table.is_empty()
-            || pool.blocks[*self.block_table.last().unwrap()].is_full(pool.block_size);
+        let need_new_block = match self.block_table.last() {
+            None => true,
+            Some(&id) => pool
+                .blocks
+                .get(id)
+                .is_none_or(|b| b.is_full(pool.block_size)),
+        };
         if need_new_block {
             let id = pool.alloc()?;
             pool.blocks[id].ref_count += 1;

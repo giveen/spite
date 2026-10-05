@@ -204,7 +204,7 @@ pub fn greedy(logits: &[f32]) -> Result<u32, SamplingError> {
     logits
         .iter()
         .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .map(|(i, _)| i as u32)
         .ok_or(SamplingError::EmptyLogits)
 }
