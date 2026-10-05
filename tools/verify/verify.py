@@ -563,8 +563,8 @@ def main():
     test_info = check_abi(test_lib, "under-test")
 
     cuda = CudaHelper()
-    gpu_arch = test_info.gpu_arch or b""
-    is_cuda = b"sm_" in gpu_arch
+    gpu_arch = (test_info.gpu_arch or b"").lower()
+    is_cuda = b"sm_" in gpu_arch or b"cuda" in gpu_arch or b"nvidia" in gpu_arch
 
     print("\n── Op correctness ─────────────────────────────────────────────────")
     passed = True

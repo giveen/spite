@@ -7,12 +7,14 @@
 //! # Model-specific resolution order
 //!
 //! ```text
-//! kernels/<family>/<model>/<arch>/<card>/<quant>/   ← most specific
-//! kernels/<family>/<model>/<arch>/<card>/
-//! kernels/<family>/<model>/<arch>/<quant>/
-//! kernels/<family>/<model>/<arch>/                  ← arch baseline
-//! kernels/generic/<arch>/
-//! kernels/generic/generic/                          ← always present
+//! kernels/<family>/<model>/<company>/<arch>/<card>/<quant>/   ← most specific
+//! kernels/<family>/<model>/<company>/<arch>/<card>/
+//! kernels/<family>/<model>/<company>/<arch>/<quant>/
+//! kernels/<family>/<model>/<company>/<arch>/                  ← arch baseline
+//! kernels/<family>/<model>/<company>/                         ← vendor/company generic baseline
+//! kernels/generic/generic_cuda/                               ← vendor generic
+//! kernels/generic/<company>/<arch>/
+//! kernels/generic/generic/                                    ← always present
 //! ```
 //!
 //! # Engine-level resolution order (cross-model features)
@@ -35,11 +37,12 @@ use std::path::{Path, PathBuf};
 
 /// Determine the company/vendor directory name corresponding to a GPU arch.
 pub fn company_from_arch(gpu_arch: &str) -> &'static str {
-    if gpu_arch.starts_with("sm_") {
+    if gpu_arch.starts_with("sm_") || gpu_arch == "cuda" || gpu_arch == "nvidia" {
         "nvidia"
     } else if gpu_arch.starts_with("rdna")
         || gpu_arch.starts_with("cdna")
         || gpu_arch == "strix_halo"
+        || gpu_arch == "rocm"
     {
         "amd"
     } else if gpu_arch.starts_with("arc_") {
@@ -145,7 +148,10 @@ impl KernelSpec {
             }
         }
 
-        // 2. Legacy hierarchy fallback: kernels/<family>/<model>/<arch>/...
+        // 2. Company-level model generic fallback: kernels/<family>/<model>/<company>/
+        paths.push(model_dir.join(company));
+
+        // 3. Legacy hierarchy fallback: kernels/<family>/<model>/<arch>/...
         if has_card && has_quant {
             paths.push(legacy_arch_base.join(&self.card_id).join(&self.quant));
         }
@@ -157,10 +163,14 @@ impl KernelSpec {
         }
         paths.push(legacy_arch_base);
 
-        // 3. Vendor-generic fallbacks (no model knowledge, but right vendor backend)
-        if self.gpu_arch.starts_with("sm_") {
+        // 4. Vendor-generic fallbacks (no model knowledge, but right vendor backend)
+        if self.gpu_arch.starts_with("sm_") || self.gpu_arch == "cuda" || self.gpu_arch == "nvidia"
+        {
             paths.push(kernels_dir.join("generic").join("generic_cuda"));
-        } else if self.gpu_arch.starts_with("rdna") || self.gpu_arch.starts_with("cdna") {
+        } else if self.gpu_arch.starts_with("rdna")
+            || self.gpu_arch.starts_with("cdna")
+            || self.gpu_arch == "rocm"
+        {
             paths.push(kernels_dir.join("generic").join("generic_rocm"));
         }
 
@@ -375,14 +385,15 @@ mod tests {
         assert_eq!(c[1], PathBuf::from("/k/llama/llama4/nvidia/sm_89/rtx_4090"));
         assert_eq!(c[2], PathBuf::from("/k/llama/llama4/nvidia/sm_89/Q4_K_M"));
         assert_eq!(c[3], PathBuf::from("/k/llama/llama4/nvidia/sm_89"));
-        assert_eq!(c[4], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090/Q4_K_M"));
-        assert_eq!(c[5], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090"));
-        assert_eq!(c[6], PathBuf::from("/k/llama/llama4/sm_89/Q4_K_M"));
-        assert_eq!(c[7], PathBuf::from("/k/llama/llama4/sm_89"));
-        assert_eq!(c[8], PathBuf::from("/k/generic/generic_cuda"));
-        assert_eq!(c[9], PathBuf::from("/k/generic/nvidia/sm_89"));
-        assert_eq!(c[10], PathBuf::from("/k/generic/sm_89"));
-        assert_eq!(c[11], PathBuf::from("/k/generic/generic"));
+        assert_eq!(c[4], PathBuf::from("/k/llama/llama4/nvidia"));
+        assert_eq!(c[5], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090/Q4_K_M"));
+        assert_eq!(c[6], PathBuf::from("/k/llama/llama4/sm_89/rtx_4090"));
+        assert_eq!(c[7], PathBuf::from("/k/llama/llama4/sm_89/Q4_K_M"));
+        assert_eq!(c[8], PathBuf::from("/k/llama/llama4/sm_89"));
+        assert_eq!(c[9], PathBuf::from("/k/generic/generic_cuda"));
+        assert_eq!(c[10], PathBuf::from("/k/generic/nvidia/sm_89"));
+        assert_eq!(c[11], PathBuf::from("/k/generic/sm_89"));
+        assert_eq!(c[12], PathBuf::from("/k/generic/generic"));
     }
 
     #[test]
@@ -390,11 +401,12 @@ mod tests {
         let root = PathBuf::from("/k");
         let c = spec_arch_only().model_candidates(&root);
         assert_eq!(c[0], PathBuf::from("/k/deepseek/v4/nvidia/sm_89"));
-        assert_eq!(c[1], PathBuf::from("/k/deepseek/v4/sm_89"));
-        assert_eq!(c[2], PathBuf::from("/k/generic/generic_cuda"));
-        assert_eq!(c[3], PathBuf::from("/k/generic/nvidia/sm_89"));
-        assert_eq!(c[4], PathBuf::from("/k/generic/sm_89"));
-        assert_eq!(c[5], PathBuf::from("/k/generic/generic"));
+        assert_eq!(c[1], PathBuf::from("/k/deepseek/v4/nvidia"));
+        assert_eq!(c[2], PathBuf::from("/k/deepseek/v4/sm_89"));
+        assert_eq!(c[3], PathBuf::from("/k/generic/generic_cuda"));
+        assert_eq!(c[4], PathBuf::from("/k/generic/nvidia/sm_89"));
+        assert_eq!(c[5], PathBuf::from("/k/generic/sm_89"));
+        assert_eq!(c[6], PathBuf::from("/k/generic/generic"));
     }
 
     #[test]

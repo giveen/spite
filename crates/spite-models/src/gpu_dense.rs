@@ -98,7 +98,9 @@ impl GpuDense {
     /// Resolve a dispatch table whose rms_norm/attention/ffn/matmul all come
     /// from a CUDA (`sm_*`) kernel. `None` when CUDA or the kernel is absent.
     pub fn resolve_table(arch: &str, gpu_arch: &str, kernels_dir: &Path) -> Option<DispatchTable> {
-        if !gpu_arch.starts_with("sm_") || GpuBackend::detect() != GpuBackend::Cuda {
+        if (!gpu_arch.starts_with("sm_") && gpu_arch != "cuda" && gpu_arch != "nvidia")
+            || GpuBackend::detect() != GpuBackend::Cuda
+        {
             return None;
         }
         let mut spec = KernelSpec::from_arch(arch, gpu_arch);
@@ -106,7 +108,9 @@ impl GpuDense {
             spec.card_id = spite_dispatch::detect_card_id("");
         }
         let table = DispatchBuilder::new(kernels_dir, spec).build().ok()?;
-        let on_gpu = |src: &spite_dispatch::OpSource| src.gpu_arch.starts_with("sm_");
+        let on_gpu = |src: &spite_dispatch::OpSource| {
+            src.gpu_arch.starts_with("sm_") || src.gpu_arch == "cuda" || src.gpu_arch == "nvidia"
+        };
         let ok = table.rms_norm.0.is_some()
             && table.attention.0.is_some()
             && table.ffn.0.is_some()

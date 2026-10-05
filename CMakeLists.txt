@@ -83,6 +83,9 @@ function(spite_resolve_gpu_target _in _out_company _out_arch _out_card)
     elseif(_l MATCHES "^arc_")
         set(${_out_company} "intel" PARENT_SCOPE)
         set(${_out_arch} "${_l}" PARENT_SCOPE)
+    elseif(_l STREQUAL "cuda" OR _l STREQUAL "nvidia")
+        set(${_out_company} "nvidia" PARENT_SCOPE)
+        set(${_out_arch} "cuda" PARENT_SCOPE)
         set(${_out_card} "" PARENT_SCOPE)
     elseif(_l STREQUAL "metal")
         set(${_out_company} "apple" PARENT_SCOPE)
@@ -106,6 +109,8 @@ foreach(_a ${_archs})
     spite_resolve_gpu_target("${_a}" _comp _arch _card)
     if(_arch MATCHES "^sm_([0-9]+)$")
         list(APPEND _cuda_archs ${CMAKE_MATCH_1})
+    elseif(_arch STREQUAL "cuda" OR _arch STREQUAL "sm_all")
+        list(APPEND _cuda_archs "75" "80" "86" "89" "90" "120")
     endif()
 endforeach()
 if(_cuda_archs)
@@ -155,6 +160,7 @@ foreach(_spec ${_model_specs})
         endif()
         list(APPEND _search_dirs
             "${CMAKE_SOURCE_DIR}/kernels/${_family}/${_model}/${_company}/${_arch}"
+            "${CMAKE_SOURCE_DIR}/kernels/${_family}/${_model}/${_company}"
             "${CMAKE_SOURCE_DIR}/kernels/${_family}/${_model}/${_arch}"
         )
         list(REMOVE_DUPLICATES _search_dirs)
@@ -195,7 +201,7 @@ foreach(_spec ${_model_specs})
 
             # CUDA kernels share the host's libcudart (dlopen'd by spite-gpu) so
             # device pointers and the primary context are one runtime instance.
-            if(_arch MATCHES "^sm_")
+            if(_arch MATCHES "^sm_" OR _arch STREQUAL "cuda" OR _company STREQUAL "nvidia")
                 find_package(CUDAToolkit REQUIRED)
                 set_target_properties(${_target} PROPERTIES
                     CUDA_RUNTIME_LIBRARY Shared

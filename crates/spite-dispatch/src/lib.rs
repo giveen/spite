@@ -4,12 +4,14 @@
 //! and builds a `DispatchTable` by walking two priority chains:
 //!
 //! **Model ops** (rms_norm, attention, ffn, layer) use `resolve::model_candidates`:
-//!   kernels/<family>/<model>/<arch>/<card>/<quant>/   ← card + quant specialist
-//!   kernels/<family>/<model>/<arch>/<card>/           ← card specialist
-//!   kernels/<family>/<model>/<arch>/<quant>/          ← quant specialist
-//!   kernels/<family>/<model>/<arch>/                  ← arch baseline
-//!   kernels/generic/<arch>/
-//!   kernels/generic/generic/                          ← always present
+//!   kernels/<family>/<model>/<company>/<arch>/<card>/<quant>/   ← card + quant specialist
+//!   kernels/<family>/<model>/<company>/<arch>/<card>/           ← card specialist
+//!   kernels/<family>/<model>/<company>/<arch>/<quant>/          ← quant specialist
+//!   kernels/<family>/<model>/<company>/<arch>/                  ← arch baseline
+//!   kernels/<family>/<model>/<company>/                         ← vendor generic baseline
+//!   kernels/generic/generic_cuda/                               ← vendor generic
+//!   kernels/generic/<company>/<arch>/
+//!   kernels/generic/generic/                                    ← always present
 //!
 //! **Engine ops** (speculative, prefill, kv_quant) use `resolve::engine_candidates`:
 //!   kernels/_engine/<feature>/<arch>/<card>/          ← card specialist
