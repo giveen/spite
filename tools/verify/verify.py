@@ -18,6 +18,7 @@ Exit code 0 = all checks passed.
 import argparse
 import ctypes
 import os
+import struct
 import sys
 import random
 import math
@@ -86,6 +87,7 @@ class SpiteKernelInfo(ctypes.Structure):
         ("speculative_verify", ctypes.c_void_p),
         ("prefill",            ctypes.c_void_p),
         ("matmul",             ctypes.c_void_p),
+        ("kv_cache_kinds",     ctypes.c_void_p),  # trailing optional ABI slot (v4)
     ]
 
 # ── Function Signatures ───────────────────────────────────────────────────
@@ -175,6 +177,67 @@ def make_ctx() -> SpiteCtx:
     ctx.n_batch   = 1
     ctx.n_threads = 1
     return ctx
+
+
+KV_BLOCK_BYTES = {
+    SPITE_TYPE_F32: 4, SPITE_TYPE_F16: 2, SPITE_TYPE_BF16: 2,
+    SPITE_TYPE_Q8_0: 34, SPITE_TYPE_Q5_1: 24, SPITE_TYPE_Q4_0: 18,
+}
+KV_BLOCK_ELEMS = {SPITE_TYPE_Q8_0: 32, SPITE_TYPE_Q5_1: 32, SPITE_TYPE_Q4_0: 32}
+KV_TIER_NAMES = {SPITE_TYPE_F32: "F32", SPITE_TYPE_F16: "F16", SPITE_TYPE_Q8_0: "Q8_0",
+                 SPITE_TYPE_Q5_1: "Q5_1", SPITE_TYPE_Q4_0: "Q4_0"}
+
+
+def kv_row_bytes(kind: int, n_elem: int) -> int:
+    """Bytes per KV row; mirrors kvq_row_bytes() in kv_attn.inl."""
+    if kind in (SPITE_TYPE_F32, SPITE_TYPE_BF16):
+        return n_elem * KV_BLOCK_BYTES[kind]
+    if kind == SPITE_TYPE_F16:
+        return n_elem * 2
+    return ((n_elem + 31) // 32) * KV_BLOCK_BYTES[kind]
+
+
+def kv_tier_blob(kind: int, rows: int, n_elem: int, rng: random.Random) -> bytes:
+    """A KV cache image of `rows` rows at `kind`, in the project's block layout.
+
+    The block fields are filled with ordinary magnitudes so both sides compute
+    on finite inputs; any byte pattern would do for a differential comparison,
+    but a NaN scale would fail the tolerance for a reason that is not a bug.
+    """
+    if kind == SPITE_TYPE_F32:
+        return struct.pack(f"<{rows * n_elem}f", *[rng.gauss(0, 1.0) for _ in range(rows * n_elem)])
+    if kind == SPITE_TYPE_F16:
+        return struct.pack(f"<{rows * n_elem}e", *[rng.gauss(0, 1.0) for _ in range(rows * n_elem)])
+    blocks = (n_elem + 31) // 32
+    out = bytearray()
+    for _ in range(rows * blocks):
+        if kind == SPITE_TYPE_Q8_0:
+            out += struct.pack("<e", rng.uniform(0.005, 0.05))
+            out += bytes(rng.randrange(256) for _ in range(32))
+        elif kind == SPITE_TYPE_Q5_1:
+            out += struct.pack("<e", rng.uniform(0.001, 0.02))
+            out += struct.pack("<e", rng.uniform(-0.3, 0.3))
+            out += struct.pack("<I", rng.getrandbits(32))
+            out += bytes(rng.randrange(256) for _ in range(16))
+        else:
+            out += struct.pack("<e", rng.uniform(0.005, 0.05))
+            out += bytes(rng.randrange(256) for _ in range(16))
+    assert len(out) == rows * kv_row_bytes(kind, n_elem)
+    return bytes(out)
+
+
+def looks_cuda(info: SpiteKernelInfo) -> bool:
+    """Same heuristic main() uses to pick the device path for the test kernel."""
+    arch = (info.gpu_arch or b"").lower()
+    return b"sm_" in arch or b"cuda" in arch or b"nvidia" in arch
+
+
+def declared_kv_tiers(info: SpiteKernelInfo) -> int:
+    """KV tiers the kernel's attention op accepts (NULL slot = F32 only)."""
+    if not info.kv_cache_kinds:
+        return 1 << SPITE_TYPE_F32
+    fn = ctypes.CFUNCTYPE(ctypes.c_uint64)(info.kv_cache_kinds)
+    return fn()
 
 
 def max_abs_diff(a: list[float], b: list[float]) -> float:
@@ -522,7 +585,8 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
                      d_model: int = 64, head_dim: int = 16,
                      n_heads: int = 4, n_kv_heads: int = 2,
                      n_ctx: int = 8, pos: int = 3,
-                     use_qk_norm: bool = True) -> bool:
+                     use_qk_norm: bool = True,
+                     kv_kind: int = SPITE_TYPE_F32) -> bool:
     """One decode token at `pos` against a pre-populated KV cache.
 
     Exercises the whole op: Q/K/V projections, optional per-head QK RMSNorm,
@@ -530,9 +594,15 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
     over rows [0, pos], and the fused `out += Wo*att` residual.
 
     The reference is the scalar C kernel in kernels/generic/generic/ops.c.
-    KV is F32 on both sides: that is the tier the generic kernel declares
-    (kv_cache_kinds left NULL), and F32 is the highest-fidelity path each GPU
-    kernel offers, so this pins the maths rather than the block codec.
+    With kv_kind=F32 (the default) that is the tier the generic kernel declares
+    (kv_cache_kinds left NULL) and the highest-fidelity path each GPU kernel
+    offers, so the case pins the maths rather than the block codec.
+
+    kv_kind selects a VBR cache tier instead.  The generic reference is F32-KV
+    only, so a quantized tier needs a tier-capable --ref; both sides then read
+    the same cache bytes, which makes the case a differential check of the
+    kernel's block decoders (q8_0/q5_1/q4_0/f16) rather than a comparison
+    against an independent implementation.
 
     The GPU kernels dispatch on shape: a small head_dim / short context takes
     the portable VBR back end, a supported head_dim with room for the split-K
@@ -540,13 +610,19 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
     the tiled loop and the multi-chunk combine.  Call it once per path.
     """
     tag = "" if use_qk_norm else " (no QK norm)"
+    tier = KV_TIER_NAMES.get(kv_kind, str(kv_kind))
     print(f"\n  [attention] d_model={d_model} heads={n_heads} kv_heads={n_kv_heads} "
-          f"head_dim={head_dim} ctx={n_ctx} pos={pos}{tag}")
+          f"head_dim={head_dim} ctx={n_ctx} pos={pos} kv={tier}{tag}")
     if not test_info.attention:
         print("    SKIP: test kernel has no attention")
         return True
     if not ref_info.attention:
         print("    SKIP: reference kernel has no attention")
+        return True
+    if kv_kind != SPITE_TYPE_F32 and not (declared_kv_tiers(ref_info) & (1 << kv_kind)):
+        print(f"    SKIP: reference kernel does not accept {tier} KV (the generic C "
+              f"reference is F32-only; pass --ref <kernel.so> to make this a "
+              f"differential check of the block decoder)")
         return True
 
     kv_stride = n_kv_heads * head_dim
@@ -564,9 +640,10 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
     qn_data  = [rng.uniform(0.5, 1.5) for _ in range(head_dim)]
     kn_data  = [rng.uniform(0.5, 1.5) for _ in range(head_dim)]
     out_init = [rng.gauss(0, 0.1) for _ in range(d_model)]
-    # Rows [0, pos) are given; both sides write row `pos` themselves.
-    k_init = [rng.gauss(0, 1.0) for _ in range(n_ctx * kv_stride)]
-    v_init = [rng.gauss(0, 1.0) for _ in range(n_ctx * kv_stride)]
+    # Rows [0, pos) are given; both sides write row `pos` themselves.  In the
+    # cache's own tier, so a quantized case feeds both sides the same bytes.
+    kv_blob = kv_tier_blob(kv_kind, n_ctx, kv_stride, random.Random(7))
+    kv_nbytes = len(kv_blob)
 
     def fresh_out():
         arr = (ctypes.c_float * d_model)(*out_init)
@@ -575,10 +652,10 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
         return t, arr
 
     def fresh_kv():
-        ka = (ctypes.c_float * (n_ctx * kv_stride))(*k_init)
-        va = (ctypes.c_float * (n_ctx * kv_stride))(*v_init)
-        tk, _ = make_tensor([0.0] * (n_ctx * kv_stride), [kv_stride, n_ctx, 1, 1])
-        tv, _ = make_tensor([0.0] * (n_ctx * kv_stride), [kv_stride, n_ctx, 1, 1])
+        ka = ctypes.create_string_buffer(kv_blob)
+        va = ctypes.create_string_buffer(kv_blob)
+        tk, _ = make_tensor([0.0] * (n_ctx * kv_stride), [kv_stride, n_ctx, 1, 1], kind=kv_kind)
+        tv, _ = make_tensor([0.0] * (n_ctx * kv_stride), [kv_stride, n_ctx, 1, 1], kind=kv_kind)
         tk.data = ctypes.cast(ka, ctypes.c_void_p)
         tv.data = ctypes.cast(va, ctypes.c_void_p)
         kv = SpiteKvCache()
@@ -603,17 +680,25 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
     p_qn = ctypes.byref(tqn) if use_qk_norm else None
     p_kn = ctypes.byref(tkn) if use_qk_norm else None
 
-    # ── reference (scalar C, host memory) ──
+    # ── reference ──
+    # A host reference (the scalar C kernel) runs in host memory; a CUDA
+    # reference is a differential oracle and runs on the device tensors built
+    # below, so `--ref <gpu kernel.so>` compares two GPU implementations.
     to_ref, out_ref_arr = fresh_out()
-    kv_ref, _, _ = fresh_kv()
     ref_fn = AttentionFn(ref_info.attention)
-    ret_ref = ref_fn(ctypes.byref(to_ref), ctypes.byref(tx), ctypes.byref(twq),
-                     ctypes.byref(twk), ctypes.byref(twv), ctypes.byref(two),
-                     p_qn, p_kn, eps, ctypes.byref(kv_ref), rope_base,
-                     ctypes.byref(make_ctx_for(pos)))
-    if ret_ref != 0:
-        print(f"    FAIL: reference attention returned {ret_ref}")
-        return False
+    ref_is_cuda = looks_cuda(ref_info)
+    if not ref_is_cuda:
+        kv_ref, _, _ = fresh_kv()
+        ret_ref = ref_fn(ctypes.byref(to_ref), ctypes.byref(tx), ctypes.byref(twq),
+                         ctypes.byref(twk), ctypes.byref(twv), ctypes.byref(two),
+                         p_qn, p_kn, eps, ctypes.byref(kv_ref), rope_base,
+                         ctypes.byref(make_ctx_for(pos)))
+        if ret_ref != 0:
+            print(f"    FAIL: reference attention returned {ret_ref}")
+            return False
+    elif not is_cuda:
+        print("    SKIP: reference is a CUDA kernel but the under-test kernel is not")
+        return True
 
     test_fn = AttentionFn(test_info.attention)
     if not is_cuda:
@@ -631,9 +716,8 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
         if not cuda.available:
             print("    SKIP: CUDA runtime not available")
             return True
-        n_kv_elems = n_ctx * kv_stride
-        # Sizing mirror of kvattn_run's requirement, so a too-small scratchpad
-        # shows up here as -2 rather than as a silent pass.
+        # Sizing mirror of kvattn_prologue's requirement, so a too-small
+        # scratchpad shows up here as -2 rather than as a silent pass.
         scratch_sz = 4 * (nh_hd * 2 + kv_stride * 2 + n_heads * n_ctx)
         d_x  = cuda.malloc(d_model * 4)
         d_wq = cuda.malloc(len(wq_data) * 4)
@@ -643,8 +727,8 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
         d_qn = cuda.malloc(head_dim * 4) if use_qk_norm else None
         d_kn = cuda.malloc(head_dim * 4) if use_qk_norm else None
         d_o  = cuda.malloc(d_model * 4)
-        d_k  = cuda.malloc(n_kv_elems * 4)
-        d_v  = cuda.malloc(n_kv_elems * 4)
+        d_k  = cuda.malloc(kv_nbytes)
+        d_v  = cuda.malloc(kv_nbytes)
         d_scratch = cuda.malloc(scratch_sz)
         try:
             cuda.h2d(d_x, (ctypes.c_float * d_model)(*x_data), d_model * 4)
@@ -656,8 +740,8 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
                 cuda.h2d(d_qn, (ctypes.c_float * head_dim)(*qn_data), head_dim * 4)
                 cuda.h2d(d_kn, (ctypes.c_float * head_dim)(*kn_data), head_dim * 4)
             cuda.h2d(d_o, (ctypes.c_float * d_model)(*out_init), d_model * 4)
-            cuda.h2d(d_k, (ctypes.c_float * n_kv_elems)(*k_init), n_kv_elems * 4)
-            cuda.h2d(d_v, (ctypes.c_float * n_kv_elems)(*v_init), n_kv_elems * 4)
+            cuda.h2d(d_k, (ctypes.c_ubyte * kv_nbytes)(*kv_blob), kv_nbytes)
+            cuda.h2d(d_v, (ctypes.c_ubyte * kv_nbytes)(*kv_blob), kv_nbytes)
 
             g_x, _  = make_tensor([0.0] * d_model, [d_model, 1, 1, 1])
             g_wq, _ = make_tensor([0.0] * len(wq_data), [d_model, nh_hd, 1, 1])
@@ -667,8 +751,8 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
             g_qn, _ = make_tensor([0.0] * head_dim, [head_dim, 1, 1, 1])
             g_kn, _ = make_tensor([0.0] * head_dim, [head_dim, 1, 1, 1])
             g_o, _  = make_tensor([0.0] * d_model, [d_model, 1, 1, 1])
-            g_k, _  = make_tensor([0.0] * n_kv_elems, [kv_stride, n_ctx, 1, 1])
-            g_v, _  = make_tensor([0.0] * n_kv_elems, [kv_stride, n_ctx, 1, 1])
+            g_k, _  = make_tensor([0.0] * (n_ctx * kv_stride), [kv_stride, n_ctx, 1, 1], kind=kv_kind)
+            g_v, _  = make_tensor([0.0] * (n_ctx * kv_stride), [kv_stride, n_ctx, 1, 1], kind=kv_kind)
             g_x.data, g_wq.data, g_wk.data, g_wv.data = d_x, d_wq, d_wk, d_wv
             g_wo.data, g_o.data, g_k.data, g_v.data = d_wo, d_o, d_k, d_v
             if use_qk_norm:
@@ -679,6 +763,21 @@ def verify_attention(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
             ctx_gpu = make_ctx_for(pos)
             ctx_gpu.scratchpad = d_scratch
             ctx_gpu.scratchpad_bytes = scratch_sz
+
+            if ref_is_cuda:
+                ret_ref = ref_fn(ctypes.byref(g_o), ctypes.byref(g_x), ctypes.byref(g_wq),
+                                 ctypes.byref(g_wk), ctypes.byref(g_wv), ctypes.byref(g_wo),
+                                 ctypes.byref(g_qn) if use_qk_norm else None,
+                                 ctypes.byref(g_kn) if use_qk_norm else None,
+                                 eps, ctypes.byref(g_kv), rope_base, ctypes.byref(ctx_gpu))
+                cuda.sync()
+                if ret_ref != 0:
+                    print(f"    FAIL: reference attention returned {ret_ref}")
+                    return False
+                cuda.d2h(out_ref_arr, d_o, d_model * 4)
+                # both sides accumulate into `out`, so restore its input, and
+                # the KV row `pos` they rewrite holds the same values either way
+                cuda.h2d(d_o, (ctypes.c_float * d_model)(*out_init), d_model * 4)
 
             ret_test = test_fn(ctypes.byref(g_o), ctypes.byref(g_x), ctypes.byref(g_wq),
                                ctypes.byref(g_wk), ctypes.byref(g_wv), ctypes.byref(g_wo),
@@ -778,6 +877,21 @@ def main():
                                use_qk_norm=True)
     passed &= verify_attention(ref_info, test_info, cuda, is_cuda, head_dim=64, n_ctx=320, pos=140,
                                use_qk_norm=True)
+
+    # VBR cache tiers.  The generic C reference declares F32-only KV, so with the
+    # default reference these report SKIP; pass --ref <tier-capable kernel.so>
+    # (e.g. a GPU .so from before the change) and they become a differential
+    # check that both kernels decode identical cache bytes identically — the
+    # shipped reference cannot check the block codecs by construction.
+    if declared_kv_tiers(ref_info) & ((1 << SPITE_TYPE_F16) | (1 << SPITE_TYPE_Q8_0) |
+                                      (1 << SPITE_TYPE_Q5_1) | (1 << SPITE_TYPE_Q4_0)):
+        for tier in (SPITE_TYPE_F16, SPITE_TYPE_Q8_0, SPITE_TYPE_Q5_1, SPITE_TYPE_Q4_0):
+            passed &= verify_attention(ref_info, test_info, cuda, is_cuda, head_dim=64, n_ctx=160,
+                                       pos=140, use_qk_norm=True, kv_kind=tier)
+    else:
+        print("\n  [attention] VBR tiers f16/q8_0/q5_1/q4_0 (block decoders): SKIP — the "
+              "reference\n              kernel declares F32-only KV; pass a tier-capable .so "
+              "as --ref to check them")
 
     print("\n── Result ─────────────────────────────────────────────────────────")
     if passed:
