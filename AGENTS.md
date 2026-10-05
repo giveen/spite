@@ -35,11 +35,12 @@ Before writing any code, answer this question about the improvement:
 |---|---|
 | Every model on every GPU (algorithmic improvement, correctness fix) | `kernels/generic/generic/` |
 | One GPU architecture across all models | `kernels/generic/<company>/<arch>/` |
+| One model variant across all GPUs of a vendor (guiding principle) | `kernels/<family>/<model>/<company>/` |
 | One model variant on one GPU architecture | `kernels/<family>/<model>/<company>/<arch>/` |
 | One specific card variant (tile sizes, cache layout, ISA quirk) | `kernels/<family>/<model>/<company>/<arch>/<card>/` (narrowest sub-path) |
 | Rust host / ABI / scheduling / sampling | `crates/spite-<name>/src/` |
 
-**Place code at the scope of its benefit.** A tile-size tweak that only helps the RTX 3060 does not belong in the generic sm\_86 directory — it belongs in `nvidia/sm_86/rtx_3060/` with a comment explaining the card constraint. A math fix that applies to all models belongs in `kernels/generic/generic/` so every GPU gets the improvement automatically.
+**Place code at the scope of its benefit.** A tile-size tweak that only helps the RTX 3060 does not belong in the generic sm\_86 directory — it belongs in `nvidia/sm_86/rtx_3060/` with a comment explaining the card constraint. A generic CUDA kernel that works across all NVIDIA GPUs for Qwen3 belongs at `kernels/qwen/qwen3/nvidia/` as the vendor-wide baseline. A math fix that applies to all models belongs in `kernels/generic/generic/` so every GPU gets the improvement automatically.
 
 ---
 

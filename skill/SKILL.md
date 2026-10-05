@@ -74,9 +74,10 @@ Any violation of these triggers must be **rejected**:
   - *Rule*: Code must live at the exact scope of its benefit:
     - `kernels/generic/generic/`: algorithmic improvement benefiting all GPUs & CPU fallback.
     - `kernels/generic/<company>/<arch>/`: arch-wide optimizations across models (e.g. `nvidia/sm_89/`).
+    - `kernels/<family>/<model>/<company>/`: generic model baseline across all GPUs of a vendor (guiding principle, e.g. `qwen/qwen3/nvidia/`).
     - `kernels/<family>/<model>/<company>/<arch>/`: model variant on an architecture.
     - `kernels/<family>/<model>/<company>/<arch>/<card>/`: specific card tuning (e.g. `qwen/qwen3/nvidia/sm_120/rtx_5090/`).
-  - *Why*: Prevents architecture directories from being polluted with card-specific tile constraints.
+  - *Why*: Prevents architecture directories from being polluted with card-specific tile constraints and ensures vendor-wide baselines are placed at the tree root.
   - *Severity*: **REQUEST CHANGES**
 
 - **Trigger: Unpinned or Split Rust Dependencies**
