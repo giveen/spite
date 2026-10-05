@@ -247,6 +247,15 @@ pub type LayerFn = unsafe extern "C" fn(
     ctx: *const SpiteCtx,
 ) -> c_int;
 
+/// Optional: bitmask over [`SpiteType`] values (bit `ty as u32`) of the KV-cache
+/// tiers this kernel's attention op can read and write.
+///
+/// `None` means the kernel predates VBR and is taken to accept F32 KV only -
+/// the conservative reading. The host clamps the VBR start tier and degrade
+/// ladder to this set so a kernel supporting fewer tiers still runs instead of
+/// failing the attention op.
+pub type KvCacheKindsFn = unsafe extern "C" fn() -> u64;
+
 /// Verify N draft tokens against main-model logits.
 /// Returns accept mask; first rejection zeroes all subsequent positions.
 /// Returning -1 falls back to the generic scalar implementation.
@@ -320,6 +329,9 @@ pub struct SpiteKernelInfo {
     pub prefill: Option<LayerFn>,
     /// Dense projection (LM head). Added in ABI v4.
     pub matmul: Option<MatmulFn>,
+    /// KV-cache tiers the attention op accepts. `None` = F32 only.
+    /// Added after ABI v4 as a trailing optional slot (no version bump).
+    pub kv_cache_kinds: Option<KvCacheKindsFn>,
 }
 
 unsafe impl Send for SpiteKernelInfo {}

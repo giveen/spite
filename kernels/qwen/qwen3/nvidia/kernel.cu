@@ -172,52 +172,9 @@ __global__ void rms_norm_rows(float* __restrict__ out, const float* __restrict__
 
 // ── Attention pieces ─────────────────────────────────────────────────────
 
-/*
- * One block per head (blockDim = head_dim/2 rounded up to a warp multiple).
- * Optional per-head RMSNorm, then NEOX RoPE (pairs (i, i+hd/2)).
- * Writes the result to dst + head*hd (dst may be the KV-cache row).
- */
-/* dst may alias src (in-place Q); no __restrict__ on those two. */
-__global__ void qk_norm_rope(float* dst, const float* src, const void* __restrict__ nw, int nkind, float eps, int hd, int pos,
-                             float theta) {
-    const float* s = src + static_cast<size_t>(blockIdx.x) * hd;
-    float* d = dst + static_cast<size_t>(blockIdx.x) * hd;
-    const int half = hd / 2;
-    float scale = 1.0f;
-    if (nw) {
-        float ss = 0.0f;
-        for (int i = threadIdx.x; i < hd; i += blockDim.x) ss += s[i] * s[i];
-        ss = block_sum(ss);
-        scale = rsqrtf(ss / hd + eps);
-    }
-    for (int i = threadIdx.x; i < half; i += blockDim.x) {
-        float x0 = s[i] * scale, x1 = s[i + half] * scale;
-        if (nw) {
-            x0 *= load_w(nw, nkind, i);
-            x1 *= load_w(nw, nkind, i + half);
-        }
-        const float freq = powf(theta, -2.0f * i / hd);
-        float sn, cs;
-        sincosf(pos * freq, &sn, &cs);
-        d[i] = x0 * cs - x1 * sn;
-        d[i + half] = x0 * sn + x1 * cs;
-    }
-}
-
-/* scores[h, t] = q_h · k_t[kvh] * scale, t in [0, n_tok). One warp per (h, t). */
-__global__ void attn_scores(float* __restrict__ scores, const float* __restrict__ q,
-                            const float* __restrict__ kc, int n_tok, int n_ctx, int hd,
-                            int group, int kv_stride, float scale) {
-    const int h = blockIdx.y;
-    const int t = blockIdx.x * ROWS_PER_BLOCK + threadIdx.y;
-    if (t >= n_tok) return;
-    const float* qh = q + static_cast<size_t>(h) * hd;
-    const float* kt = kc + static_cast<size_t>(t) * kv_stride + static_cast<size_t>(h / group) * hd;
-    float acc = 0.0f;
-    for (int i = threadIdx.x; i < hd; i += WARP) acc += qh[i] * kt[i];
-    acc = warp_sum(acc);
-    if (threadIdx.x == 0) scores[static_cast<size_t>(h) * n_ctx + t] = acc * scale;
-}
+// The F32-only qk_norm_rope / attn_scores / attn_weighted_v that used to live
+// here are superseded by the shared VBR kernels in kv_attn.inl; only the
+// softmax below is still shared with that file.
 
 /* In-place softmax over scores[h, 0..n_tok). One block per head. */
 __global__ void attn_softmax(float* __restrict__ scores, int n_tok, int n_ctx) {
@@ -234,20 +191,6 @@ __global__ void attn_softmax(float* __restrict__ scores, int n_tok, int n_ctx) {
     sum = block_sum(sum);
     const float inv = 1.0f / sum;
     for (int t = threadIdx.x; t < n_tok; t += blockDim.x) s[t] *= inv;
-}
-
-/* att[h, i] = Σ_t p[h, t] · v_t[kvh, i]. Block per head, thread per dim. */
-__global__ void attn_weighted_v(float* __restrict__ att, const float* __restrict__ scores,
-                                const float* __restrict__ vc, int n_tok, int n_ctx, int hd,
-                                int group, int kv_stride) {
-    const int h = blockIdx.x;
-    const float* p = scores + static_cast<size_t>(h) * n_ctx;
-    const float* vb = vc + static_cast<size_t>(h / group) * hd;
-    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
-        float acc = 0.0f;
-        for (int t = 0; t < n_tok; ++t) acc += p[t] * vb[static_cast<size_t>(t) * kv_stride + i];
-        att[static_cast<size_t>(h) * hd + i] = acc;
-    }
 }
 
 // ── FFN activation ───────────────────────────────────────────────────────
@@ -272,6 +215,10 @@ inline int finish() {
 
 }  // namespace
 
+// Shared VBR (quantized-KV) attention. Uses this file's launch_matvec,
+// threads_for, stream_of, attn_softmax, block_sum and load_w.
+#include "kernels/qwen/qwen3/nvidia/kv_attn.inl"
+
 // ── ABI ops ──────────────────────────────────────────────────────────────
 
 extern "C" int qwen3_cuda_rms_norm(SpiteTensor* out, const SpiteTensor* x,
@@ -292,55 +239,7 @@ extern "C" int qwen3_cuda_attention(SpiteTensor* out, const SpiteTensor* x,
                                     const SpiteTensor* q_norm, const SpiteTensor* k_norm,
                                     float norm_eps, SpiteKvCache* kv, float rope_freq_base,
                                     const SpiteCtx* ctx) {
-    if (!ctx || !kv || ctx->n_heads <= 0 || ctx->n_kv_heads <= 0) return -1;
-    if (kv->k.kind != SPITE_TYPE_F32 || kv->v.kind != SPITE_TYPE_F32) return -1;
-    const int nh = ctx->n_heads, nkv = ctx->n_kv_heads;
-    const int hd = static_cast<int>(wq->ne[1]) / nh;
-    const int kv_stride = nkv * hd;
-    const int n_ctx = static_cast<int>(kv->k.ne[1]);
-    const int pos = ctx->pos;
-    if (hd <= 0 || hd % 2 || nh % nkv || static_cast<int>(kv->k.ne[0]) != kv_stride) return -1;
-    if (pos < 0 || pos >= n_ctx) return -2;
-
-    const size_t need = sizeof(float) * (static_cast<size_t>(nh) * hd * 2 +
-                                         static_cast<size_t>(kv_stride) +
-                                         static_cast<size_t>(nh) * n_ctx);
-    if (!ctx->scratchpad || ctx->scratchpad_bytes < need) return -2;
-    float* q = static_cast<float*>(ctx->scratchpad);
-    float* k = q + static_cast<size_t>(nh) * hd;
-    float* att = k + kv_stride;
-    float* scores = att + static_cast<size_t>(nh) * hd;
-
-    cudaStream_t s = stream_of(ctx);
-    const float* xin = static_cast<const float*>(x->data);
-    float* kc = static_cast<float*>(kv->k.data);
-    float* vc = static_cast<float*>(kv->v.data);
-    float* k_row = kc + static_cast<size_t>(pos) * kv_stride;
-    float* v_row = vc + static_cast<size_t>(pos) * kv_stride;
-
-    // Projections; V goes straight into its cache row.
-    if (launch_matvec(wq, xin, q, false, s) || launch_matvec(wk, xin, k, false, s) ||
-        launch_matvec(wv, xin, v_row, false, s))
-        return -1;
-
-    const int rt = threads_for(hd / 2);
-    qk_norm_rope<<<nh, rt, 0, s>>>(q, q, q_norm ? q_norm->data : nullptr,
-                                   q_norm ? q_norm->kind : 0, norm_eps, hd, pos, rope_freq_base);
-    qk_norm_rope<<<nkv, rt, 0, s>>>(k_row, k, k_norm ? k_norm->data : nullptr,
-                                    k_norm ? k_norm->kind : 0, norm_eps, hd, pos, rope_freq_base);
-
-    const int n_tok = pos + 1;
-    const int group = nh / nkv;
-    const float scale = rsqrtf(static_cast<float>(hd));
-    attn_scores<<<dim3((n_tok + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK, nh),
-                  dim3(WARP, ROWS_PER_BLOCK), 0, s>>>(scores, q, kc, n_tok, n_ctx, hd, group,
-                                                      kv_stride, scale);
-    attn_softmax<<<nh, threads_for(n_tok > 256 ? 256 : n_tok), 0, s>>>(scores, n_tok, n_ctx);
-    attn_weighted_v<<<nh, threads_for(hd), 0, s>>>(att, scores, vc, n_tok, n_ctx, hd, group,
-                                                   kv_stride);
-
-    if (launch_matvec(wo, att, static_cast<float*>(out->data), true, s)) return -1;
-    return finish();
+    return kvattn_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base, ctx);
 }
 
 extern "C" int qwen3_cuda_ffn(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor* w_gate,
@@ -373,6 +272,12 @@ extern "C" int qwen3_cuda_matmul(SpiteTensor* out, const SpiteTensor* x, const S
 
 // ── Kernel descriptor ────────────────────────────────────────────────────
 
+/* KV-cache tiers this attention op reads and writes (bit = SpiteType). */
+extern "C" uint64_t qwen3_cuda_kv_cache_kinds() {
+    return (1ull << SPITE_TYPE_F32) | (1ull << SPITE_TYPE_F16) | (1ull << SPITE_TYPE_Q8_0) |
+           (1ull << SPITE_TYPE_Q5_1) | (1ull << SPITE_TYPE_Q4_0);
+}
+
 static const SpiteKernelInfo KERNEL_INFO = {
     SPITE_ABI_VERSION,
     "qwen3",
@@ -387,6 +292,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     nullptr, /* speculative_verify */
     nullptr, /* prefill */
     qwen3_cuda_matmul,
+    qwen3_cuda_kv_cache_kinds,
 };
 
 extern "C" const SpiteKernelInfo* spite_kernel_info() { return &KERNEL_INFO; }

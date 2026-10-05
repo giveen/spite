@@ -9,6 +9,7 @@ use spite_loader::GgufModel;
 
 use crate::dense::{self, DenseWeights, KvStore};
 use crate::{ModelArch, ModelConfig, ModelError};
+use spite_kvcache::KvQuantConfig;
 
 pub struct Mistral4 {
     config: ModelConfig,
@@ -40,6 +41,12 @@ impl ModelArch for Mistral4 {
     fn reset_cache(&self) {
         if let Ok(mut kv) = self.kv.write() {
             kv.reset();
+        }
+    }
+
+    fn set_kv_quant(&self, cfg: KvQuantConfig) {
+        if let Ok(mut kv) = self.kv.write() {
+            kv.set_quant(&cfg);
         }
     }
 

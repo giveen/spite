@@ -15,6 +15,11 @@
 
 pub mod paged;
 pub mod persist;
+pub mod quant;
+pub mod vbr;
+
+pub use quant::{dequantize, packed_bytes, quantize};
+pub use vbr::{VbrPolicy, VbrRows};
 
 use spite_abi::{SpiteKvCache, SpiteTensor};
 use thiserror::Error;
@@ -27,10 +32,10 @@ use thiserror::Error;
 /// `F16` is the default; move down the ladder when VRAM is tight.
 ///
 /// Degradation ladder (high → low quality):
-///   F16 (2.0 bpe) → Q8 (1.06 bpe) → Q5_1 (0.75 bpe) → Q4 (0.56 bpe)
+///   F32 (4.0) → F16 (2.0 bpe) → Q8 (1.06 bpe) → Q5_1 (0.75 bpe) → Q4 (0.56 bpe)
 ///
-/// The engine degrades automatically at runtime when the KV budget fills —
-/// you just set the tier you want to start at.
+/// The engine degrades automatically as the sequence grows — you just set the
+/// tier you want to start at. See [`vbr`](crate::vbr) for the trigger policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KvQuant {
     /// Full precision — reference / debug only.  (4 bytes/element)
@@ -81,6 +86,20 @@ impl KvQuant {
             Self::Q4 => None,
         }
     }
+
+    /// Next tier up the ladder (`None` if already at the top).
+    ///
+    /// Used when a kernel cannot read the requested tier: the start tier is
+    /// walked up until one the kernel accepts is found.
+    pub fn upgrade(self) -> Option<Self> {
+        match self {
+            Self::F32 => None,
+            Self::F16 => Some(Self::F32),
+            Self::Q8 => Some(Self::F16),
+            Self::Q5_1 => Some(Self::Q8),
+            Self::Q4 => Some(Self::Q5_1),
+        }
+    }
 }
 
 impl std::fmt::Display for KvQuant {
@@ -110,8 +129,9 @@ impl std::str::FromStr for KvQuant {
 /// K and V are independently settable (K is more attention-sensitive than V,
 /// so a common configuration is K=q8, V=q5_1 or K=q8, V=q4).
 ///
-/// The engine degrades both sides automatically when the KV VRAM budget fills.
-/// You set the preferred starting tier; no separate "auto" flag is needed.
+/// The engine degrades both sides automatically as the sequence grows (at 1/4,
+/// 1/2 and 3/4 of the context window). You set the preferred starting tier; no
+/// separate "auto" flag is needed.
 ///
 /// # How to choose
 ///
@@ -166,6 +186,19 @@ impl KvQuantConfig {
 
     pub fn is_default(&self) -> bool {
         self.key == KvQuant::F16 && self.val == KvQuant::F16
+    }
+
+    /// Full-precision *starting* tier (no quantization at short context).
+    ///
+    /// The CPU model paths default to this so their outputs stay exact for the
+    /// short prompts used by reference tests. VBR still applies from here: at
+    /// long context the cache degrades down the ladder from f32. The executor
+    /// overrides the start tier via [`KvQuantConfig::default`] before inference.
+    pub fn full_precision() -> Self {
+        Self {
+            key: KvQuant::F32,
+            val: KvQuant::F32,
+        }
     }
 }
 

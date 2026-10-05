@@ -297,6 +297,15 @@ pub trait ModelArch: Send + Sync {
     /// Clear cached K/V state. Called when starting a new sequence.
     fn reset_cache(&self) {}
 
+    /// Configure KV-cache quantization (Variable Bit Rate).
+    ///
+    /// Called once by the executor before the first forward pass. The default
+    /// is a no-op, which leaves the cache at full precision; archs that own a
+    /// KV cache override this to store quantized rows and degrade them as the
+    /// sequence grows. Calling it also clears any existing cache so the new
+    /// tier takes effect from position zero.
+    fn set_kv_quant(&self, _cfg: spite_kvcache::KvQuantConfig) {}
+
     /// Run one forward pass.
     ///
     /// `tokens`:     input token ids `[seq_len]`

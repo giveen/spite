@@ -14,6 +14,7 @@ use std::sync::RwLock;
 use spite_abi::SpiteCtx;
 use spite_compute::flash_attn::{FlashAttnConfig, scalar_attention};
 use spite_compute::linear_attn::{gdn_l2_norm, gdn_step, ssm_conv_step};
+use spite_kvcache::{KvQuant, KvQuantConfig, VbrPolicy, VbrRows};
 use spite_loader::GgufModel;
 use spite_rope::apply_irope;
 
@@ -29,13 +30,15 @@ struct LinearState {
 }
 
 enum LayerState {
-    Full { k: Vec<f32>, v: Vec<f32> },
+    Full { k: VbrRows, v: VbrRows },
     Linear(LinearState),
 }
 
 pub struct Qwen3_5 {
     config: ModelConfig,
     weights: Option<DenseWeights>,
+    /// KV quantization policy. Full precision until the executor enables VBR.
+    kv_quant: RwLock<KvQuantConfig>,
     // ponytail: RwLock, uncontended single-threaded use; sharded locks if parallel decode matters.
     state: RwLock<Vec<LayerState>>,
 }
@@ -45,6 +48,7 @@ impl Qwen3_5 {
         Self {
             config,
             weights: None,
+            kv_quant: RwLock::new(KvQuantConfig::full_precision()),
             state: RwLock::new(Vec::new()),
         }
     }
@@ -55,6 +59,24 @@ impl Qwen3_5 {
             .get(layer)
             .copied()
             .unwrap_or(true)
+    }
+
+    /// Current K-cache storage tier for each full-attention layer.
+    ///
+    /// Exposed for diagnostics and tests: it makes VBR degradation observable
+    /// from outside the crate without reaching into the layer state.
+    pub fn kv_key_tiers(&self) -> Vec<KvQuant> {
+        self.state
+            .read()
+            .map(|s| {
+                s.iter()
+                    .filter_map(|l| match l {
+                        LayerState::Full { k, .. } => Some(k.quant()),
+                        LayerState::Linear(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -72,6 +94,14 @@ impl ModelArch for Qwen3_5 {
         if let Ok(mut s) = self.state.write() {
             s.clear();
         }
+    }
+
+    fn set_kv_quant(&self, cfg: KvQuantConfig) {
+        if let Ok(mut q) = self.kv_quant.write() {
+            *q = cfg;
+        }
+        // Existing rows were packed at the old tier; drop them.
+        self.reset_cache();
     }
 
     fn forward(
@@ -105,6 +135,12 @@ impl ModelArch for Qwen3_5 {
             .state
             .write()
             .map_err(|_| ModelError::Forward("state lock".into()))?;
+        let (kq, vq) = self
+            .kv_quant
+            .read()
+            .map(|c| (c.key, c.val))
+            .unwrap_or((KvQuant::F32, KvQuant::F32));
+        let kv_row_len = n_kv_heads * head_dim;
         while state.len() < cfg.n_layers {
             let layer = state.len();
             if self.is_recurrent(layer) {
@@ -114,8 +150,8 @@ impl ModelArch for Qwen3_5 {
                 }));
             } else {
                 state.push(LayerState::Full {
-                    k: Vec::new(),
-                    v: Vec::new(),
+                    k: VbrRows::new(kv_row_len, VbrPolicy::from_ctx(cfg.max_seq_len, kq)),
+                    v: VbrRows::new(kv_row_len, VbrPolicy::from_ctx(cfg.max_seq_len, vq)),
                 });
             }
         }
@@ -273,12 +309,15 @@ fn full_attn(
     let LayerState::Full { k: kk, v: vv } = &mut state[layer] else {
         return Err(ModelError::Forward("layer state kind mismatch".into()));
     };
-    kk.extend_from_slice(&kn);
-    vv.extend_from_slice(&v);
-    let n_prev = kk.len() / (n_kv_heads * head_dim);
+    kk.push(&kn);
+    vv.push(&v);
+    let n_prev = kk.len();
+    // Dequantize the history on demand; same O(ctx) order as the attention.
+    let kd = kk.to_f32();
+    let vd = vv.to_f32();
     let attn_cfg = FlashAttnConfig::new(1, n_prev, n_heads, n_kv_heads, head_dim);
     let mut attn_out = vec![0f32; n_heads * head_dim];
-    scalar_attention(&qn, kk, vv, &mut attn_out, &attn_cfg)
+    scalar_attention(&qn, &kd, &vd, &mut attn_out, &attn_cfg)
         .map_err(|e| ModelError::Forward(format!("attn: {e}")))?;
     if let Some(g) = gate {
         for (o, &gg) in attn_out.iter_mut().zip(g.iter()) {
@@ -557,5 +596,43 @@ mod tests {
         model.forward(&[2], &mut step, &ctx1).unwrap();
         assert!(full[..cfg.vocab_size] == pre[..]);
         assert!(full[cfg.vocab_size..] == step[..]);
+    }
+
+    #[test]
+    fn vbr_degrades_full_attention_kv_with_depth() {
+        let (cfg, weights) = tiny_weights();
+        let mut model = Qwen3_5::new(cfg.clone());
+        model.weights = Some(weights);
+        model.config.recurrent_layers = vec![true, true, true, false];
+        // Opt into VBR at f16. max_seq_len is 64, so thresholds land at
+        // 16, 32 and 48 tokens.
+        model.set_kv_quant(KvQuantConfig {
+            key: KvQuant::F16,
+            val: KvQuant::F16,
+        });
+        let ctx = SpiteCtx {
+            n_ctx: 64,
+            n_batch: 1,
+            n_threads: 1,
+            pos: 0,
+            n_heads: 2,
+            n_kv_heads: 2,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: std::ptr::null_mut(),
+            scratchpad_bytes: 0,
+        };
+        let tokens: Vec<u32> = (0..50).map(|i| (i % cfg.vocab_size) as u32).collect();
+        let mut logits = vec![0f32; tokens.len() * cfg.vocab_size];
+        model.forward(&tokens, &mut logits, &ctx).unwrap();
+        assert!(logits.iter().all(|x| x.is_finite()));
+        // One full-attention layer (index 3); from f16 the 50 tokens cross
+        // all three thresholds (16, 32, 48) and land on the q4 floor.
+        assert_eq!(model.kv_key_tiers(), vec![KvQuant::Q4]);
+
+        // Starting at full precision means the same 50 tokens only reach
+        // q5_1 — the f32 start adds one step before the ladder runs out.
+        model.set_kv_quant(KvQuantConfig::full_precision());
+        model.forward(&tokens, &mut logits, &ctx).unwrap();
+        assert_eq!(model.kv_key_tiers(), vec![KvQuant::Q5_1]);
     }
 }
