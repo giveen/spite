@@ -1,23 +1,27 @@
 //! Tesla P100 tensor-parallel shard policy.
 //!
-//! P100 **SXM2** groups (DGX-1 quads) are fully connected over NVLink 1.0, so
-//! Megatron-style tensor parallelism across up to 4 cards is viable.
+//! Tensor parallelism shards each layer's weight matrices across the cards and
+//! needs one all-reduce per attention/FFN op, so it is only worth it when the
+//! cards can exchange data directly. The gate is **peer access**
+//! (`cudaDeviceCanAccessPeer`), not the link medium:
 //!
-//! P100 **PCIe** cards have no NVLink. Peer copies fall back to PCIe (PHB when
-//! both cards sit under one root complex, SYS across QPI on dual-socket boards),
-//! which is far too bandwidth-bound to tensor-shard a dense model, and this
-//! policy refuses it: with no NVLink, [`P100Topology::shard_strategy`] returns
-//! [`ShardStrategy::Pipeline`], never [`ShardStrategy::Tensor`]. The dense
-//! layer-wise pipeline in `spite-models`/`spite-parallel::pipeline` moves only
-//! the hidden state through host memory, so it is the right split for PCIe/QPI
-//! boxes (2× and 4× P100-PCIE-16GB included).
+//! * P100 **SXM2** groups (DGX-1 quads) are fully connected over NVLink 1.0.
+//! * P100 **PCIe** cards have no NVLink, but a pair under one root complex
+//!   (**PHB**) still has PCIe peer access, and pxa measures a real win there:
+//!   `-sm tensor` on 2× P100-PCIE is +17–27% decode and +44% prefill over the
+//!   layer split (pxa `docs/DEFAULTS.md`). A peer-capable PCIe pair is a tensor
+//!   group, not a pipeline.
+//! * A pair with **no** peer access (SYS across QPI, or a platform that blocks
+//!   PCIe P2P) must use the layer-wise pipeline, which moves only the hidden
+//!   state through host memory.
 //!
-//! The GPU count comes from the environment (`SPITE_P100_SHARDS`, else
-//! `SPITE_GPU_COUNT`). NVLink is probed at runtime by
-//! [`P100Topology::detect`] via `spite-gpu`'s `cuda::p2p_kind` (peer access plus
-//! the SXM form factor in the device name); `SPITE_P100_NVLINK=1` (or `=0`)
-//! overrides the probe. Enumerating the environment without CUDA (all of the
-//! `from_*` constructors used in tests) assumes **no** NVLink.
+//! [`P100Topology::detect`] probes the `0 -> 1` link with `spite-gpu`'s
+//! `cuda::p2p_kind` (peer access + the SXM form factor in the device name).
+//! `SPITE_P100_LINK=none|pcie|nvlink` overrides the probe; the legacy
+//! `SPITE_P100_NVLINK=1|0` is accepted as `nvlink|pcie`. The GPU count comes
+//! from `SPITE_P100_SHARDS`, else `SPITE_GPU_COUNT`. Enumerating the
+//! environment without CUDA (the `from_*` constructors used in tests) assumes
+//! **no** link.
 //!
 //! The kernel-side all-reduce is exported by the P100 card kernel as
 //! `spite_p100_enable_peer_access` / `spite_p100_allreduce_f32`
@@ -32,50 +36,49 @@ use crate::ShardStrategy;
 /// Maximum tensor-parallel degree for a P100 NVLink group.
 pub const P100_TP_MAX_SHARDS: usize = 4;
 
-/// GPUs available to a P100 tensor-parallel group, and whether they are linked
-/// by NVLink.
+/// GPUs available to a P100 tensor-parallel group, and the link between them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct P100Topology {
     pub n_linked: usize,
-    /// True only when the group has peer access over an SXM/NVLink link. A
-    /// PCIe group is `false` even when the cards can address each other.
-    pub nvlink: bool,
+    /// Direct device link: `None` (no peer access), `Pcie` (peer access over
+    /// PCIe — PHB/SYS), or `Nvlink` (SXM2). Only `None` rules out tensor
+    /// parallelism.
+    pub link: P2pKind,
 }
 
 impl P100Topology {
     /// Read the group size from `SPITE_P100_SHARDS`, else `SPITE_GPU_COUNT`,
-    /// and probe the `0 -> 1` link for NVLink (env override
+    /// and probe the `0 -> 1` link (env override `SPITE_P100_LINK` /
     /// `SPITE_P100_NVLINK`, else `cuda::p2p_kind`).
     pub fn detect() -> Self {
         let mut topo = Self::from_parts(
             std::env::var("SPITE_P100_SHARDS").ok().as_deref(),
             std::env::var("SPITE_GPU_COUNT").ok().as_deref(),
-            false,
+            P2pKind::None,
         );
         if topo.n_linked >= 2 {
-            topo.nvlink = probe_nvlink();
+            topo.link = probe_link();
         }
         topo
     }
 
-    /// `detect()` without touching the environment beyond the explicit
-    /// override, and without probing. An explicit shard count wins over the
-    /// GPU count; unparsable values are ignored; the count clamps to
-    /// [`P100_TP_MAX_SHARDS`]. `nvlink` is taken as given.
-    pub fn from_parts(p100_shards: Option<&str>, gpu_count: Option<&str>, nvlink: bool) -> Self {
+    /// `detect()` without probing. An explicit shard count wins over the GPU
+    /// count; unparsable values are ignored; the count clamps to
+    /// [`P100_TP_MAX_SHARDS`]. `link` is taken as given.
+    pub fn from_parts(p100_shards: Option<&str>, gpu_count: Option<&str>, link: P2pKind) -> Self {
         let parse = |v: Option<&str>| v.and_then(|s| s.trim().parse::<usize>().ok());
         let n = parse(p100_shards).or(parse(gpu_count)).unwrap_or(1);
         let n_linked = n.clamp(1, P100_TP_MAX_SHARDS);
         Self {
             n_linked,
-            nvlink: nvlink && n_linked >= 2,
+            link: if n_linked >= 2 { link } else { P2pKind::None },
         }
     }
 
-    /// `from_parts` with no NVLink (the conservative default when the link is
+    /// `from_parts` with no link (the conservative default when the link is
     /// unknown or unprobed).
     pub fn from_env_values(p100_shards: Option<&str>, gpu_count: Option<&str>) -> Self {
-        Self::from_parts(p100_shards, gpu_count, false)
+        Self::from_parts(p100_shards, gpu_count, P2pKind::None)
     }
 
     /// True when there is more than one GPU to spread the model over.
@@ -83,35 +86,55 @@ impl P100Topology {
         self.n_linked >= 2
     }
 
-    /// True when tensor parallelism is both possible and worthwhile (NVLink).
+    /// True when the cards can exchange data directly, so tensor parallelism
+    /// is possible (NVLink **or** PCIe peer access).
     pub fn can_tensor_parallel(&self) -> bool {
-        self.nvlink
+        self.link != P2pKind::None
     }
 
     /// Best split for the group, so KV heads and FFN columns divide evenly.
     ///
-    /// * one GPU, or no NVLink → [`ShardStrategy::None`] / pipeline only;
-    /// * NVLink → the largest power-of-two tensor degree that fits.
+    /// * one GPU, or no peer access → [`ShardStrategy::None`] / pipeline only;
+    /// * any direct link → the largest power-of-two tensor degree that fits.
     pub fn shard_strategy(&self) -> ShardStrategy {
-        match self.n_linked {
-            n if n < 2 => ShardStrategy::None,
-            n if !self.nvlink => ShardStrategy::Pipeline { n_stages: n },
-            n if n >= 4 => ShardStrategy::Tensor { n_shards: 4 },
-            _ => ShardStrategy::Tensor { n_shards: 2 },
+        if self.n_linked < 2 {
+            return ShardStrategy::None;
+        }
+        if self.link == P2pKind::None {
+            return ShardStrategy::Pipeline {
+                n_stages: self.n_linked,
+            };
+        }
+        if self.n_linked >= 4 {
+            ShardStrategy::Tensor { n_shards: 4 }
+        } else {
+            ShardStrategy::Tensor { n_shards: 2 }
         }
     }
 }
 
-/// Runtime NVLink probe for devices 0 and 1, with a `SPITE_P100_NVLINK`
-/// override (`1/true/yes/on` → NVLink, anything else non-empty → PCIe).
-fn probe_nvlink() -> bool {
+/// Runtime `0 -> 1` link probe with a `SPITE_P100_LINK` override
+/// (`none|pcie|nvlink`); `SPITE_P100_NVLINK=1|0` is the legacy alias.
+fn probe_link() -> P2pKind {
+    if let Ok(v) = std::env::var("SPITE_P100_LINK") {
+        match v.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "0" => return P2pKind::None,
+            "pcie" | "pci" => return P2pKind::Pcie,
+            "nvlink" | "sxm" => return P2pKind::Nvlink,
+            _ => {}
+        }
+    }
     if let Ok(v) = std::env::var("SPITE_P100_NVLINK") {
         let t = v.trim().to_ascii_lowercase();
         if !t.is_empty() {
-            return matches!(t.as_str(), "1" | "true" | "yes" | "on");
+            return if matches!(t.as_str(), "1" | "true" | "yes" | "on") {
+                P2pKind::Nvlink
+            } else {
+                P2pKind::Pcie
+            };
         }
     }
-    matches!(cuda::p2p_kind(0, 1), Ok(P2pKind::Nvlink))
+    cuda::p2p_kind(0, 1).unwrap_or(P2pKind::None)
 }
 
 /// Per-GPU configuration for a P100 tensor-parallel run.
@@ -148,6 +171,7 @@ mod tests {
         assert_eq!(topo.n_linked, 1);
         assert!(!topo.is_multi_gpu());
         assert!(!topo.can_tensor_parallel());
+        assert_eq!(topo.link, P2pKind::None);
         assert_eq!(topo.shard_strategy(), ShardStrategy::None);
     }
 
@@ -155,7 +179,7 @@ mod tests {
     fn explicit_shards_win_over_gpu_count() {
         let topo = P100Topology::from_env_values(Some("4"), Some("2"));
         assert_eq!(topo.n_linked, 4);
-        // No NVLink assumed by `from_env_values`: never tensor-shard PCIe.
+        // No link assumed by `from_env_values`: pipeline, not tensor.
         assert_eq!(
             topo.shard_strategy(),
             ShardStrategy::Pipeline { n_stages: 4 }
@@ -174,11 +198,11 @@ mod tests {
 
     #[test]
     fn nvlink_enables_tensor_parallel() {
-        let topo = P100Topology::from_parts(Some("4"), None, true);
+        let topo = P100Topology::from_parts(Some("4"), None, P2pKind::Nvlink);
         assert!(topo.can_tensor_parallel());
         assert_eq!(topo.shard_strategy(), ShardStrategy::Tensor { n_shards: 4 });
-        // Three NVLink cards still round down to a power of two.
-        let three = P100Topology::from_parts(Some("3"), None, true);
+        // Three cards still round down to a power of two.
+        let three = P100Topology::from_parts(Some("3"), None, P2pKind::Nvlink);
         assert_eq!(
             three.shard_strategy(),
             ShardStrategy::Tensor { n_shards: 2 }
@@ -186,9 +210,19 @@ mod tests {
     }
 
     #[test]
-    fn pcie_falls_back_to_pipeline() {
-        // Two PCIe P100s (PHB/SYS) must be a pipeline, not a tensor group.
-        let topo = P100Topology::from_parts(Some("2"), None, false);
+    fn pcie_peer_pair_is_a_tensor_group() {
+        // pxa measures `-sm tensor` on 2x P100-PCIE (PHB) at +17-27% decode
+        // over the layer split, so peer-capable PCIe is tensor, not pipeline.
+        let topo = P100Topology::from_parts(Some("2"), None, P2pKind::Pcie);
+        assert!(topo.is_multi_gpu());
+        assert!(topo.can_tensor_parallel());
+        assert_eq!(topo.shard_strategy(), ShardStrategy::Tensor { n_shards: 2 });
+    }
+
+    #[test]
+    fn no_peer_access_falls_back_to_pipeline() {
+        // SYS across QPI (or a platform without PCIe P2P): pipeline only.
+        let topo = P100Topology::from_parts(Some("2"), None, P2pKind::None);
         assert!(topo.is_multi_gpu());
         assert!(!topo.can_tensor_parallel());
         assert_eq!(
@@ -198,9 +232,9 @@ mod tests {
     }
 
     #[test]
-    fn nvlink_with_one_gpu_is_impossible() {
-        let topo = P100Topology::from_parts(Some("1"), None, true);
-        assert!(!topo.nvlink);
+    fn one_gpu_has_no_link() {
+        let topo = P100Topology::from_parts(Some("1"), None, P2pKind::Nvlink);
+        assert_eq!(topo.link, P2pKind::None);
         assert_eq!(topo.shard_strategy(), ShardStrategy::None);
     }
 
@@ -208,7 +242,7 @@ mod tests {
     fn configs_match_topology() {
         let topo = P100Topology {
             n_linked: 2,
-            nvlink: true,
+            link: P2pKind::Pcie,
         };
         let cfgs = P100TpConfig::for_topology(&topo);
         assert_eq!(cfgs.len(), 2);

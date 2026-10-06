@@ -6,14 +6,13 @@ and runs it, then hands the hidden state to the next GPU. Use it when a model
 does not fit in one card's VRAM, e.g. a 27B Qwen3.8 **Q6_K (~20.9 GiB)** on
 16 GB Tesla P100s.
 
-> **P100 note.** Pipeline splitting is the *only* multi-GPU mode for
-> **P100-PCIE** cards: they have no NVLink, so tensor parallelism would be
-> bandwidth-bound and is refused (`spite-parallel::p100_multi` returns
-> `Pipeline`, never `Tensor`, when the NVLink probe fails). Same-root-complex
-> pairs (**PHB**) copy at PCIe speed; pairs across the two sockets (**SYS**,
-> over QPI) are slower still — but neither changes correctness, because the
-> pipeline moves only the hidden state through host memory. Only the **SXM2**
-> P100 has NVLink 1.0.
+> **P100 note.** Tensor parallelism is gated on **peer access**, not on NVLink.
+> A pair under one root complex (**PHB**) has PCIe peer access and is a tensor
+> group — pxa measures `-sm tensor` on 2× P100-PCIE at +17–27% decode over the
+> layer split — while a pair across the two sockets (**SYS**, over QPI), or any
+> platform without PCIe P2P, has no peer path and uses the layer-wise pipeline.
+> Only the **SXM2** P100 has NVLink 1.0, which is faster again. The executor does
+> not wire tensor parallelism yet; see `docs/p100-pxa-port.md`.
 
 ---
 
@@ -24,7 +23,7 @@ does not fit in one card's VRAM, e.g. a 27B Qwen3.8 **Q6_K (~20.9 GiB)** on
 | Hybrid models (Qwen3.5 / Qwen3.8 family, GGUF arch `qwen35`) | Pipeline split ✅ |
 | NextN / MTP draft head | Runs on the last GPU ✅ |
 | Dense models (`gpu_dense` path: Llama, Qwen3, …) | Single GPU only |
-| Tensor parallelism (`spite-parallel::p100_multi`) | Policy only, not wired; requires NVLink (P100 SXM2). PCIe cards fall back to pipeline |
+| Tensor parallelism (`spite-parallel::p100_multi`) | Policy only, not wired; gated on peer access (NVLink **or** PCIe P2P), so a PHB P100 pair is a tensor group |
 | Mixed vendors (CUDA + HIP) | Not supported |
 
 The split needs **no peer-to-peer access or NVLink**. Only the hidden state
