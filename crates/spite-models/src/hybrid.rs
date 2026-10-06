@@ -18,7 +18,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use spite_abi::{
-    FfnActivation, SpiteAttnParams, SpiteCtx, SpiteGdnParams, SpiteKvCache, SpiteTensor, SpiteType,
+    FfnActivation, SpiteAttnParams, SpiteCtx, SpiteGdnParams, SpiteKvCache, SpiteMoeParams,
+    SpiteTensor, SpiteType,
 };
 use spite_compute::dequant::dequant_to_f32;
 use spite_dispatch::{DispatchBuilder, DispatchTable, KernelSpec};
@@ -34,12 +35,30 @@ use crate::{ModelArch, ModelConfig, ModelError};
 /// Source label of the portable CPU reference kernel.
 const GENERIC: &str = "generic";
 
-/// Per-layer tensors, resolved once at load.
-struct Ffn {
+/// Per-layer dense FFN tensors.
+struct DenseFfn {
     norm: SpiteTensor,
     gate: SpiteTensor,
     up: SpiteTensor,
     down: SpiteTensor,
+}
+
+/// Per-layer MoE FFN tensors (e.g. Qwen3.5 MoE).
+struct MoeFfn {
+    norm: SpiteTensor,
+    w_gate_inp: SpiteTensor,
+    w_up_exps: SpiteTensor,
+    w_gate_exps: SpiteTensor,
+    w_down_exps: SpiteTensor,
+    w_up_shexp: Option<SpiteTensor>,
+    w_gate_shexp: Option<SpiteTensor>,
+    w_down_shexp: Option<SpiteTensor>,
+    params: SpiteMoeParams,
+}
+
+enum LayerFfn {
+    Dense(Box<DenseFfn>),
+    Moe(Box<MoeFfn>),
 }
 
 struct AttnLayer {
@@ -52,7 +71,7 @@ struct AttnLayer {
     k_norm: SpiteTensor,
     /// Index into `HState::kv`.
     kv: usize,
-    ffn: Ffn,
+    ffn: LayerFfn,
 }
 
 struct GdnLayer {
@@ -68,7 +87,7 @@ struct GdnLayer {
     ssm_norm: SpiteTensor,
     /// Index into `HState::gdn`.
     st: usize,
-    ffn: Ffn,
+    ffn: LayerFfn,
 }
 
 enum Layer {
@@ -126,10 +145,9 @@ pub struct HybridDecoder {
     state: Mutex<HState>,
 }
 
-/// True for archs this decoder implements: recurrent GDN layers with a dense FFN.
-/// (The MoE variant `qwen35moe` needs expert routing ops and is not covered.)
+/// True for archs this decoder implements: recurrent GDN layers with dense or MoE FFN.
 pub fn is_hybrid(cfg: &ModelConfig) -> bool {
-    cfg.ssm_d_state > 0 && cfg.n_expert == 0 && cfg.recurrent_layers.iter().any(|&r| r)
+    cfg.ssm_d_state > 0 && cfg.recurrent_layers.iter().any(|&r| r)
 }
 
 impl HybridDecoder {
@@ -159,15 +177,16 @@ impl HybridDecoder {
         let table = DispatchBuilder::new(kernels_dir, spec).build().ok()?;
         let want_generic = !use_gpu;
         let src_ok = |s: &spite_dispatch::OpSource| (s.gpu_arch == GENERIC) == want_generic;
+        let ffn_ok = (table.ffn.0.is_some() && src_ok(&table.ffn.1))
+            || (table.moe_ffn.0.is_some() && src_ok(&table.moe_ffn.1));
         let ok = table.rms_norm.0.is_some()
             && table.attention_ex.0.is_some()
             && table.linear_attn.0.is_some()
-            && table.ffn.0.is_some()
+            && ffn_ok
             && table.matmul.0.is_some()
             && src_ok(&table.rms_norm.1)
             && src_ok(&table.attention_ex.1)
             && src_ok(&table.linear_attn.1)
-            && src_ok(&table.ffn.1)
             && src_ok(&table.matmul.1);
         ok.then_some((table, backend))
     }
@@ -314,11 +333,42 @@ impl HybridDecoder {
         let (mut kv_i, mut gdn_i) = (0usize, 0usize);
         for l in 0..n_layers {
             let b = format!("blk.{l}");
-            let ffn = Ffn {
-                norm: get(&format!("{b}.post_attention_norm.weight"))?,
-                gate: get(&format!("{b}.ffn_gate.weight"))?,
-                up: get(&format!("{b}.ffn_up.weight"))?,
-                down: get(&format!("{b}.ffn_down.weight"))?,
+            let post_norm = get(&format!("{b}.post_attention_norm.weight"))?;
+            let ffn = if config.n_expert > 0 {
+                let w_gate_inp = get(&format!("{b}.ffn_gate_inp.weight"))?;
+                let w_up_exps = get(&format!("{b}.ffn_up_exps.weight"))?;
+                let w_gate_exps = get(&format!("{b}.ffn_gate_exps.weight"))?;
+                let w_down_exps = get(&format!("{b}.ffn_down_exps.weight"))?;
+                let w_up_shexp = get(&format!("{b}.ffn_up_shexp.weight")).ok();
+                let w_gate_shexp = get(&format!("{b}.ffn_gate_shexp.weight")).ok();
+                let w_down_shexp = get(&format!("{b}.ffn_down_shexp.weight")).ok();
+                let shared_intermediate_size =
+                    w_up_shexp.as_ref().map(|t| t.ne[1] as i32).unwrap_or(0);
+                let params = SpiteMoeParams {
+                    num_experts: config.n_expert as i32,
+                    num_experts_per_tok: config.n_expert_used as i32,
+                    intermediate_size: w_up_exps.ne[1] as i32,
+                    shared_intermediate_size,
+                    weights_scale: config.expert_weights_scale,
+                };
+                LayerFfn::Moe(Box::new(MoeFfn {
+                    norm: post_norm,
+                    w_gate_inp,
+                    w_up_exps,
+                    w_gate_exps,
+                    w_down_exps,
+                    w_up_shexp,
+                    w_gate_shexp,
+                    w_down_shexp,
+                    params,
+                }))
+            } else {
+                LayerFfn::Dense(Box::new(DenseFfn {
+                    norm: post_norm,
+                    gate: get(&format!("{b}.ffn_gate.weight"))?,
+                    up: get(&format!("{b}.ffn_up.weight"))?,
+                    down: get(&format!("{b}.ffn_down.weight"))?,
+                }))
             };
             let norm = get(&format!("{b}.attn_norm.weight"))?;
             if config.recurrent_layers[l] {
@@ -491,11 +541,10 @@ impl ModelArch for HybridDecoder {
         if logits_out.len() != tokens.len() * vocab {
             return Err(err("logits_out shape mismatch"));
         }
-        let (Some(rms_norm), Some(attention_ex), Some(linear_attn), Some(ffn), Some(matmul)) = (
+        let (Some(rms_norm), Some(attention_ex), Some(linear_attn), Some(matmul)) = (
             self.table.rms_norm.0,
             self.table.attention_ex.0,
             self.table.linear_attn.0,
-            self.table.ffn.0,
             self.table.matmul.0,
         ) else {
             return Err(err("dispatch table incomplete for hybrid decoder"));
@@ -607,26 +656,73 @@ impl ModelArch for HybridDecoder {
                         &g.ffn
                     }
                 };
-                // SAFETY: as above.
-                unsafe {
-                    rc(
-                        rms_norm(&mut n_t, &h_t, &ffn_w.norm, cfg.norm_eps, &kctx),
-                        "rms_norm",
-                        li,
-                    )?;
-                    rc(
-                        ffn(
-                            &mut h_t,
-                            &n_t,
-                            &ffn_w.gate,
-                            &ffn_w.up,
-                            &ffn_w.down,
-                            FfnActivation::SiluGate,
-                            &kctx,
-                        ),
-                        "ffn",
-                        li,
-                    )?;
+                match ffn_w {
+                    LayerFfn::Dense(d) => {
+                        let Some(ffn) = self.table.ffn.0 else {
+                            return Err(err("ffn op missing"));
+                        };
+                        unsafe {
+                            rc(
+                                rms_norm(&mut n_t, &h_t, &d.norm, cfg.norm_eps, &kctx),
+                                "rms_norm",
+                                li,
+                            )?;
+                            rc(
+                                ffn(
+                                    &mut h_t,
+                                    &n_t,
+                                    &d.gate,
+                                    &d.up,
+                                    &d.down,
+                                    FfnActivation::SiluGate,
+                                    &kctx,
+                                ),
+                                "ffn",
+                                li,
+                            )?;
+                        }
+                    }
+                    LayerFfn::Moe(m) => {
+                        let Some(moe_ffn) = self.table.moe_ffn.0 else {
+                            return Err(err("moe_ffn op missing"));
+                        };
+                        let p_up_sh = m
+                            .w_up_shexp
+                            .as_ref()
+                            .map_or(std::ptr::null(), |t| t as *const _);
+                        let p_gate_sh = m
+                            .w_gate_shexp
+                            .as_ref()
+                            .map_or(std::ptr::null(), |t| t as *const _);
+                        let p_down_sh = m
+                            .w_down_shexp
+                            .as_ref()
+                            .map_or(std::ptr::null(), |t| t as *const _);
+                        unsafe {
+                            rc(
+                                rms_norm(&mut n_t, &h_t, &m.norm, cfg.norm_eps, &kctx),
+                                "rms_norm",
+                                li,
+                            )?;
+                            rc(
+                                moe_ffn(
+                                    &mut h_t,
+                                    &n_t,
+                                    &m.w_gate_inp,
+                                    &m.w_up_exps,
+                                    &m.w_gate_exps,
+                                    &m.w_down_exps,
+                                    p_up_sh,
+                                    p_gate_sh,
+                                    p_down_sh,
+                                    &m.params,
+                                    &kctx,
+                                ),
+                                "moe_ffn",
+                                li,
+                            )?;
+                        }
+                    }
                 }
             }
 

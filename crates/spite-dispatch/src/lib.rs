@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use spite_abi::{
     ABI_VERSION, AttentionExFn, AttentionFn, FfnFn, GdnFn, KERNEL_ENTRY_SYMBOL, KernelInfoFn,
-    LayerFn, MatmulFn, MtpStemFn, RmsNormFn, SpecVerifyFn, SpiteKernelInfo, SpiteType,
+    LayerFn, MatmulFn, MoeFn, MtpStemFn, RmsNormFn, SpecVerifyFn, SpiteKernelInfo, SpiteType,
 };
 
 pub mod cards;
@@ -115,6 +115,8 @@ pub struct DispatchTable {
     pub attention_ex: (Option<AttentionExFn>, OpSource),
     /// Fused MTP stem (normalize embedding, normalize hidden state, pack [2*d, T]).
     pub mtp_stem: (Option<MtpStemFn>, OpSource),
+    /// MoE feed-forward layer (routed + shared experts).
+    pub moe_ffn: (Option<MoeFn>, OpSource),
     // ── Engine-level ops (cross-model, card/arch/generic chain) ──────────
     pub speculative_verify: (Option<SpecVerifyFn>, OpSource),
     pub prefill: (Option<LayerFn>, OpSource), // chunked prefill
@@ -134,6 +136,7 @@ impl DispatchTable {
             ("linear_attn", &self.linear_attn.1),
             ("attention_ex", &self.attention_ex.1),
             ("mtp_stem", &self.mtp_stem.1),
+            ("moe_ffn", &self.moe_ffn.1),
             ("spec_verify", &self.speculative_verify.1),
             ("prefill", &self.prefill.1),
         ];
@@ -159,6 +162,7 @@ impl DispatchTable {
             linear_attn: (None, src.clone()),
             attention_ex: (None, src.clone()),
             mtp_stem: (None, src.clone()),
+            moe_ffn: (None, src.clone()),
             speculative_verify: (None, src.clone()),
             prefill: (None, src),
             _libs: Vec::new(),
@@ -228,6 +232,7 @@ impl DispatchBuilder {
         let linear_attn = find_op(&model_libs, |k| k.info.linear_attn, generic_src.clone());
         let attention_ex = find_op(&model_libs, |k| k.info.attention_ex, generic_src.clone());
         let mtp_stem = find_op(&model_libs, |k| k.info.mtp_stem, generic_src.clone());
+        let moe_ffn = find_op(&model_libs, |k| k.info.moe_ffn, generic_src.clone());
         let kv_cache_kinds_ex = model_libs
             .iter()
             .find(|l| l.info.attention_ex.is_some())
@@ -262,6 +267,7 @@ impl DispatchBuilder {
             linear_attn,
             attention_ex,
             mtp_stem,
+            moe_ffn,
             speculative_verify,
             prefill,
             _libs: all_libs,

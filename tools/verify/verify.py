@@ -98,6 +98,16 @@ class SpiteKernelInfo(ctypes.Structure):
         ("linear_attn",        ctypes.c_void_p),  # GDN layer (v7)
         ("attention_ex",       ctypes.c_void_p),  # partial RoPE + gated Q (v7)
         ("mtp_stem",           ctypes.c_void_p),  # fused MTP stem (v7)
+        ("moe_ffn",            ctypes.c_void_p),  # MoE routed+shared expert FFN
+    ]
+
+class SpiteMoeParams(ctypes.Structure):
+    _fields_ = [
+        ("num_experts",              ctypes.c_int32),
+        ("num_experts_per_tok",      ctypes.c_int32),
+        ("intermediate_size",        ctypes.c_int32),
+        ("shared_intermediate_size", ctypes.c_int32),
+        ("weights_scale",            ctypes.c_float),
     ]
 
 class SpiteGdnParams(ctypes.Structure):
@@ -168,6 +178,12 @@ AttentionExFn = ctypes.CFUNCTYPE(
 MtpStemFn = ctypes.CFUNCTYPE(
     ctypes.c_int,
     *([_TP] * 5), ctypes.c_float, ctypes.POINTER(SpiteCtx),
+)
+
+# out, x, w_gate_inp, w_up_exps, w_gate_exps, w_down_exps, w_up_shexp, w_gate_shexp, w_down_shexp, params, ctx
+MoeFn = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    *([_TP] * 9), ctypes.POINTER(SpiteMoeParams), ctypes.POINTER(SpiteCtx),
 )
 
 # ── Strides and Helpers ───────────────────────────────────────────────────
@@ -923,6 +939,193 @@ def verify_ffn(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
             cuda.free(d_wd)
             cuda.free(d_o)
             cuda.free(d_scratch)
+
+    err = max_abs_diff(list(out_ref_arr), test_out)
+    if err > 1e-4:
+        print(f"    FAIL: max_abs_diff={err:.2e} (threshold 1e-4)")
+        return False
+    print(f"    OK: max_abs_diff={err:.2e}")
+    return True
+
+
+def verify_moe_ffn(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
+                   cuda: CudaHelper, is_cuda: bool, hidden: int = 64,
+                   intermediate: int = 128, n_expert: int = 256,
+                   n_used: int = 8, has_shared: bool = True,
+                   shared_intermediate: int = 128) -> bool:
+    print(f"\n  [moe_ffn] hidden={hidden} intermediate={intermediate} "
+          f"n_expert={n_expert} n_used={n_used} shared={has_shared}")
+    if not ref_info.moe_ffn:
+        print("    SKIP: reference kernel has no moe_ffn")
+        return True
+    if not test_info.moe_ffn:
+        print("    SKIP: test kernel has no moe_ffn")
+        return True
+
+    rng = random.Random(42)
+    router_rows = n_expert + (1 if has_shared else 0)
+
+    x_data = [rng.gauss(0, 1) for _ in range(hidden)]
+    s_h = 1.0 / math.sqrt(hidden)
+    s_f = 1.0 / math.sqrt(intermediate)
+
+    w_gate_inp_data = [rng.gauss(0, s_h) for _ in range(hidden * router_rows)]
+    w_up_exps_data = [rng.gauss(0, s_h) for _ in range(hidden * intermediate * n_expert)]
+    w_gate_exps_data = [rng.gauss(0, s_h) for _ in range(hidden * intermediate * n_expert)]
+    w_down_exps_data = [rng.gauss(0, s_f) for _ in range(intermediate * hidden * n_expert)]
+
+    w_up_shexp_data = [rng.gauss(0, s_h) for _ in range(hidden * shared_intermediate)] if has_shared else []
+    w_gate_shexp_data = [rng.gauss(0, s_h) for _ in range(hidden * shared_intermediate)] if has_shared else []
+    w_down_shexp_data = [rng.gauss(0, 1.0 / math.sqrt(shared_intermediate)) for _ in range(shared_intermediate * hidden)] if has_shared else []
+
+    out_init = [rng.gauss(0, 0.1) for _ in range(hidden)]
+    out_ref_arr = (ctypes.c_float * hidden)(*out_init)
+
+    tx, _ = make_tensor(x_data, [hidden, 1, 1, 1])
+    tr_inp, _ = make_tensor(w_gate_inp_data, [hidden, router_rows, 1, 1])
+
+    t_ue, _ = make_tensor(w_up_exps_data, [hidden, intermediate, n_expert, 1])
+    t_ge, _ = make_tensor(w_gate_exps_data, [hidden, intermediate, n_expert, 1])
+    t_de, _ = make_tensor(w_down_exps_data, [intermediate, hidden, n_expert, 1])
+
+    if has_shared:
+        t_su, _ = make_tensor(w_up_shexp_data, [hidden, shared_intermediate, 1, 1])
+        t_sg, _ = make_tensor(w_gate_shexp_data, [hidden, shared_intermediate, 1, 1])
+        t_sd, _ = make_tensor(w_down_shexp_data, [shared_intermediate, hidden, 1, 1])
+    else:
+        t_su, t_sg, t_sd = None, None, None
+
+    to, _ = make_tensor([0.0] * hidden, [hidden, 1, 1, 1])
+    to.data = ctypes.cast(out_ref_arr, ctypes.c_void_p)
+
+    params = SpiteMoeParams()
+    params.num_experts = n_expert
+    params.num_experts_per_tok = n_used
+    params.intermediate_size = intermediate
+    params.shared_intermediate_size = shared_intermediate if has_shared else 0
+    params.weights_scale = 1.0
+
+    ctx_ref = make_ctx()
+
+    ref_fn = MoeFn(ref_info.moe_ffn)
+    ret_ref = ref_fn(
+        ctypes.byref(to), ctypes.byref(tx), ctypes.byref(tr_inp),
+        ctypes.byref(t_ue), ctypes.byref(t_ge), ctypes.byref(t_de),
+        ctypes.byref(t_su) if has_shared else None,
+        ctypes.byref(t_sg) if has_shared else None,
+        ctypes.byref(t_sd) if has_shared else None,
+        ctypes.byref(params), ctypes.byref(ctx_ref),
+    )
+    if ret_ref != 0:
+        print(f"    SKIP: reference moe_ffn returned {ret_ref}")
+        return True
+
+    test_fn = MoeFn(test_info.moe_ffn)
+    if not is_cuda:
+        out_test_arr = (ctypes.c_float * hidden)(*out_init)
+        to_test, _ = make_tensor([0.0] * hidden, [hidden, 1, 1, 1])
+        to_test.data = ctypes.cast(out_test_arr, ctypes.c_void_p)
+        ctx_test = make_ctx()
+        ret_test = test_fn(
+            ctypes.byref(to_test), ctypes.byref(tx), ctypes.byref(tr_inp),
+            ctypes.byref(t_ue), ctypes.byref(t_ge), ctypes.byref(t_de),
+            ctypes.byref(t_su) if has_shared else None,
+            ctypes.byref(t_sg) if has_shared else None,
+            ctypes.byref(t_sd) if has_shared else None,
+            ctypes.byref(params), ctypes.byref(ctx_test),
+        )
+        if ret_test != 0:
+            print(f"    FAIL: test moe_ffn returned {ret_test}")
+            return False
+        test_out = list(out_test_arr)
+    else:
+        if not cuda.available:
+            print("    SKIP: CUDA runtime not available")
+            return True
+        scratch_sz = (router_rows + 8 + 8 + 1 + intermediate * 2 + (shared_intermediate * 2 if has_shared else 0) + 128) * 4
+        d_x = cuda.malloc(hidden * 4)
+        d_r_inp = cuda.malloc(hidden * router_rows * 4)
+        d_ue = cuda.malloc(hidden * intermediate * n_expert * 4)
+        d_ge = cuda.malloc(hidden * intermediate * n_expert * 4)
+        d_de = cuda.malloc(intermediate * hidden * n_expert * 4)
+        d_o = cuda.malloc(hidden * 4)
+        d_scratch = cuda.malloc(scratch_sz)
+
+        d_su = cuda.malloc(hidden * shared_intermediate * 4) if has_shared else 0
+        d_sg = cuda.malloc(hidden * shared_intermediate * 4) if has_shared else 0
+        d_sd = cuda.malloc(shared_intermediate * hidden * 4) if has_shared else 0
+
+        try:
+            cuda.h2d(d_x, (ctypes.c_float * hidden)(*x_data), hidden * 4)
+            cuda.h2d(d_r_inp, (ctypes.c_float * (hidden * router_rows))(*w_gate_inp_data), hidden * router_rows * 4)
+            cuda.h2d(d_ue, (ctypes.c_float * (hidden * intermediate * n_expert))(*w_up_exps_data), hidden * intermediate * n_expert * 4)
+            cuda.h2d(d_ge, (ctypes.c_float * (hidden * intermediate * n_expert))(*w_gate_exps_data), hidden * intermediate * n_expert * 4)
+            cuda.h2d(d_de, (ctypes.c_float * (intermediate * hidden * n_expert))(*w_down_exps_data), intermediate * hidden * n_expert * 4)
+            cuda.h2d(d_o, (ctypes.c_float * hidden)(*out_init), hidden * 4)
+
+            tx_gpu, _ = make_tensor([0.0] * hidden, [hidden, 1, 1, 1])
+            tx_gpu.data = d_x
+
+            tr_inp_gpu, _ = make_tensor([0.0] * (hidden * router_rows), [hidden, router_rows, 1, 1])
+            tr_inp_gpu.data = d_r_inp
+
+            t_ue_gpu, _ = make_tensor([0.0] * (hidden * intermediate * n_expert), [hidden, intermediate, n_expert, 1])
+            t_ue_gpu.data = d_ue
+
+            t_ge_gpu, _ = make_tensor([0.0] * (hidden * intermediate * n_expert), [hidden, intermediate, n_expert, 1])
+            t_ge_gpu.data = d_ge
+
+            t_de_gpu, _ = make_tensor([0.0] * (intermediate * hidden * n_expert), [intermediate, hidden, n_expert, 1])
+            t_de_gpu.data = d_de
+
+            to_gpu, _ = make_tensor([0.0] * hidden, [hidden, 1, 1, 1])
+            to_gpu.data = d_o
+
+            if has_shared:
+                cuda.h2d(d_su, (ctypes.c_float * (hidden * shared_intermediate))(*w_up_shexp_data), hidden * shared_intermediate * 4)
+                cuda.h2d(d_sg, (ctypes.c_float * (hidden * shared_intermediate))(*w_gate_shexp_data), hidden * shared_intermediate * 4)
+                cuda.h2d(d_sd, (ctypes.c_float * (shared_intermediate * hidden))(*w_down_shexp_data), shared_intermediate * hidden * 4)
+
+                t_su_gpu, _ = make_tensor([0.0] * (hidden * shared_intermediate), [hidden, shared_intermediate, 1, 1])
+                t_su_gpu.data = d_su
+                t_sg_gpu, _ = make_tensor([0.0] * (hidden * shared_intermediate), [hidden, shared_intermediate, 1, 1])
+                t_sg_gpu.data = d_sg
+                t_sd_gpu, _ = make_tensor([0.0] * (shared_intermediate * hidden), [shared_intermediate, hidden, 1, 1])
+                t_sd_gpu.data = d_sd
+            else:
+                t_su_gpu, t_sg_gpu, t_sd_gpu = None, None, None
+
+            ctx_gpu = make_ctx()
+            ctx_gpu.scratchpad = d_scratch
+            ctx_gpu.scratchpad_bytes = scratch_sz
+
+            ret_test = test_fn(
+                ctypes.byref(to_gpu), ctypes.byref(tx_gpu), ctypes.byref(tr_inp_gpu),
+                ctypes.byref(t_ue_gpu), ctypes.byref(t_ge_gpu), ctypes.byref(t_de_gpu),
+                ctypes.byref(t_su_gpu) if has_shared else None,
+                ctypes.byref(t_sg_gpu) if has_shared else None,
+                ctypes.byref(t_sd_gpu) if has_shared else None,
+                ctypes.byref(params), ctypes.byref(ctx_gpu),
+            )
+            cuda.sync()
+            if ret_test != 0:
+                print(f"    FAIL: test moe_ffn returned {ret_test}")
+                return False
+            out_test_arr = (ctypes.c_float * hidden)()
+            cuda.d2h(out_test_arr, d_o, hidden * 4)
+            test_out = list(out_test_arr)
+        finally:
+            cuda.free(d_x)
+            cuda.free(d_r_inp)
+            cuda.free(d_ue)
+            cuda.free(d_ge)
+            cuda.free(d_de)
+            cuda.free(d_o)
+            cuda.free(d_scratch)
+            if has_shared:
+                cuda.free(d_su)
+                cuda.free(d_sg)
+                cuda.free(d_sd)
 
     err = max_abs_diff(list(out_ref_arr), test_out)
     if err > 1e-4:
@@ -1946,6 +2149,12 @@ def main():
 
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=64, ffn_dim=128)
     passed &= verify_ffn(ref_info, test_info, cuda, is_cuda, hidden=2048, ffn_dim=4096)
+
+    # MoE FFN (routed top-8 over 256 experts + shared expert)
+    passed &= verify_moe_ffn(ref_info, test_info, cuda, is_cuda, hidden=64, intermediate=128,
+                             n_expert=256, n_used=8, has_shared=True, shared_intermediate=128)
+    passed &= verify_moe_ffn(ref_info, test_info, cuda, is_cuda, hidden=64, intermediate=128,
+                             n_expert=256, n_used=8, has_shared=False, shared_intermediate=0)
 
     # head_dim 16 and 80 are outside every GPU kernel's flash dispatch, so these
     # pin the portable VBR back end at both ends of its range; the rest pin the

@@ -473,6 +473,33 @@ typedef int (*SpiteMtpStemFn)(
     const SpiteCtx*    ctx
 );
 
+/* Geometry and config of one MoE FFN layer (e.g. Qwen3.5 MoE). */
+typedef struct {
+    int32_t num_experts;
+    int32_t num_experts_per_tok;
+    int32_t intermediate_size;
+    int32_t shared_intermediate_size;
+    float   weights_scale;
+} SpiteMoeParams;
+
+/*
+ * MoE feed-forward layer: out += moe_ffn(x).
+ * Supports top-k routed experts with softmax gating and optional shared expert.
+ */
+typedef int (*SpiteMoeFn)(
+    SpiteTensor*          out,
+    const SpiteTensor*    x,
+    const SpiteTensor*    w_gate_inp,
+    const SpiteTensor*    w_up_exps,
+    const SpiteTensor*    w_gate_exps,
+    const SpiteTensor*    w_down_exps,
+    const SpiteTensor*    w_up_shexp,
+    const SpiteTensor*    w_gate_shexp,
+    const SpiteTensor*    w_down_shexp,
+    const SpiteMoeParams* params,
+    const SpiteCtx*       ctx
+);
+
 typedef struct {
     uint32_t    abi_version;
     const char* model_arch;       /* e.g. "llama3" */
@@ -500,6 +527,8 @@ typedef struct {
     SpiteAttentionExFn attention_ex;
     /* Fused MTP stem: normalize embedding, normalize hidden state, pack [2*d, T]. */
     SpiteMtpStemFn   mtp_stem;
+    /* MoE feed-forward layer (routed + shared experts). */
+    SpiteMoeFn       moe_ffn;
 } SpiteKernelInfo;
 
 /* Every kernel .so must export this symbol. */
