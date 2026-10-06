@@ -154,6 +154,65 @@ extern "C" int qwen35_cuda_attention_ex(
     const SpiteTensor *, const SpiteTensor *, float, SpiteKvCache *, float,
     const SpiteAttnParams *, const SpiteCtx *);
 
+/* Fused MTP stem: row RMSNorm on embedding and hidden, then pack into [2*d, T]. */
+__global__ void mtp_stem_kernel(float *__restrict__ out,
+                                const float *__restrict__ embed,
+                                const float *__restrict__ hidden,
+                                const void *__restrict__ w_enorm, int enorm_kind,
+                                const void *__restrict__ w_hnorm, int hnorm_kind,
+                                int d, float eps) {
+  const int tok = blockIdx.y;
+  const float *e_tok = embed + static_cast<size_t>(tok) * d;
+  const float *h_tok = hidden + static_cast<size_t>(tok) * d;
+  float *out_tok = out + static_cast<size_t>(tok) * (2 * d);
+
+  float ss_e = 0.0f;
+  float ss_h = 0.0f;
+  for (int i = threadIdx.x; i < d; i += blockDim.x) {
+    ss_e += e_tok[i] * e_tok[i];
+    ss_h += h_tok[i] * h_tok[i];
+  }
+  ss_e = q35_block_sum(ss_e);
+  ss_h = q35_block_sum(ss_h);
+
+  const float scale_e = rsqrtf(ss_e / d + eps);
+  const float scale_h = rsqrtf(ss_h / d + eps);
+
+  for (int i = threadIdx.x; i < d; i += blockDim.x) {
+    out_tok[i]     = e_tok[i] * scale_e * q35_load_w(w_enorm, enorm_kind, i);
+    out_tok[d + i] = h_tok[i] * scale_h * q35_load_w(w_hnorm, hnorm_kind, i);
+  }
+}
+
+extern "C" int qwen35_cuda_mtp_stem(SpiteTensor *out, const SpiteTensor *embed,
+                                    const SpiteTensor *hidden,
+                                    const SpiteTensor *w_enorm,
+                                    const SpiteTensor *w_hnorm, float eps,
+                                    const SpiteCtx *ctx) {
+  if (!out || !embed || !hidden || !w_enorm || !w_hnorm || !out->data ||
+      !embed->data || !hidden->data)
+    return -1;
+  if (embed->kind != SPITE_TYPE_F32 || hidden->kind != SPITE_TYPE_F32 ||
+      out->kind != SPITE_TYPE_F32)
+    return -1;
+
+  const int64_t d = embed->ne[0];
+  const int64_t t = embed->ne[1] ? embed->ne[1] : 1;
+  if (d < 1 || hidden->ne[0] != d || out->ne[0] != 2 * d)
+    return -1;
+
+  int threads = static_cast<int>(((d + 31) / 32) * 32);
+  threads = threads < 32 ? 32 : (threads > 1024 ? 1024 : threads);
+  dim3 grid(1, static_cast<unsigned>(t));
+
+  mtp_stem_kernel<<<grid, threads, 0, q35_stream(ctx)>>>(
+      static_cast<float *>(out->data), static_cast<const float *>(embed->data),
+      static_cast<const float *>(hidden->data), w_enorm->data, w_enorm->kind,
+      w_hnorm->data, w_hnorm->kind, static_cast<int>(d), eps);
+
+  return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
 // ── Kernel descriptor ────────────────────────────────────────────────────
 
 static const SpiteKernelInfo KERNEL_INFO = {
@@ -177,6 +236,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     qwen35_cuda_kv_cache_kinds,
     qwen35_cuda_linear_attn,
     qwen35_cuda_attention_ex,
+    qwen35_cuda_mtp_stem,
 };
 
 extern "C" const SpiteKernelInfo *spite_kernel_info() { return &KERNEL_INFO; }

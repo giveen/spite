@@ -97,6 +97,7 @@ class SpiteKernelInfo(ctypes.Structure):
         ("kv_cache_kinds",     ctypes.c_void_p),  # trailing optional ABI slot (v4)
         ("linear_attn",        ctypes.c_void_p),  # GDN layer (v7)
         ("attention_ex",       ctypes.c_void_p),  # partial RoPE + gated Q (v7)
+        ("mtp_stem",           ctypes.c_void_p),  # fused MTP stem (v7)
     ]
 
 class SpiteGdnParams(ctypes.Structure):
@@ -161,6 +162,12 @@ AttentionExFn = ctypes.CFUNCTYPE(
     ctypes.c_int,
     *([_TP] * 8), ctypes.c_float, ctypes.POINTER(SpiteKvCache),
     ctypes.c_float, ctypes.POINTER(SpiteAttnParams), ctypes.POINTER(SpiteCtx),
+)
+
+# out, embed, hidden, w_enorm, w_hnorm, eps, ctx
+MtpStemFn = ctypes.CFUNCTYPE(
+    ctypes.c_int,
+    *([_TP] * 5), ctypes.c_float, ctypes.POINTER(SpiteCtx),
 )
 
 # ── Strides and Helpers ───────────────────────────────────────────────────
@@ -430,6 +437,120 @@ def verify_rms_norm(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
         finally:
             cuda.free(d_x)
             cuda.free(d_w)
+            cuda.free(d_o)
+
+    err = max_abs_diff(list(out_ref_arr), test_out)
+    if err > 1e-4:
+        print(f"    FAIL: max_abs_diff={err:.2e} (threshold 1e-4)")
+        return False
+    print(f"    OK: max_abs_diff={err:.2e}")
+    return True
+
+
+def verify_mtp_stem(ref_info: SpiteKernelInfo, test_info: SpiteKernelInfo,
+                    cuda: CudaHelper, is_cuda: bool, dim: int = 128, n_tokens: int = 2) -> bool:
+    print(f"\n  [mtp_stem] dim={dim} tokens={n_tokens}")
+    if not hasattr(ref_info, "mtp_stem") or not ref_info.mtp_stem:
+        print("    SKIP: reference kernel has no mtp_stem")
+        return True
+    if not hasattr(test_info, "mtp_stem") or not test_info.mtp_stem:
+        print("    SKIP: test kernel has no mtp_stem")
+        return True
+
+    rng = random.Random(42)
+    e_data = [rng.gauss(0, 1) for _ in range(dim * n_tokens)]
+    h_data = [rng.gauss(0, 1) for _ in range(dim * n_tokens)]
+    we_data = [rng.uniform(0.5, 1.5) for _ in range(dim)]
+    wh_data = [rng.uniform(0.5, 1.5) for _ in range(dim)]
+    out_dim = 2 * dim * n_tokens
+
+    out_ref_arr = (ctypes.c_float * out_dim)()
+    te, _ = make_tensor(e_data, [dim, n_tokens, 1, 1])
+    th, _ = make_tensor(h_data, [dim, n_tokens, 1, 1])
+    twe, _ = make_tensor(we_data, [dim, 1, 1, 1])
+    twh, _ = make_tensor(wh_data, [dim, 1, 1, 1])
+    to, _ = make_tensor([0.0] * out_dim, [2 * dim, n_tokens, 1, 1])
+    to.data = ctypes.cast(out_ref_arr, ctypes.c_void_p)
+    ctx_ref = make_ctx()
+
+    is_gemma = b"gemma" in (test_info.model_arch or b"").lower()
+    we_arg = None if is_gemma else ctypes.byref(twe)
+    wh_arg = None if is_gemma else ctypes.byref(twh)
+
+    ref_fn = MtpStemFn(ref_info.mtp_stem)
+    ret_ref = ref_fn(ctypes.byref(to), ctypes.byref(te), ctypes.byref(th),
+                     we_arg, wh_arg, 1e-5, ctypes.byref(ctx_ref))
+    if ret_ref != 0:
+        print(f"    SKIP: reference mtp_stem returned {ret_ref}")
+        return True
+
+    test_fn = MtpStemFn(test_info.mtp_stem)
+    if not is_cuda:
+        out_test_arr = (ctypes.c_float * out_dim)()
+        to_test, _ = make_tensor([0.0] * out_dim, [2 * dim, n_tokens, 1, 1])
+        to_test.data = ctypes.cast(out_test_arr, ctypes.c_void_p)
+        ctx_test = make_ctx()
+        ret_test = test_fn(ctypes.byref(to_test), ctypes.byref(te), ctypes.byref(th),
+                           we_arg, wh_arg, 1e-5, ctypes.byref(ctx_test))
+        if ret_test != 0:
+            print(f"    FAIL: test mtp_stem returned {ret_test}")
+            return False
+        test_out = list(out_test_arr)
+    else:
+        if not cuda.available:
+            print("    SKIP: CUDA runtime not available")
+            return True
+        nbytes_act = dim * n_tokens * 4
+        nbytes_norm = dim * 4
+        nbytes_out = out_dim * 4
+        d_e = cuda.malloc(nbytes_act)
+        d_h = cuda.malloc(nbytes_act)
+        d_we = cuda.malloc(nbytes_norm) if not is_gemma else 0
+        d_wh = cuda.malloc(nbytes_norm) if not is_gemma else 0
+        d_o = cuda.malloc(nbytes_out)
+        try:
+            cuda.h2d(d_e, (ctypes.c_float * (dim * n_tokens))(*e_data), nbytes_act)
+            cuda.h2d(d_h, (ctypes.c_float * (dim * n_tokens))(*h_data), nbytes_act)
+            if not is_gemma:
+                cuda.h2d(d_we, (ctypes.c_float * dim)(*we_data), nbytes_norm)
+                cuda.h2d(d_wh, (ctypes.c_float * dim)(*wh_data), nbytes_norm)
+
+            te_gpu, _ = make_tensor([0.0] * (dim * n_tokens), [dim, n_tokens, 1, 1])
+            th_gpu, _ = make_tensor([0.0] * (dim * n_tokens), [dim, n_tokens, 1, 1])
+            to_gpu, _ = make_tensor([0.0] * out_dim, [2 * dim, n_tokens, 1, 1])
+
+            te_gpu.data = d_e
+            th_gpu.data = d_h
+            to_gpu.data = d_o
+
+            if not is_gemma:
+                twe_gpu, _ = make_tensor([0.0] * dim, [dim, 1, 1, 1])
+                twh_gpu, _ = make_tensor([0.0] * dim, [dim, 1, 1, 1])
+                twe_gpu.data = d_we
+                twh_gpu.data = d_wh
+                we_gpu_arg = ctypes.byref(twe_gpu)
+                wh_gpu_arg = ctypes.byref(twh_gpu)
+            else:
+                we_gpu_arg = None
+                wh_gpu_arg = None
+
+            ctx_gpu = make_ctx()
+
+            ret_test = test_fn(ctypes.byref(to_gpu), ctypes.byref(te_gpu), ctypes.byref(th_gpu),
+                               we_gpu_arg, wh_gpu_arg, 1e-5, ctypes.byref(ctx_gpu))
+            cuda.sync()
+            if ret_test != 0:
+                print(f"    FAIL: test mtp_stem returned {ret_test}")
+                return False
+            out_test_arr = (ctypes.c_float * out_dim)()
+            cuda.d2h(out_test_arr, d_o, nbytes_out)
+            test_out = list(out_test_arr)
+        finally:
+            cuda.free(d_e)
+            cuda.free(d_h)
+            if not is_gemma:
+                cuda.free(d_we)
+                cuda.free(d_wh)
             cuda.free(d_o)
 
     err = max_abs_diff(list(out_ref_arr), test_out)
@@ -1788,6 +1909,9 @@ def main():
     passed = True
     passed &= verify_rms_norm(ref_info, test_info, cuda, is_cuda, dim=64)
     passed &= verify_rms_norm(ref_info, test_info, cuda, is_cuda, dim=4096)
+
+    passed &= verify_mtp_stem(ref_info, test_info, cuda, is_cuda, dim=64, n_tokens=1)
+    passed &= verify_mtp_stem(ref_info, test_info, cuda, is_cuda, dim=4096, n_tokens=3)
 
     passed &= verify_matmul(ref_info, test_info, cuda, is_cuda, cols=64, rows=128)
     passed &= verify_matmul(ref_info, test_info, cuda, is_cuda, cols=4096, rows=4096)

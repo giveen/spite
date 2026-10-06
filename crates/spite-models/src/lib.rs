@@ -123,6 +123,7 @@ pub struct ModelConfig {
     pub value_length_swa: usize,
     pub rope_freq_base_swa: f32,
     pub final_logit_softcapping: f32,
+    pub n_nextn_predict_layers: usize,
 
     // ── RoPE scaling (YaRN / linear / NTK) ───────────────────────────────
     /// Multiplicative rope scale factor. 1.0 = no scaling (default).
@@ -219,6 +220,7 @@ impl Default for ModelConfig {
             value_length_swa: 0,
             rope_freq_base_swa: 10000.0,
             final_logit_softcapping: 0.0,
+            n_nextn_predict_layers: 0,
             rope_scale_factor: 1.0,
             rope_original_ctx: 0,
             yarn_beta_fast: 32.0,
@@ -289,6 +291,7 @@ impl From<spite_loader::config::ModelHyperparams> for ModelConfig {
             value_length_swa: h.value_length_swa as usize,
             rope_freq_base_swa: h.rope_freq_base_swa,
             final_logit_softcapping: h.final_logit_softcapping,
+            n_nextn_predict_layers: h.n_nextn_predict_layers as usize,
             ..Default::default()
         }
     }

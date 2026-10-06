@@ -437,3 +437,75 @@ int spite_generic_matmul(
     free(wf);
     return 0;
 }
+
+/* ── MTP Stem ─────────────────────────────────────────────────────────── */
+
+int spite_generic_mtp_stem(
+    SpiteTensor       *out_packed,
+    const SpiteTensor *embed,
+    const SpiteTensor *hidden,
+    const SpiteTensor *w_enorm,
+    const SpiteTensor *w_hnorm,
+    float              eps,
+    const SpiteCtx    *ctx
+) {
+    (void)ctx;
+    if (!out_packed || !embed || !hidden) return -1;
+    if (embed->kind != SPITE_TYPE_F32 || hidden->kind != SPITE_TYPE_F32 || out_packed->kind != SPITE_TYPE_F32) return -1;
+
+    const int d = tensor_cols(embed);
+    int t = tensor_rows(embed);
+    if (t < 1) t = 1;
+    if (tensor_cols(out_packed) != 2 * d) return -1;
+
+    float *we = w_enorm ? dequant_to_f32(w_enorm) : NULL;
+    float *wh = w_hnorm ? dequant_to_f32(w_hnorm) : NULL;
+    if ((w_enorm && !we) || (w_hnorm && !wh)) {
+        if (we) free(we);
+        if (wh) free(wh);
+        return -1;
+    }
+
+    const float *e_data = (const float *)embed->data;
+    const float *h_data = (const float *)hidden->data;
+    float *out_data = (float *)out_packed->data;
+    const float emb_scale = sqrtf((float)d);
+
+    for (int tok = 0; tok < t; ++tok) {
+        const float *e_tok = e_data + (size_t)tok * d;
+        const float *h_tok = h_data + (size_t)tok * d;
+        float *out_tok = out_data + (size_t)tok * (2 * d);
+
+        if (we && wh) {
+            /* Qwen-style MTP stem: RMSNorm(embed) * we, RMSNorm(hidden) * wh */
+            float sum_e = 0.0f;
+            float sum_h = 0.0f;
+            for (int i = 0; i < d; ++i) {
+                sum_e += e_tok[i] * e_tok[i];
+                sum_h += h_tok[i] * h_tok[i];
+            }
+            const float rms_e = sqrtf(sum_e / (float)d + eps);
+            const float rms_h = sqrtf(sum_h / (float)d + eps);
+
+            for (int i = 0; i < d; ++i) {
+                out_tok[i]     = (e_tok[i] / rms_e) * we[i];
+                out_tok[d + i] = (h_tok[i] / rms_h) * wh[i];
+            }
+        } else {
+            /* Gemma-style MTP stem: embed * sqrt(d), hidden */
+            for (int i = 0; i < d; ++i) {
+                float ev = e_tok[i] * emb_scale;
+                if (we) ev *= we[i];
+                out_tok[i] = ev;
+
+                float hv = h_tok[i];
+                if (wh) hv *= wh[i];
+                out_tok[d + i] = hv;
+            }
+        }
+    }
+
+    if (we) free(we);
+    if (wh) free(wh);
+    return 0;
+}

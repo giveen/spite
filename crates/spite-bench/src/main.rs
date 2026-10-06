@@ -101,49 +101,76 @@ fn main() -> Result<()> {
     };
     let kv_label = format!("{}/{}", kv_cfg.key, kv_cfg.val);
 
-    let (model, device_label): (Box<dyn spite_models::ModelArch>, String) = match args.device {
-        Device::Cpu => {
-            let mut m = ArchRegistry::default().build(ModelConfig::from(hp))?;
-            m.load_weights(&gguf)?;
-            (m, "cpu".into())
-        }
-        Device::Cuda | Device::Auto => {
-            match spite_models::gpu_dense::GpuDense::resolve_table(
-                &hp.arch,
-                &gpu_arch,
-                &args.kernels_dir,
-            ) {
-                Some(table) => {
-                    let qk_norm = hp.arch == "qwen3";
-                    let (m, r) = spite_models::gpu_dense::GpuDense::load(
-                        ModelConfig::from(hp),
-                        &gguf,
-                        table,
-                        4096,
-                        qk_norm,
-                        &kv_cfg,
-                    )
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                    peak_mem_mib =
-                        ((r.weights_bytes + r.kv_bytes + r.scratch_bytes) / (1024 * 1024)) as u64;
-                    (Box::new(m), format!("cuda ({gpu_arch}, kv {kv_label})"))
-                }
-                None if args.device == Device::Cuda => {
-                    anyhow::bail!(
-                        "--device cuda: no CUDA kernel for arch '{}' on '{}' under {}",
-                        hp.arch,
-                        gpu_arch,
-                        args.kernels_dir.display()
-                    );
+    let cfg = ModelConfig::from(hp);
+    let (model, device_label): (Box<dyn spite_models::ModelArch>, String) =
+        if spite_models::hybrid::is_hybrid(&cfg) {
+            use spite_models::hybrid::HybridDecoder;
+            let want_gpu = args.device != Device::Cpu;
+            let resolved = if want_gpu {
+                HybridDecoder::resolve_table(&cfg.arch, &gpu_arch, &args.kernels_dir, true)
+            } else {
+                None
+            };
+            let resolved = resolved.or_else(|| {
+                HybridDecoder::resolve_table(&cfg.arch, &gpu_arch, &args.kernels_dir, false)
+            });
+            match resolved {
+                Some((table, backend)) => {
+                    let (m, r) = HybridDecoder::load(cfg, &gguf, table, backend, 4096)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    peak_mem_mib = ((r.weights_bytes + r.state_bytes + r.scratch_bytes)
+                        / (1024 * 1024)) as u64;
+                    let dev = if backend == spite_gpu::GpuBackend::Cpu {
+                        "cpu".into()
+                    } else {
+                        format!("cuda ({gpu_arch})")
+                    };
+                    (Box::new(m), dev)
                 }
                 None => {
-                    let mut m = ArchRegistry::default().build(ModelConfig::from(hp))?;
+                    anyhow::bail!("no hybrid kernel for arch '{}' on '{}'", cfg.arch, gpu_arch);
+                }
+            }
+        } else {
+            match args.device {
+                Device::Cpu => {
+                    let mut m = ArchRegistry::default().build(cfg)?;
                     m.load_weights(&gguf)?;
                     (m, "cpu".into())
                 }
+                Device::Cuda | Device::Auto => {
+                    match spite_models::gpu_dense::GpuDense::resolve_table(
+                        &cfg.arch,
+                        &gpu_arch,
+                        &args.kernels_dir,
+                    ) {
+                        Some(table) => {
+                            let qk_norm = cfg.arch == "qwen3";
+                            let (m, r) = spite_models::gpu_dense::GpuDense::load(
+                                cfg, &gguf, table, 4096, qk_norm, &kv_cfg,
+                            )
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            peak_mem_mib = ((r.weights_bytes + r.kv_bytes + r.scratch_bytes)
+                                / (1024 * 1024)) as u64;
+                            (Box::new(m), format!("cuda ({gpu_arch}, kv {kv_label})"))
+                        }
+                        None if args.device == Device::Cuda => {
+                            anyhow::bail!(
+                                "--device cuda: no CUDA kernel for arch '{}' on '{}' under {}",
+                                cfg.arch,
+                                gpu_arch,
+                                args.kernels_dir.display()
+                            );
+                        }
+                        None => {
+                            let mut m = ArchRegistry::default().build(cfg)?;
+                            m.load_weights(&gguf)?;
+                            (m, "cpu".into())
+                        }
+                    }
+                }
             }
-        }
-    };
+        };
 
     if args.verbose {
         let mut spec =

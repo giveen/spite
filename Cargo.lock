@@ -1307,6 +1307,7 @@ dependencies = [
  "spite-abi",
  "spite-dispatch",
  "spite-executor",
+ "spite-gpu",
  "spite-kvcache",
  "spite-loader",
  "spite-models",

@@ -109,6 +109,8 @@ pub struct ModelHyperparams {
     pub value_length_swa: u32,
     pub rope_freq_base_swa: f32,
     pub final_logit_softcapping: f32,
+    /// Multi-Token Prediction (MTP / NextN) draft blocks count.
+    pub n_nextn_predict_layers: u32,
 }
 
 impl ModelHyperparams {
@@ -330,6 +332,7 @@ impl ModelHyperparams {
             value_length_swa: u("attention.value_length_swa"),
             rope_freq_base_swa: f("rope.freq_base_swa"),
             final_logit_softcapping: f("final_logit_softcapping"),
+            n_nextn_predict_layers: u("nextn_predict_layers"),
         }
     }
 

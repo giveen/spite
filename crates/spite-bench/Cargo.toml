@@ -15,6 +15,7 @@ spite-abi      = { workspace = true }
 spite-dispatch = { workspace = true }
 spite-models   = { workspace = true }
 spite-loader   = { workspace = true }
+spite-gpu      = { workspace = true }
 spite-executor = { workspace = true }
 spite-sampling = { workspace = true }
 spite-kvcache  = { workspace = true }
