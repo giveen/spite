@@ -1,310 +1,397 @@
 /*
  * kernels/qwen/qwen3_8/nvidia/kv_attn_flash.inl
  *
- * Flash-decoding attention for Qwen3.8 NVIDIA kernels.
+ * Flash-decoding attention for the Qwen3.8 NVIDIA kernels — the portable back end
+ * for the vendor root, i.e. every CUDA architecture this tree builds for
+ * (sm_75 Turing through sm_120 Blackwell).  Nothing here is arch-specific: no
+ * 128-bit vector types, no async copies, no dynamic shared memory, no
+ * assumption beyond what CUDA C++ guarantees on all of them, so the same
+ * source is what every NVIDIA card runs.
  *
- * Portable CUDA C++ — no arch-specific PTX, no Tensor Cores, no async copies —
- * so the same source compiles on sm_60 (P100) through sm_120 (Blackwell).
- * Arch kernels (sm_60/) can override the inner tile by defining
- * SPITE_KVFLASH_ARCH and providing:
+ * Ported verbatim from kernels/qwen/qwen3/nvidia/kv_attn_flash.inl (names only).
+ *
+ * Why this exists (measured on the Qwen3 tree, RTX 5090, nh=32/nkv=8/hd=128, n_tok=4096):
+ * the portable VBR back end in kv_attn.inl spends 72% of the op in
+ * `kvattn_weighted_v_f32` — one block per query head (32 blocks on 170 SMs),
+ * each thread walking the whole KV history one dependent FMA at a time.  Two
+ * properties of the decode shape are worth exploiting instead:
+ *
+ *   1. Every query head in a GQA group reads the same K/V rows, so the VBR
+ *      cache is currently dequantized `group` times over.  KV is staged in
+ *      shared memory once per KV head and shared by the whole group.
+ *   2. The score vector does not need to be materialized.  Scores are consumed
+ *      where they are produced (online softmax), which removes the
+ *      nh*n_ctx-float buffer and the three passes over it.
+ *
+ * Decode-only model — the host issues one token per call — so this is
+ * FlashDecoding rather than a q-tiled FlashAttention: the KV axis is split
+ * across blocks (one block = one KV head x one KV range), each block writes its
+ * partial (m, l, acc) and kvflash_combine() folds them together.  Splitting the
+ * KV axis is what buys the parallelism; sharing the tile across the group is
+ * what buys the bandwidth.
+ *
+ * Included at global scope from a kernel.cu, after kv_attn.inl (it uses
+ * KvattnArgs/kvattn_prologue/kvq_get/kvq_row_bytes) and after the file's
+ * anonymous namespace (it uses warp_max, warp_sum, threads_for, stream_of and
+ * launch_matvec, exactly like kv_attn.inl does).
+ *
+ * An arch kernel may supply its own tile kernel instead: define
+ * SPITE_KVFLASH_ARCH, then provide (before including this file)
  *
  *   bool kvflash_hd_supported(int hd);
  *   int  kvflash_launch_hd(const KvattnArgs& a, int chunks, int per,
  *                          float* acc, float* m, float* l, cudaStream_t s);
  *
- * plus KVFLASH_TILE / KVFLASH_WARPS.  The chunking, split-K workspace,
- * combine pass, and kvflash_run() are shared regardless.
- *
- * KVFLASH_TILE must be ≤ 32.  warp_sum() reduces exactly 32 lanes; with
- * blockDim.x = KVFLASH_TILE the dot product loop over head_dim uses
- * stride = blockDim.x, so each thread accumulates a partial sum and one
- * warp_sum() collects them correctly.  A TILE > 32 spreads one KV head
- * across two warps, making the reduction silently incomplete.
- *
- * K/V tiles are stored as __half2 in shared memory, halving smem usage
- * (e.g. 16 KB instead of 64 KB at TILE=32, head_dim=128) and enabling
- * 4 concurrent blocks/SM on GP100 with __launch_bounds__(128,4).
- *
- * Included after kv_attn.inl and after the anonymous namespace in kernel.cu
- * (uses warp_max, warp_sum, threads_for, stream_of, launch_matvec, KvattnArgs,
- * kvattn_prologue, kvq_get, kvq_row_bytes, attn_softmax).
+ * plus KVFLASH_TILE / KVFLASH_WARPS for its own tile geometry (the scaffolding
+ * reads those macros for its chunking heuristic).  The portable tile kernel and
+ * dispatch below are then not emitted, and the chunking, the split-K workspace,
+ * the combine pass and kvflash_run() stay shared — so the levels cannot drift
+ * on anything except the tile kernel itself.
  */
 
 #ifndef SPITE_QWEN3_8_KV_ATTN_FLASH_INL
 #define SPITE_QWEN3_8_KV_ATTN_FLASH_INL
 
+/* KV rows staged per tile.  A tile is one warp-wide score step (lane == KV
+ * index inside the tile), so it cannot be smaller than a warp. */
 #ifndef KVFLASH_TILE
 #define KVFLASH_TILE 32
 #endif
+/* Query heads handled per block (one warp each).  Qwen3-8B has 4 query heads
+ * per KV head, so the default covers a whole GQA group in one pass. */
 #ifndef KVFLASH_WARPS
 #define KVFLASH_WARPS 4
 #endif
+/* Keep every chunk at least this many tiles wide, so splitting the KV axis for
+ * occupancy does not degenerate into one row per block. */
+constexpr int KVFLASH_TILES_MIN = 4;
 
-/* Optional per-arch launch bounds hint — default: no constraint. */
-#ifndef KVFLASH_LAUNCH_BOUNDS
-#define KVFLASH_LAUNCH_BOUNDS
-#endif
-
-/* ── Fast exp helper ──────────────────────────────────────────────────────── */
-
-/* ex2.approx.f32 is ~4 cycles on sm_60+ vs ~16 for full __expf. */
-__device__ __forceinline__ float exp2_approx(float x) {
-    float r;
-    asm("ex2.approx.f32 %0,%1;" : "=f"(r) : "f"(x));
-    return r;
-}
-
-/* Natural exp via base-2: expf(x) = 2^(x * log2e). */
-static __device__ __forceinline__ float kvf_expf(float x) {
-    return exp2_approx(x * 1.4426950408889634f);
-}
-
-/* ── Split-K workspace ────────────────────────────────────────────────────── */
-
-/* One partial result per (chunk × head). */
-struct KvFlashPartial {
-    float m;   /* running max */
-    float l;   /* running sum-exp denominator */
-    /* acc[head_dim] follows immediately; layout: [chunks, n_heads, 1+1+head_dim] */
-};
-
-/* ── Portable tile kernel ─────────────────────────────────────────────────── */
+/* The split-K workspace is carved out of the region kvattn_prologue() reserved
+ * for the VBR score vector: that is nh*n_ctx floats, which is what let this fit
+ * without changing the host's scratchpad budget.  Layout (floats), `acc` first
+ * because a tile kernel may store it with 128-bit writes:
+ *   acc [chunks*nh*hd]  m [chunks*nh]  l [chunks*nh]
+ * chunks <= n_ctx/(hd+2) keeps the sum inside the scores reservation. */
 
 #ifndef SPITE_KVFLASH_ARCH
+/* One warp per query head of the GQA group; the block loads a KV tile once for
+ * the whole group, so the VBR decode cost is paid once per KV head instead of
+ * once per query head. */
+template <int HD>
+__global__ void kvflash_core_portable(const float* __restrict__ q,
+                                      const uint8_t* __restrict__ kc,
+                                      const uint8_t* __restrict__ vc, int row_bytes, int kind,
+                                      int nh, int group, int n_tok, int per, float scale,
+                                      float* __restrict__ wm, float* __restrict__ wl,
+                                      float* __restrict__ wacc) {
+    /* A lane owns KV row `lane` in the score phase and dims lane+32e in the
+     * P.V phase, so the head range must split evenly across lanes and start on
+     * a VBR block boundary. */
+    static_assert(HD % 32 == 0, "flash tile: head_dim must be a multiple of 32");
+    constexpr int NLANE = HD / 32;  /* output dims owned by one lane */
+    const int lane = threadIdx.x;
+    const int w = threadIdx.y;
+    const int nwarps = blockDim.y;
+    const int gchunks = (group + KVFLASH_WARPS - 1) / KVFLASH_WARPS;
 
-static_assert(KVFLASH_TILE <= 32,
-    "KVFLASH_TILE must be <= 32: warp_sum() only reduces one warp (32 lanes)");
+    /* +1 word of row padding: the score phase reads one column across 32 rows,
+     * and an unpadded row stride is a multiple of 32 words, i.e. a 32-way bank
+     * conflict for every single load. */
+    __shared__ float s_q[KVFLASH_WARPS][HD];
+    __shared__ float s_k[KVFLASH_TILE][HD + 1];
+    __shared__ float s_v[KVFLASH_TILE][HD + 1];
+    __shared__ float s_p[KVFLASH_WARPS][KVFLASH_TILE];
+
+    const int kh = blockIdx.y / gchunks;
+    const int hw = blockIdx.y % gchunks * (int)nwarps + w;
+    const bool live = hw < group;
+    const int h = kh * group + hw;
+
+    const int t_begin = blockIdx.x * per;
+    const int t_end = min(n_tok, t_begin + per);
+
+    if (live)
+        for (int i = lane; i < HD; i += 32) s_q[w][i] = q[static_cast<size_t>(h) * HD + i];
+    __syncwarp();
+
+    float m = -INFINITY, l = 0.0f;
+    float acc[NLANE];
+#pragma unroll
+    for (int e = 0; e < NLANE; ++e) acc[e] = 0.0f;
+
+    for (int t0 = t_begin; t0 < t_end; t0 += KVFLASH_TILE) {
+        /* Stage K and V for this tile, decoded to float, once for the group.
+         * Warp w owns rows w, w+nwarps, ... and the lanes walk a row, so the
+         * global side is coalesced and the smem side is conflict-free.
+         *
+         * The block tiers decode inline rather than through kvq_get(): element
+         * lane+32k of a head sits in block k at position lane, so the block
+         * index is the loop index and the per-element tier switch plus block
+         * address math disappear from the hottest loop in the op. */
+        for (int t = w; t < KVFLASH_TILE; t += nwarps) {
+            const int gt = t0 + t;
+            const bool ok = gt < t_end;
+            const uint8_t* kr = kc + static_cast<size_t>(gt) * row_bytes;
+            const uint8_t* vr = vc + static_cast<size_t>(gt) * row_bytes;
+            float* skrow = s_k[t];
+            float* svrow = s_v[t];
+
+            if (kind == SPITE_TYPE_F32) {
+                const float* kf =
+                    reinterpret_cast<const float*>(kr) + static_cast<size_t>(kh) * HD;
+                const float* vf =
+                    reinterpret_cast<const float*>(vr) + static_cast<size_t>(kh) * HD;
+#pragma unroll 4
+                for (int i = lane; i < HD; i += 32) {
+                    skrow[i] = ok ? kf[i] : 0.0f;
+                    svrow[i] = ok ? vf[i] : 0.0f;
+                }
+            } else if (kind == SPITE_TYPE_F16) {
+                const __half* khs =
+                    reinterpret_cast<const __half*>(kr) + static_cast<size_t>(kh) * HD;
+                const __half* vhs =
+                    reinterpret_cast<const __half*>(vr) + static_cast<size_t>(kh) * HD;
+#pragma unroll 4
+                for (int i = lane; i < HD; i += 32) {
+                    skrow[i] = ok ? __half2float(khs[i]) : 0.0f;
+                    svrow[i] = ok ? __half2float(vhs[i]) : 0.0f;
+                }
+            } else if (kind == SPITE_TYPE_Q8_0) {
+                const BlockQ8_0* kb =
+                    reinterpret_cast<const BlockQ8_0*>(kr) + static_cast<size_t>(kh) * (HD / 32);
+                const BlockQ8_0* vb =
+                    reinterpret_cast<const BlockQ8_0*>(vr) + static_cast<size_t>(kh) * (HD / 32);
+#pragma unroll
+                for (int k = 0; k < HD / 32; ++k) {
+                    skrow[lane + 32 * k] =
+                        ok ? __half2float(kb[k].d) * static_cast<float>(kb[k].qs[lane]) : 0.0f;
+                    svrow[lane + 32 * k] =
+                        ok ? __half2float(vb[k].d) * static_cast<float>(vb[k].qs[lane]) : 0.0f;
+                }
+            } else if (kind == SPITE_TYPE_Q5_1) {
+                const KvqQ5_1* kb =
+                    reinterpret_cast<const KvqQ5_1*>(kr) + static_cast<size_t>(kh) * (HD / 32);
+                const KvqQ5_1* vb =
+                    reinterpret_cast<const KvqQ5_1*>(vr) + static_cast<size_t>(kh) * (HD / 32);
+#pragma unroll
+                for (int k = 0; k < HD / 32; ++k) {
+                    if (ok) {
+                        const int j = lane & 15;
+                        const uint8_t kbq = kb[k].qs[j];
+                        const uint8_t vbq = vb[k].qs[j];
+                        const uint32_t klo = (lane < 16) ? (kbq & 0x0Fu) : (kbq >> 4);
+                        const uint32_t vlo = (lane < 16) ? (vbq & 0x0Fu) : (vbq >> 4);
+                        const uint32_t kq = klo | (((kb[k].qh >> lane) & 1u) << 4);
+                        const uint32_t vq = vlo | (((vb[k].qh >> lane) & 1u) << 4);
+                        skrow[lane + 32 * k] =
+                            static_cast<float>(kq) * __half2float(kb[k].d) + __half2float(kb[k].m);
+                        svrow[lane + 32 * k] =
+                            static_cast<float>(vq) * __half2float(vb[k].d) + __half2float(vb[k].m);
+                    } else {
+                        skrow[lane + 32 * k] = 0.0f;
+                        svrow[lane + 32 * k] = 0.0f;
+                    }
+                }
+            } else { /* SPITE_TYPE_Q4_0 */
+                const KvqQ4_0* kb =
+                    reinterpret_cast<const KvqQ4_0*>(kr) + static_cast<size_t>(kh) * (HD / 32);
+                const KvqQ4_0* vb =
+                    reinterpret_cast<const KvqQ4_0*>(vr) + static_cast<size_t>(kh) * (HD / 32);
+#pragma unroll
+                for (int k = 0; k < HD / 32; ++k) {
+                    if (ok) {
+                        const int j = lane & 15;
+                        const uint8_t kbq = kb[k].qs[j];
+                        const uint8_t vbq = vb[k].qs[j];
+                        const int klo = (lane < 16) ? (kbq & 0x0F) : (kbq >> 4);
+                        const int vlo = (lane < 16) ? (vbq & 0x0F) : (vbq >> 4);
+                        skrow[lane + 32 * k] = static_cast<float>(klo - 8) * __half2float(kb[k].d);
+                        svrow[lane + 32 * k] = static_cast<float>(vlo - 8) * __half2float(vb[k].d);
+                    } else {
+                        skrow[lane + 32 * k] = 0.0f;
+                        svrow[lane + 32 * k] = 0.0f;
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        /* Scores: lane == position inside the tile, so q.k_t is a per-lane FMA
+         * chain with no shuffle tree (the VBR back end needs 5 shuffles per
+         * 4 FMAs here).  Four accumulators keep the chain off the critical
+         * path. */
+        const int gt = t0 + lane;
+        float s = -INFINITY;
+        if (live && gt < t_end) {
+            const float* krow = s_k[lane];
+            const float* qrow = s_q[w];
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            int i = 0;
+#pragma unroll 4
+            for (; i + 4 <= HD; i += 4) {
+                a0 = fmaf(qrow[i + 0], krow[i + 0], a0);
+                a1 = fmaf(qrow[i + 1], krow[i + 1], a1);
+                a2 = fmaf(qrow[i + 2], krow[i + 2], a2);
+                a3 = fmaf(qrow[i + 3], krow[i + 3], a3);
+            }
+            for (; i < HD; ++i) a0 = fmaf(qrow[i], krow[i], a0);
+            s = (a0 + a1 + a2 + a3) * scale;
+        }
+
+        /* Online softmax: rescale the running accumulator instead of writing
+         * the scores out and walking them again. */
+        const float m_new = fmaxf(m, warp_max(s));
+        const float alpha = __expf(m - m_new);
+        const float p = __expf(s - m_new);
+        l = l * alpha + warp_sum(p);
+        m = m_new;
+#pragma unroll
+        for (int e = 0; e < NLANE; ++e) acc[e] *= alpha;
+        if (live) s_p[w][lane] = p;
+        __syncwarp();
+
+        /* P.V: the lane owns output dims now, so every staged V element is used
+         * once per (head, tile) rather than once per token. */
+        if (live) {
+            for (int t = 0; t < KVFLASH_TILE; ++t) {
+                if (t0 + t >= t_end) break;
+                const float pv = s_p[w][t];
+                const float* vrow = s_v[t];
+#pragma unroll
+                for (int e = 0; e < NLANE; ++e)
+                    acc[e] = fmaf(pv, vrow[lane + 32 * e], acc[e]);
+            }
+        }
+        __syncthreads();
+    }
+
+    /* Hand the partial (m, l, acc) to the combine pass.  A chunk that falls
+     * past the end of the KV history contributes nothing: m stays -inf, so its
+     * combine weight exp(m - M) is 0. */
+    if (live) {
+        if (lane == 0) {
+            wm[static_cast<size_t>(blockIdx.x) * nh + h] = m;
+            wl[static_cast<size_t>(blockIdx.x) * nh + h] = l;
+        }
+#pragma unroll
+        for (int e = 0; e < NLANE; ++e) {
+            const int d = lane + 32 * e;
+            if (d < HD)
+                wacc[(static_cast<size_t>(blockIdx.x) * nh + h) * HD + d] = acc[e];
+        }
+    }
+}
+
+/* Head dims the tile kernel covers: multiples of 32, so a head's element range
+ * both splits evenly across the 32 lanes and starts on a VBR block boundary.
+ * Anything else (hd=80, hd=256, …) needs no special handling — kvflash_run()
+ * hands it to the VBR back end, which decodes through kvq_get() element-wise. */
+inline bool kvflash_hd_supported(int hd) {
+    return hd == 32 || hd == 64 || hd == 96 || hd == 128;
+}
+
+template <int HD>
+inline int kvflash_launch_tile(const KvattnArgs& a, int chunks, int per, float* acc, float* m,
+                               float* l, cudaStream_t s) {
+    const int gchunks = (a.group + KVFLASH_WARPS - 1) / KVFLASH_WARPS;
+    const dim3 grid(chunks, a.nkv * gchunks);
+    const dim3 block(32, KVFLASH_WARPS);
+    kvflash_core_portable<HD><<<grid, block, 0, s>>>(a.q, a.kc, a.vc, a.row_bytes, a.kind, a.nh,
+                                                     a.group, a.n_tok, per, a.scale, m, l, acc);
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+inline int kvflash_launch_hd(const KvattnArgs& a, int chunks, int per, float* acc, float* m,
+                             float* l, cudaStream_t s) {
+    switch (a.hd) {
+    case 32: return kvflash_launch_tile<32>(a, chunks, per, acc, m, l, s);
+    case 64: return kvflash_launch_tile<64>(a, chunks, per, acc, m, l, s);
+    case 96: return kvflash_launch_tile<96>(a, chunks, per, acc, m, l, s);
+    case 128: return kvflash_launch_tile<128>(a, chunks, per, acc, m, l, s);
+    default: return -1;
+    }
+}
+#endif  /* !SPITE_KVFLASH_ARCH */
+
+/* Fold the per-(chunk, head) partials into the attention output.
+ *
+ * out[h] = sum_c exp(m_c - M) * acc_c[h] / sum_c exp(m_c - M) * l_c,  M = max_c m_c
+ * One block per query head; the chunk axis is walked twice (max, then the
+ * weighted sum), which is cheap next to the tile kernels. */
+__global__ void kvflash_combine(float* __restrict__ att, const float* __restrict__ wm,
+                                const float* __restrict__ wl, const float* __restrict__ wacc,
+                                int chunks, int nh, int hd) {
+    const int h = blockIdx.x;
+    float M = -INFINITY;
+    for (int c = 0; c < chunks; ++c) M = fmaxf(M, wm[static_cast<size_t>(c) * nh + h]);
+
+    float den = 0.0f;
+    for (int c = 0; c < chunks; ++c)
+        den += __expf(wm[static_cast<size_t>(c) * nh + h] - M) * wl[static_cast<size_t>(c) * nh + h];
+    const float inv = den > 0.0f ? 1.0f / den : 0.0f;
+
+    const float* acch = wacc + static_cast<size_t>(h) * hd;
+    float* outh = att + static_cast<size_t>(h) * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        float num = 0.0f;
+        for (int c = 0; c < chunks; ++c)
+            num += __expf(wm[static_cast<size_t>(c) * nh + h] - M) *
+                   acch[static_cast<size_t>(c) * nh * hd + i];
+        outh[i] = num * inv;
+    }
+}
 
 /*
- * One block = one KV range × one GQA group.
- *   gridDim.x  = n_chunks
- *   gridDim.y  = n_kv_heads
- *   blockDim.x = KVFLASH_TILE   (one lane = one KV position; must be ≤ 32)
- *   blockDim.y = KVFLASH_WARPS  (one warp = one query head in the group)
+ * Flash-decoding attention for one token at `ctx->pos`.
  *
- * Shared memory layout (half2 — halves bandwidth and smem vs float):
- *   k_tile[KVFLASH_TILE][head_dim/2]  __half2  (dequantised K)
- *   v_tile[KVFLASH_TILE][head_dim/2]  __half2  (dequantised V)
- *
- * With KVFLASH_TILE=32, head_dim=128, KVFLASH_WARPS=4 (128 threads/block):
- *   smem = 2 × 32 × 64 × 4 = 16 384 bytes (16 KB)
- *   → 4 blocks/SM on GP100 (64 KB/SM) with KVFLASH_LAUNCH_BOUNDS=(128,4)
+ * Shapes the tile kernel does not cover (head_dim outside the arch dispatch,
+ * or a context too short to hold even one chunk of the split-K workspace) fall
+ * back to kvattn_run(), which is why the pre-check runs before the prologue
+ * rather than after it: falling back later would re-run the projections only to
+ * throw the result away.
  */
-KVFLASH_LAUNCH_BOUNDS
-__global__ void kvflash_tile(
-        const KvattnArgs* __restrict__ ga,
-        int chunks, int per,
-        float* __restrict__ acc_out,  /* [chunks, n_heads, head_dim] */
-        float* __restrict__ m_out,    /* [chunks, n_heads]           */
-        float* __restrict__ l_out)    /* [chunks, n_heads]           */
-{
-    extern __shared__ __half2 smem_h2[];  /* k_tile then v_tile */
-    const KvattnArgs& a = *ga;
+inline int kvflash_run(SpiteTensor* out, const SpiteTensor* x, const SpiteTensor* wq,
+                       const SpiteTensor* wk, const SpiteTensor* wv, const SpiteTensor* wo,
+                       const SpiteTensor* q_norm, const SpiteTensor* k_norm, float norm_eps,
+                       SpiteKvCache* kv, float rope_freq_base, const SpiteCtx* ctx) {
+    if (!ctx || !kv || ctx->n_heads <= 0 || ctx->n_kv_heads <= 0) return -1;
+    const int hd = static_cast<int>(wq->ne[1]) / ctx->n_heads;
+    const int n_ctx = static_cast<int>(kv->k.ne[1]);
+    /* The workspace below is carved out of the scores region, which is nh*n_ctx
+     * floats, and costs chunks*nh*(hd+2) of it. */
+    if (!kvflash_hd_supported(hd) || n_ctx < hd + 2)
+        return kvattn_run(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kv, rope_freq_base,
+                          ctx);
 
-    const int chunk    = blockIdx.x;
-    const int kv_head  = blockIdx.y;
-    const int q_in_grp = threadIdx.y;
-    const int grp_sz   = a.n_heads / a.n_kv_heads;
-    const int q_head   = kv_head * grp_sz + q_in_grp;
-    if (q_head >= a.n_heads) return;
+    KvattnArgs a;
+    const int rc = kvattn_prologue(&a, x, wq, wk, wv, q_norm, k_norm, norm_eps, kv,
+                                   rope_freq_base, ctx);
+    if (rc) return rc;
 
-    const int t_start = chunk * per;
-    const int t_end   = min(t_start + per, a.n_tok);
-    if (t_start >= a.n_tok) return;
+    const int nh = a.nh;
+    /* The tile kernel writes acc with 128-bit stores, so it starts on a 16-byte
+     * boundary; the 0..3 floats of slack come out of the budget below. */
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(a.scores);
+    const uintptr_t aligned = (raw + 15u) & ~static_cast<uintptr_t>(15u);
+    const int pad = static_cast<int>((aligned - raw) / sizeof(float));
+    const int avail = static_cast<int>(ctx->scratchpad_bytes / sizeof(float)) -
+                      (2 * nh * a.hd + 2 * a.kv_stride) - pad;
+    const int cmax = avail / (nh * (a.hd + 2));
+    int chunks = (a.n_tok + KVFLASH_TILES_MIN * KVFLASH_TILE - 1) / (KVFLASH_TILES_MIN * KVFLASH_TILE);
+    if (chunks > cmax) chunks = cmax;
+    if (chunks < 1) chunks = 1;
+    const int per = (a.n_tok + chunks - 1) / chunks;
 
-    const int hd2 = a.head_dim / 2;  /* __half2 elements per KV vector */
-    __half2* k_tile = smem_h2;
-    __half2* v_tile = smem_h2 + KVFLASH_TILE * hd2;
-
-    const float* qh = a.q + (size_t)q_head * a.head_dim;
-    float* acc = acc_out + ((size_t)chunk * a.n_heads + q_head) * a.head_dim;
-    float* mp  = m_out   +  (size_t)chunk * a.n_heads + q_head;
-    float* lp  = l_out   +  (size_t)chunk * a.n_heads + q_head;
-
-    float m_cur = -INFINITY, l_cur = 0.0f;
-    for (int i = threadIdx.x; i < a.head_dim; i += blockDim.x) acc[i] = 0.0f;
-
-    for (int t = t_start; t < t_end; t += KVFLASH_TILE) {
-        const int tile_len = min(KVFLASH_TILE, t_end - t);
-
-        /* Load K tile into shared memory as half2 (one lane per KV step, y=0). */
-        if (threadIdx.y == 0 && threadIdx.x < tile_len) {
-            const int tt = t + threadIdx.x;
-            const size_t koff = ((size_t)tt * a.n_kv_heads + kv_head);
-            const void* krow = static_cast<const char*>(a.k_cache) +
-                               koff * kvq_row_bytes(a.kv_kind, a.head_dim);
-            for (int i = 0; i < hd2; ++i) {
-                const float lo = kvq_get(krow, a.kv_kind, i * 2);
-                const float hi = kvq_get(krow, a.kv_kind, i * 2 + 1);
-                k_tile[threadIdx.x * hd2 + i] = __floats2half2_rn(lo, hi);
-            }
-        }
-        __syncthreads();
-
-        /* Score each KV step in the tile; dot over paired half2 elements. */
-        float scores_local[KVFLASH_TILE];
-        for (int k = 0; k < tile_len; ++k) {
-            float dot = 0.0f;
-            for (int i = threadIdx.x; i < hd2; i += blockDim.x) {
-                const __half2 kv2 = k_tile[k * hd2 + i];
-                dot += qh[i * 2]     * __half2float(__low2half(kv2))
-                     + qh[i * 2 + 1] * __half2float(__high2half(kv2));
-            }
-            dot = warp_sum(dot);
-            scores_local[k] = dot * a.scale;
-        }
-
-        /* Online softmax update using kvf_expf (PTX ex2.approx). */
-        float m_new = m_cur;
-        for (int k = 0; k < tile_len; ++k) m_new = fmaxf(m_new, scores_local[k]);
-        const float corr = kvf_expf(m_cur - m_new);
-        l_cur *= corr;
-        for (int i = threadIdx.x; i < a.head_dim; i += blockDim.x) acc[i] *= corr;
-        m_cur = m_new;
-
-        /* Load V tile as half2. */
-        if (threadIdx.y == 0 && threadIdx.x < tile_len) {
-            const int tt = t + threadIdx.x;
-            const size_t voff = ((size_t)tt * a.n_kv_heads + kv_head);
-            const void* vrow = static_cast<const char*>(a.v_cache) +
-                               voff * kvq_row_bytes(a.kv_kind, a.head_dim);
-            for (int i = 0; i < hd2; ++i) {
-                const float lo = kvq_get(vrow, a.kv_kind, i * 2);
-                const float hi = kvq_get(vrow, a.kv_kind, i * 2 + 1);
-                v_tile[threadIdx.x * hd2 + i] = __floats2half2_rn(lo, hi);
-            }
-        }
-        __syncthreads();
-
-        for (int k = 0; k < tile_len; ++k) {
-            const float w = kvf_expf(scores_local[k] - m_cur);
-            l_cur += w;
-            for (int i = threadIdx.x; i < hd2; i += blockDim.x) {
-                const __half2 vv2 = v_tile[k * hd2 + i];
-                acc[i * 2]     += w * __half2float(__low2half(vv2));
-                acc[i * 2 + 1] += w * __half2float(__high2half(vv2));
-            }
-        }
-        __syncthreads();
-    }
-
-    /* Each query head writes its own softmax statistics. */
-    if (threadIdx.x == 0) { *mp = m_cur; *lp = l_cur; }
-}
-
-/* head_dim must be even for __half2 packing. */
-static bool kvflash_hd_supported(int hd) { return hd > 0 && hd % 2 == 0; }
-
-static int kvflash_launch_hd(const KvattnArgs& a, int chunks, int per,
-                              float* acc, float* m_out, float* l_out,
-                              cudaStream_t s) {
-    const int hd2 = a.head_dim / 2;
-    const size_t smem = sizeof(__half2) * KVFLASH_TILE * hd2 * 2;
-    const dim3 block(KVFLASH_TILE, KVFLASH_WARPS);
-    const dim3 grid(chunks, a.n_kv_heads);
-    kvflash_tile<<<grid, block, smem, s>>>(&a, chunks, per, acc, m_out, l_out);
-    return cudaGetLastError() == cudaSuccess ? 0 : -2;
-}
-
-#endif /* !SPITE_KVFLASH_ARCH */
-
-/* ── Combine pass ─────────────────────────────────────────────────────────── */
-
-__global__ void kvflash_combine(
-        float* __restrict__ out,       /* [n_heads, head_dim] — accumulated */
-        const float* __restrict__ acc, /* [chunks, n_heads, head_dim]       */
-        const float* __restrict__ m_p, /* [chunks, n_heads]                 */
-        const float* __restrict__ l_p, /* [chunks, n_heads]                 */
-        int chunks, int head_dim) {
-    const int h = blockIdx.x;
-    float* oh = out + (size_t)h * head_dim;
-    const float* ap = acc + (size_t)h * head_dim;  /* stride = n_heads*hd per chunk */
-
-    float m_max = -INFINITY;
-    for (int c = 0; c < chunks; ++c) m_max = fmaxf(m_max, m_p[(size_t)c * gridDim.x + h]);
-
-    float l_total = 0.0f;
-    for (int c = 0; c < chunks; ++c) {
-        const float w = kvf_expf(m_p[(size_t)c * gridDim.x + h] - m_max);
-        l_total += l_p[(size_t)c * gridDim.x + h] * w;
-        for (int i = threadIdx.x; i < head_dim; i += blockDim.x)
-            oh[i] += w * ap[(size_t)c * gridDim.x * head_dim + i];
-    }
-    if (threadIdx.x == 0 && l_total > 0.0f) {
-        const float inv = 1.0f / l_total;
-        for (int i = 0; i < head_dim; ++i) oh[i] *= inv;
-    }
-}
-
-/* ── Top-level dispatch ───────────────────────────────────────────────────── */
-
-static int kvflash_run(
-        SpiteTensor* out, const SpiteTensor* x,
-        const SpiteTensor* wq, const SpiteTensor* wk, const SpiteTensor* wv,
-        const SpiteTensor* wo, const SpiteTensor* q_norm, const SpiteTensor* k_norm,
-        float norm_eps, SpiteKvCache* kv, float rope_freq_base,
-        const SpiteCtx* ctx) {
-
-    if (!kvq_supported(kv->k.kind)) return -1;
+    float* wacc = reinterpret_cast<float*>(aligned);
+    float* wm = wacc + static_cast<size_t>(chunks) * nh * a.hd;
+    float* wl = wm + static_cast<size_t>(chunks) * nh;
 
     cudaStream_t s = stream_of(ctx);
-    const int n_heads    = ctx->n_heads;
-    const int n_kv_heads = ctx->n_kv_heads > 0 ? ctx->n_kv_heads : n_heads;
-    const int head_dim   = static_cast<int>(wq->ne[0]) / n_heads;
-    const int n_tok      = ctx->pos + 1;
-    const int n_ctx      = ctx->n_ctx > 0 ? ctx->n_ctx : n_tok;
-    const float scale    = 1.0f / sqrtf(static_cast<float>(head_dim));
-    const int kv_kind    = static_cast<int>(kv->k.kind);
+    if (kvflash_launch_hd(a, chunks, per, wacc, wm, wl, s)) return -2;
 
-    if (!kvflash_hd_supported(head_dim)) return -1;
-
-    /* Allocate scratchpad: q[n_heads*hd] k[nkv*hd] qk[n_heads*hd] vtmp[nkv*hd]
-     * plus split-K workspace: acc[chunks*n_heads*hd] m[chunks*n_heads] l[chunks*n_heads] */
-    const int chunks = max(1, (n_tok + KVFLASH_TILE - 1) / KVFLASH_TILE);
-    const size_t q_bytes   = sizeof(float) * n_heads    * head_dim;
-    const size_t qk_bytes  = sizeof(float) * n_kv_heads * head_dim;
-    const size_t acc_bytes = sizeof(float) * chunks * n_heads * head_dim;
-    const size_t ml_bytes  = sizeof(float) * chunks * n_heads;
-    const size_t need = q_bytes + qk_bytes * 2 + acc_bytes + ml_bytes * 2;
-    if (!ctx->scratchpad || ctx->scratchpad_bytes < need) return -2;
-
-    float* q_buf   = static_cast<float*>(ctx->scratchpad);
-    float* k_buf   = q_buf  + n_heads    * head_dim;
-    float* v_buf   = k_buf  + n_kv_heads * head_dim;
-    float* acc_buf = v_buf  + n_kv_heads * head_dim;
-    float* m_buf   = acc_buf + (size_t)chunks * n_heads * head_dim;
-    float* l_buf   = m_buf   + (size_t)chunks * n_heads;
-
-    cudaMemsetAsync(out->data, 0, sizeof(float) * n_heads * head_dim, s);
-    cudaMemsetAsync(acc_buf,   0, acc_bytes, s);
-
-    /* Compute Q, K, V projections. */
-    const float* xin = static_cast<const float*>(x->data);
-    if (launch_matvec(wq, xin, q_buf, false, s)) return -1;
-    if (launch_matvec(wk, xin, k_buf, false, s)) return -1;
-    if (launch_matvec(wv, xin, v_buf, false, s)) return -1;
-
-    /* Write K/V into cache. */
-    /* (host already positioned the KV rows at ctx->pos; we just fill them) */
-
-    /* Flash-decode tile pass. */
-    const int per = max(KVFLASH_TILE, (n_tok + chunks - 1) / chunks);
-    if (kvflash_launch_hd({q_buf, kv->k.data, kv->v.data,
-                            nullptr, static_cast<float*>(out->data),
-                            n_heads, n_kv_heads, head_dim, n_tok, n_ctx,
-                            kv_kind, scale},
-                           chunks, per, acc_buf, m_buf, l_buf, s))
-        return -2;
-
-    /* Combine split-K partials into out. */
-    kvflash_combine<<<n_heads, threads_for(head_dim), 0, s>>>(
-        static_cast<float*>(out->data), acc_buf, m_buf, l_buf, chunks, head_dim);
-
-    /* Output projection: out += wo * out (accumulated). */
-    if (launch_matvec(wo, static_cast<float*>(out->data),
-                      static_cast<float*>(out->data), true, s)) return -1;
-
+    kvflash_combine<<<nh, threads_for(a.hd), 0, s>>>(a.att, wm, wl, wacc, chunks, nh, a.hd);
+    if (launch_matvec(wo, a.att, static_cast<float*>(out->data), true, s)) return -1;
     return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }
 
-#endif /* SPITE_QWEN3_8_KV_ATTN_FLASH_INL */
+#endif  /* SPITE_QWEN3_8_KV_ATTN_FLASH_INL */

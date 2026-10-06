@@ -1,162 +1,109 @@
 /*
  * kernels/qwen/qwen3_8/nvidia/sm_60/tesla_p100/multi_gpu.cuh
  *
- * NVLink-based tensor parallelism helpers for the P100 SXM2 cluster.
+ * NVLink tensor-parallel helpers for Tesla P100 SXM2 groups (<= 4 GPUs).
  *
- * ## Design
+ * The compute ops need nothing special for tensor parallelism: the host hands
+ * each GPU its weight shard (column-split wq/wk/wv/gate/up, row-split wo/down,
+ * ctx->n_heads / n_kv_heads divided by the shard count) and runs the ordinary
+ * sm_60 ops on it.  What sharding adds is one all-reduce per attention and FFN
+ * op, which is what this file provides (exported as C from kernel.cu).
  *
- * Tensor parallelism (Megatron-style) is handled at two levels:
+ * Residual: attention and ffn ACCUMULATE (out += op(x), ABI v4).  Summing
+ * shards that each did `out += partial` would add the residual n_gpus times,
+ * so the host must run non-root shards on a zeroed `out` (or a scratch
+ * buffer) and let only the root shard carry the residual.
  *
- *   Host level (spite-parallel/src/p100_multi.rs):
- *     - Detects the NVLink topology via nvidia-smi.
- *     - Chooses n_shards (1, 2, or 4) based on NVLink connectivity.
- *     - Slices weight matrices before calling the kernel: each shard receives
- *       columns [shard*cols/N .. (shard+1)*cols/N] of the attention projections
- *       and the FFN gate/up matrices (column-parallel), plus the full rows of
- *       the down-projection (row-parallel).
- *     - After each layer, calls p100_allreduce_f32() to sum partial activations
- *       across shards via peer-to-peer NVLink DMA.
+ * Synchronisation: every GPU produces its partial on its own stream, so the
+ * reducer waits on one event per peer before reading it, and records `done`
+ * after the broadcast; peers must cudaStreamWaitEvent(done) before reading
+ * the reduced result.
  *
- *   Kernel level (this file):
- *     - p100_enable_peer_access(): one-time setup, called at engine init.
- *     - p100_allreduce_f32(): ring all-reduce using cudaMemcpyPeerAsync.
- *       P100 SXM2 has full-mesh NVLink for ≤4 GPUs (DGX-1), so a 1-step
- *       reduce-scatter + all-gather is optimal; for simplicity we use a flat
- *       ring that is 1 hop on the 4-GPU DGX-1 mesh.
- *
- * ## Usage
- *
- *   // At engine startup (once per process):
- *   p100_enable_peer_access(n_gpus);
- *
- *   // After each attention / FFN op on every shard:
- *   p100_allreduce_f32(result_dev, peer_ptrs, n_gpus, n_elems, stream);
- *
- * ## Constraints
- *
- *   - n_gpus must be ≤ P100_TP_MAX_SHARDS (4).
- *   - Peer access must be enabled before any p2p copy.
- *   - result_dev and each peer_ptrs[i] must be device pointers on their
- *     respective devices, and all must point to n_elems floats.
- *   - cudaMemcpyPeerAsync is used (no explicit driver-level NVLink API needed).
+ * Algorithm: gather-to-root + broadcast over cudaMemcpyPeerAsync.  For decode
+ * activations (one d_model row, ~20 KB) the transfers are latency-bound and
+ * this is as fast as a ring; it is not meant for large (prefill) tensors.
  */
 
 #pragma once
 
 #include <cuda_runtime.h>
+#include <stddef.h>
+
 #include "kernels/qwen/qwen3_8/nvidia/sm_60/tesla_p100/p100_tuning.cuh"
 
-/*
- * Enable bidirectional peer access between all n_gpus visible devices.
- * Call once at engine startup from any GPU context.
- * Returns the first error encountered, or cudaSuccess.
- */
-inline cudaError_t p100_enable_peer_access(int n_gpus) {
-    for (int src = 0; src < n_gpus; ++src) {
-        cudaSetDevice(src);
-        for (int dst = 0; dst < n_gpus; ++dst) {
-            if (src == dst) continue;
-            int can = 0;
-            cudaDeviceCanAccessPeer(&can, src, dst);
-            if (can) {
-                cudaError_t err = cudaDeviceEnablePeerAccess(dst, 0);
-                /* cudaErrorPeerAccessAlreadyEnabled is benign. */
-                if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled)
-                    return err;
-            }
-        }
-    }
-    return cudaSuccess;
-}
-
-/*
- * In-place all-reduce (sum) of n_elems floats across n_gpus devices.
- *
- *   result_dev  — device pointer on the CALLING device (device 0 in the ring).
- *                 On return, result_dev[0..n_elems) holds the global sum.
- *   peer_ptrs   — array of n_gpus device pointers, one per shard (index i
- *                 is the pointer on GPU i). peer_ptrs[calling_device] == result_dev.
- *   n_gpus      — number of participating shards (≤ P100_TP_MAX_SHARDS).
- *   n_elems     — number of float elements to reduce.
- *   calling_dev — CUDA device ordinal of the calling device.
- *   stream      — CUDA stream on the calling device.
- *
- * Algorithm: reduce into result_dev in n_gpus-1 steps using a ring of
- * cudaMemcpyPeerAsync copies, chunked at P100_ALLREDUCE_CHUNK to overlap
- * NVLink transfers with computation on the calling device.
- *
- * NVLink 1.0 on P100 SXM2: 80 GB/s unidirectional per GPU.
- * Transferring 5120 floats (d_model = 5120, 20 KB) takes ~0.25 µs.
- */
-inline cudaError_t p100_allreduce_f32(float*        result_dev,
-                                       float* const* peer_ptrs,
-                                       int           n_gpus,
-                                       int           n_elems,
-                                       int           calling_dev,
-                                       cudaStream_t  stream) {
-    if (n_gpus <= 1) return cudaSuccess;
-
-    /* Temporary accumulator on the calling device. */
-    float* tmp = nullptr;
-    cudaError_t err = cudaMallocAsync(&tmp, (size_t)n_elems * sizeof(float), stream);
-    if (err != cudaSuccess) return err;
-
-    /* Accumulate each remote shard into result_dev. */
-    for (int g = 0; g < n_gpus; ++g) {
-        if (g == calling_dev) continue;
-        /* Copy peer shard into tmp on the calling device. */
-        err = cudaMemcpyPeerAsync(tmp, calling_dev,
-                                   peer_ptrs[g], g,
-                                   (size_t)n_elems * sizeof(float), stream);
-        if (err != cudaSuccess) { cudaFreeAsync(tmp, stream); return err; }
-        /* Element-wise add: result_dev += tmp. */
-        /* Simple kernel — one thread per float, launched on the calling stream. */
-        const int blk = 256;
-        const int grd = (n_elems + blk - 1) / blk;
-        /* Inlined device lambda not available in CUDA C++14; use a small kernel. */
-        /* We define it below this header's include guard. */
-        p100_vec_add_f32<<<grd, blk, 0, stream>>>(result_dev, tmp, n_elems);
-    }
-
-    /* Broadcast result_dev back to all peer shards. */
-    for (int g = 0; g < n_gpus; ++g) {
-        if (g == calling_dev) continue;
-        err = cudaMemcpyPeerAsync(peer_ptrs[g], g,
-                                   result_dev, calling_dev,
-                                   (size_t)n_elems * sizeof(float), stream);
-        if (err != cudaSuccess) { cudaFreeAsync(tmp, stream); return err; }
-    }
-
-    return cudaFreeAsync(tmp, stream);
-}
-
-/* Helper kernel used by p100_allreduce_f32 (must be visible at its call site). */
-__global__ void p100_vec_add_f32(float* __restrict__ dst,
-                                  const float* __restrict__ src,
-                                  int n) {
+static __global__ void p100_vec_add_f32(float* __restrict__ dst, const float* __restrict__ src, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] += src[i];
 }
 
-/*
- * Column-parallel attention shard info.
- * The Rust host slices wq/wk/wv to [n_heads/n_shards * head_dim, d_model]
- * before calling the kernel.  The kernel sees only its local head range.
- * After the kernel, the Rust host does p100_allreduce_f32 on the output buffer.
- */
-struct P100TpAttnInfo {
-    int n_shards;   /* total tensor-parallel degree (1, 2, or 4) */
-    int shard_idx;  /* this GPU's shard (0-based)                 */
-    /* local_n_heads = ctx->n_heads / n_shards */
-};
+/* Enable peer access between every pair of devs[0..n).  Restores the caller's
+ * current device.  Pairs without peer capability are skipped (they would fall
+ * back to staged copies, which cudaMemcpyPeerAsync handles transparently). */
+inline cudaError_t p100_enable_peer_access(const int* devs, int n) {
+    int prev = 0;
+    cudaError_t err = cudaGetDevice(&prev);
+    if (err != cudaSuccess) return err;
+    for (int a = 0; a < n && err == cudaSuccess; ++a) {
+        err = cudaSetDevice(devs[a]);
+        for (int b = 0; b < n && err == cudaSuccess; ++b) {
+            if (a == b) continue;
+            int can = 0;
+            err = cudaDeviceCanAccessPeer(&can, devs[a], devs[b]);
+            if (err != cudaSuccess || !can) continue;
+            err = cudaDeviceEnablePeerAccess(devs[b], 0);
+            if (err == cudaErrorPeerAccessAlreadyEnabled) {
+                cudaGetLastError();  // clear the sticky benign error
+                err = cudaSuccess;
+            }
+        }
+    }
+    const cudaError_t rs = cudaSetDevice(prev);
+    return err != cudaSuccess ? err : rs;
+}
 
 /*
- * Row-parallel FFN shard info.
- * gate/up receive columns [shard*d_ffn/N .. (shard+1)*d_ffn/N].
- * down receives rows      [shard*d_model/N .. (shard+1)*d_model/N].
- * After the op, the Rust host all-reduces the output.
+ * In-place sum of n_elems floats across n_gpus shards; on completion every
+ * bufs[g] holds the total.
+ *
+ *   bufs[g]   device pointer on devs[g]
+ *   ready[g]  event recorded after shard g's partial was written (NULL entries
+ *             or a NULL array skip the wait, e.g. when the root produced it on
+ *             `stream`)
+ *   root      index (into bufs/devs) of the reducing GPU; `stream` and
+ *             `scratch` (n_elems floats) live on devs[root]
+ *   done      optional event recorded on `stream` after the broadcast
  */
-struct P100TpFfnInfo {
-    int n_shards;
-    int shard_idx;
-};
+inline cudaError_t p100_allreduce_f32(float* const* bufs, const int* devs,
+                                      const cudaEvent_t* ready, int n_gpus, int root,
+                                      int n_elems, float* scratch, cudaStream_t stream,
+                                      cudaEvent_t done) {
+    if (n_gpus <= 1) return cudaSuccess;
+    if (n_gpus > P100_TP_MAX_SHARDS || root < 0 || root >= n_gpus || n_elems < 0 || !scratch)
+        return cudaErrorInvalidValue;
+    int prev = 0;
+    cudaError_t err = cudaGetDevice(&prev);
+    if (err != cudaSuccess) return err;
+    err = cudaSetDevice(devs[root]);
+
+    const size_t bytes = static_cast<size_t>(n_elems) * sizeof(float);
+    const int blk = 256;
+    const int grd = (n_elems + blk - 1) / blk;
+    for (int g = 0; g < n_gpus && err == cudaSuccess; ++g) {
+        if (g == root) continue;
+        if (ready && ready[g]) err = cudaStreamWaitEvent(stream, ready[g], 0);
+        if (err == cudaSuccess)
+            err = cudaMemcpyPeerAsync(scratch, devs[root], bufs[g], devs[g], bytes, stream);
+        if (err == cudaSuccess && grd > 0) {
+            p100_vec_add_f32<<<grd, blk, 0, stream>>>(bufs[root], scratch, n_elems);
+            err = cudaGetLastError();
+        }
+    }
+    for (int g = 0; g < n_gpus && err == cudaSuccess; ++g) {
+        if (g == root) continue;
+        err = cudaMemcpyPeerAsync(bufs[g], devs[g], bufs[root], devs[root], bytes, stream);
+    }
+    if (err == cudaSuccess && done) err = cudaEventRecord(done, stream);
+
+    const cudaError_t rs = cudaSetDevice(prev);
+    return err != cudaSuccess ? err : rs;
+}

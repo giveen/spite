@@ -333,6 +333,12 @@ pub fn normalize_card_name(name: &str) -> String {
             break;
         }
     }
+    // Data-centre parts carry a hyphenated form-factor / memory suffix that does
+    // not select a different kernel: "Tesla P100-SXM2-16GB", "A100-PCIE-40GB".
+    let upper = s.to_ascii_uppercase();
+    if let Some(i) = ["-SXM", "-PCIE"].iter().filter_map(|m| upper.find(m)).min() {
+        s = &s[..i];
+    }
     // Lowercase, collapse any run of non-alphanumeric to a single underscore.
     let mut out = String::with_capacity(s.len());
     let mut last_was_sep = false;
@@ -489,5 +495,13 @@ mod tests {
         assert_eq!(normalize_card_name("AMD Instinct MI300X"), "mi300x");
         assert_eq!(normalize_card_name("Intel Arc B580"), "b580");
         assert_eq!(normalize_card_name("AMD Radeon RX 7900 XTX"), "rx_7900_xtx");
+    }
+
+    #[test]
+    fn normalize_strips_datacenter_form_factor() {
+        assert_eq!(normalize_card_name("Tesla P100-SXM2-16GB"), "tesla_p100");
+        assert_eq!(normalize_card_name("Tesla P100-PCIE-12GB"), "tesla_p100");
+        assert_eq!(normalize_card_name("NVIDIA A100-SXM4-80GB"), "a100");
+        assert_eq!(normalize_card_name("NVIDIA GeForce RTX 4090"), "rtx_4090");
     }
 }

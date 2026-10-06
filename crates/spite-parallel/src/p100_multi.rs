@@ -1,53 +1,62 @@
-//! P100 SXM2 NVLink tensor-parallelism topology detection.
+//! Tesla P100 tensor-parallel shard policy.
 //!
-//! The Tesla P100 SXM2 (DGX-1) supports up to 4-GPU full-mesh NVLink 1.0
-//! (160 GB/s bidirectional per GPU).  This module detects the NVLink
-//! connectivity and returns the optimal shard count for tensor parallelism.
+//! P100 SXM2 groups (DGX-1 quads) are fully connected over NVLink 1.0, so
+//! Megatron-style tensor parallelism across up to 4 cards is viable; PCIe
+//! P100s have no NVLink and should not be tensor-sharded.
 //!
-//! The kernel-side all-reduce is in
-//! `kernels/qwen/qwen3_8/nvidia/sm_60/tesla_p100/multi_gpu.cuh`.
-//! The Rust host calls `p100_allreduce_f32` (via FFI) after each attention
-//! and FFN op.
+//! The GPU count comes from the environment (`SPITE_P100_SHARDS`, else
+//! `SPITE_GPU_COUNT`); there is no NVLink topology probe yet, so a PCIe box
+//! must leave both unset or set `SPITE_P100_SHARDS=1`.
+//!
+//! The kernel-side all-reduce is exported by the P100 card kernel as
+//! `spite_p100_enable_peer_access` / `spite_p100_allreduce_f32`
+//! (`kernels/qwen/qwen3_8/nvidia/sm_60/tesla_p100/kernel.cu`). The executor
+//! does not call it yet: per-device weight sharding and the per-op
+//! all-reduce still have to be wired into the host.
 
 use crate::ShardStrategy;
 
-/// Maximum tensor-parallel degree for the P100 NVLink ring.
+/// Maximum tensor-parallel degree for a P100 NVLink group.
 pub const P100_TP_MAX_SHARDS: usize = 4;
 
-/// NVLink topology for a set of P100 SXM2 GPUs.
+/// GPUs available to a P100 tensor-parallel group.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct P100Topology {
-    /// Number of GPUs that can participate in NVLink all-reduce.
     pub n_linked: usize,
 }
 
 impl P100Topology {
-    /// Detect NVLink peer connectivity from the environment.
-    ///
-    /// Reads `SPITE_P100_SHARDS` (1, 2, or 4) when set.
-    /// Otherwise falls back to `SPITE_GPU_COUNT` clamped to
-    /// `P100_TP_MAX_SHARDS`.
+    /// Read the group size from `SPITE_P100_SHARDS`, else `SPITE_GPU_COUNT`.
     pub fn detect() -> Self {
-        let explicit: Option<usize> = std::env::var("SPITE_P100_SHARDS")
-            .ok()
-            .and_then(|s| s.parse().ok());
-        if let Some(n) = explicit {
-            return Self {
-                n_linked: n.clamp(1, P100_TP_MAX_SHARDS),
-            };
-        }
-        let gpu_count: usize = std::env::var("SPITE_GPU_COUNT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+        Self::from_env_values(
+            std::env::var("SPITE_P100_SHARDS").ok().as_deref(),
+            std::env::var("SPITE_GPU_COUNT").ok().as_deref(),
+        )
+    }
+
+    /// `detect()` without touching the process environment. An explicit
+    /// shard count wins over the GPU count; unparsable values are ignored.
+    pub fn from_env_values(p100_shards: Option<&str>, gpu_count: Option<&str>) -> Self {
+        let parse = |v: Option<&str>| v.and_then(|s| s.trim().parse::<usize>().ok());
+        let n = parse(p100_shards).or(parse(gpu_count)).unwrap_or(1);
         Self {
-            n_linked: gpu_count.clamp(1, P100_TP_MAX_SHARDS),
+            n_linked: n.clamp(1, P100_TP_MAX_SHARDS),
         }
     }
 
-    /// Returns true if tensor parallelism is available (≥2 linked GPUs).
+    /// True when tensor parallelism is possible (two or more GPUs).
     pub fn is_multi_gpu(&self) -> bool {
         self.n_linked >= 2
+    }
+
+    /// Largest power-of-two shard count that fits the group, so KV heads and
+    /// FFN columns split evenly across shards.
+    pub fn shard_strategy(&self) -> ShardStrategy {
+        match self.n_linked {
+            n if n >= 4 => ShardStrategy::Tensor { n_shards: 4 },
+            2 | 3 => ShardStrategy::Tensor { n_shards: 2 },
+            _ => ShardStrategy::None,
+        }
     }
 }
 
@@ -70,30 +79,9 @@ impl P100TpConfig {
     }
 }
 
-/// Returns the optimal `ShardStrategy` for P100 NVLink topology.
-///
-/// Picks the largest power-of-two shard count ≤ detected GPU count
-/// and ≤ `P100_TP_MAX_SHARDS`.  Returns `ShardStrategy::None` for a
-/// single GPU.
+/// `ShardStrategy` for the P100 group described by the environment.
 pub fn p100_optimal_shard_count() -> ShardStrategy {
-    let topo = P100Topology::detect();
-    if !topo.is_multi_gpu() {
-        return ShardStrategy::None;
-    }
-    // Round down to nearest power of two (1, 2, or 4).
-    let n = topo.n_linked;
-    let n_pow2 = if n >= 4 {
-        4
-    } else if n >= 2 {
-        2
-    } else {
-        1
-    };
-    if n_pow2 <= 1 {
-        ShardStrategy::None
-    } else {
-        ShardStrategy::Tensor { n_shards: n_pow2 }
-    }
+    P100Topology::detect().shard_strategy()
 }
 
 #[cfg(test)]
@@ -102,36 +90,33 @@ mod tests {
 
     #[test]
     fn single_gpu_no_tp() {
-        // With no env vars, defaults to 1 GPU → no tensor parallelism.
-        unsafe {
-            std::env::remove_var("SPITE_P100_SHARDS");
-            std::env::remove_var("SPITE_GPU_COUNT");
-        }
-        let topo = P100Topology::detect();
+        let topo = P100Topology::from_env_values(None, None);
         assert_eq!(topo.n_linked, 1);
         assert!(!topo.is_multi_gpu());
-        assert_eq!(p100_optimal_shard_count(), ShardStrategy::None);
+        assert_eq!(topo.shard_strategy(), ShardStrategy::None);
     }
 
     #[test]
-    fn four_gpu_tp() {
-        unsafe { std::env::set_var("SPITE_P100_SHARDS", "4") };
-        let topo = P100Topology::detect();
+    fn explicit_shards_win_over_gpu_count() {
+        let topo = P100Topology::from_env_values(Some("4"), Some("2"));
         assert_eq!(topo.n_linked, 4);
-        assert!(topo.is_multi_gpu());
-        assert_eq!(
-            p100_optimal_shard_count(),
-            ShardStrategy::Tensor { n_shards: 4 }
-        );
-        unsafe { std::env::remove_var("SPITE_P100_SHARDS") };
+        assert_eq!(topo.shard_strategy(), ShardStrategy::Tensor { n_shards: 4 });
     }
 
     #[test]
-    fn clamp_above_max() {
-        unsafe { std::env::set_var("SPITE_P100_SHARDS", "8") };
-        let topo = P100Topology::detect();
-        assert_eq!(topo.n_linked, P100_TP_MAX_SHARDS);
-        unsafe { std::env::remove_var("SPITE_P100_SHARDS") };
+    fn gpu_count_fallback_and_clamp() {
+        assert_eq!(P100Topology::from_env_values(None, Some("8")).n_linked, 4);
+        assert_eq!(P100Topology::from_env_values(Some("0"), None).n_linked, 1);
+        assert_eq!(
+            P100Topology::from_env_values(Some("x"), Some("2")).n_linked,
+            2
+        );
+    }
+
+    #[test]
+    fn three_gpus_round_down_to_two() {
+        let topo = P100Topology::from_env_values(Some("3"), None);
+        assert_eq!(topo.shard_strategy(), ShardStrategy::Tensor { n_shards: 2 });
     }
 
     #[test]

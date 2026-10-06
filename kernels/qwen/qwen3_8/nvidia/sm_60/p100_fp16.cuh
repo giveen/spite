@@ -15,31 +15,12 @@
 #include <cuda_fp16.h>
 
 /*
- * Packed fp16 dot product: dot(a[0..n), b[0..n)) with f32 accumulation.
- * Processes two elements per step using __half2 SIMD.
- * n must be even; caller ensures alignment.
- */
-__device__ __forceinline__ float h2_dot_f32(const __half* __restrict__ a,
-                                             const __half* __restrict__ b,
-                                             int n) {
-    float acc = 0.0f;
-    const __half2* a2 = reinterpret_cast<const __half2*>(a);
-    const __half2* b2 = reinterpret_cast<const __half2*>(b);
-    const int n2 = n / 2;
-    for (int i = 0; i < n2; ++i) {
-        const __half2 p = __hmul2(a2[i], b2[i]);
-        acc += __half2float(p.x) + __half2float(p.y);
-    }
-    if (n & 1) acc += __half2float(a[n - 1]) * __half2float(b[n - 1]);
-    return acc;
-}
-
-/*
- * Packed warp-reduction matvec for fp16 weight matrices (column-major rows).
- * Each warp handles one output row; lanes stride over columns using __half2.
- * Accumulates into y[row] in fp32.
+ * Warp-per-row matvec for fp16 weight matrices (row-major, GGUF layout).
+ * Lanes stride over columns two at a time with one __half2 load; products and
+ * accumulation stay in fp32, so results match the scalar F16 path.
+ * cols must be even (each row then starts 4-byte aligned).
  *
- * ROWS_PER_BLOCK_H2: number of output rows per thread block (= blockDim.y).
+ * ROWS_H2: output rows per thread block (= blockDim.y).
  */
 template <int ROWS_H2>
 __global__ void matvec_f16_h2(const __half* __restrict__ w,
