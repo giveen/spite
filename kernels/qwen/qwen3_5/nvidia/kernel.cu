@@ -213,7 +213,7 @@ extern "C" int qwen35_cuda_mtp_stem(SpiteTensor *out, const SpiteTensor *embed,
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
-#include "kernels/_engine/speculative/speculative_round.cuh"
+#include "kernels/_engine/speculative/nvidia/speculative_round.cuh"
 
 // ── Kernel descriptor ────────────────────────────────────────────────────
 
