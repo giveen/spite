@@ -26,7 +26,10 @@
  * Memory budget (one P100, 16 GB HBM2): the 27B Qwen3.8 Q5_K_P build used
  * 19 GB on an RTX 5090 (../../sm_120/rtx_5090/qwen3_5.bench), so one P100 needs
  * roughly <= 4.25 bits/weight (IQ4_XS ~14.3 GB, Q3_K_M ~13 GB of weights) plus
- * KV/state; anything larger needs two or more cards.
+ * KV/state; anything larger needs two or more cards.  Q6_K is ~20.9 GiB and
+ * never fits one card — run 2x or 4x P100-PCIE with pipeline splitting
+ * (docs/multi-gpu.md).  These PCIe cards have no NVLink, so tensor parallelism
+ * is refused and only the layer-wise pipeline is used.
  */
 
 #include "core/abi.h"

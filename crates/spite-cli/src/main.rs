@@ -396,7 +396,7 @@ fn main() -> Result<()> {
 // ── Hardware resolution ────────────────────────────────────────────────────
 
 fn resolve_hardware(hw: &HardwareArgs) -> MultiGpuSpec {
-    if hw.cards.is_empty() {
+    let mut spec = if hw.cards.is_empty() {
         let arch = hw.gpu_arch.clone().unwrap_or_else(detect_gpu_arch);
         let raw = std::env::var("SPITE_CARD").unwrap_or_default();
         let card = if raw.is_empty() {
@@ -408,7 +408,11 @@ fn resolve_hardware(hw: &HardwareArgs) -> MultiGpuSpec {
     } else {
         let refs: Vec<&str> = hw.cards.iter().map(String::as_str).collect();
         MultiGpuSpec::from_cards(&refs)
-    }
+    };
+    // Card names drop the form factor, so same-vendor defaults to PCIe; promote
+    // to NVLink/XGMI only where the runtime probe confirms it.
+    spec.probe_links();
+    spec
 }
 
 // ── Model path resolution ──────────────────────────────────────────────────

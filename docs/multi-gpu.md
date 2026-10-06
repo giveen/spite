@@ -3,8 +3,17 @@
 spite can spread one model over several CUDA GPUs in the same machine by
 **pipeline (layer) splitting**: each GPU holds a contiguous block of layers
 and runs it, then hands the hidden state to the next GPU. Use it when a model
-does not fit in one card's VRAM, e.g. a 27B Qwen3.8 Q5_K_S (~17.4 GiB) on
+does not fit in one card's VRAM, e.g. a 27B Qwen3.8 **Q6_K (~20.9 GiB)** on
 16 GB Tesla P100s.
+
+> **P100 note.** Pipeline splitting is the *only* multi-GPU mode for
+> **P100-PCIE** cards: they have no NVLink, so tensor parallelism would be
+> bandwidth-bound and is refused (`spite-parallel::p100_multi` returns
+> `Pipeline`, never `Tensor`, when the NVLink probe fails). Same-root-complex
+> pairs (**PHB**) copy at PCIe speed; pairs across the two sockets (**SYS**,
+> over QPI) are slower still — but neither changes correctness, because the
+> pipeline moves only the hidden state through host memory. Only the **SXM2**
+> P100 has NVLink 1.0.
 
 ---
 
@@ -15,7 +24,7 @@ does not fit in one card's VRAM, e.g. a 27B Qwen3.8 Q5_K_S (~17.4 GiB) on
 | Hybrid models (Qwen3.5 / Qwen3.8 family, GGUF arch `qwen35`) | Pipeline split ✅ |
 | NextN / MTP draft head | Runs on the last GPU ✅ |
 | Dense models (`gpu_dense` path: Llama, Qwen3, …) | Single GPU only |
-| Tensor parallelism (`spite-parallel::p100_multi`) | Policy only, not wired |
+| Tensor parallelism (`spite-parallel::p100_multi`) | Policy only, not wired; requires NVLink (P100 SXM2). PCIe cards fall back to pipeline |
 | Mixed vendors (CUDA + HIP) | Not supported |
 
 The split needs **no peer-to-peer access or NVLink**. Only the hidden state
@@ -43,6 +52,27 @@ With no flags, spite considers every visible GPU:
 
 The token embedding is looked up on the host, so `token_embd.weight` is not
 uploaded at all unless it doubles as the LM head (tied embeddings).
+
+---
+
+## P100 memory budget (Qwen3.8-27B)
+
+`Qwen3.8-27B-Q6_K` weights are **~20.9 GiB**: 64 trunk layers of ~284 MiB
+(full attention) to ~293 MiB (Gated Delta Net) plus a ~324 MiB NextN/MTP block,
+which the last stage carries. It never fits one 16 GiB P100-PCIE card, so a
+2× box splits it ~10.5 GiB per card and a 4× box ~5.2 GiB per card.
+
+KV lives only on the 16 full-attention layers (every 4th layer) and the MTP
+block — 17 × 4 KiB = ~68 KiB/token in F16 across the whole pipeline:
+
+| ctx | KV across the pipeline |
+|---|---|
+| 4k | ~0.27 GiB |
+| 32k | ~2.2 GiB |
+| 262144 | ~17 GiB |
+
+The Gated Delta Net layers carry a fixed recurrent state instead of a growing
+KV (conv history + S×S state), ~0.15 GiB total, independent of `--ctx`.
 
 ---
 
@@ -110,6 +140,10 @@ No `stage` lines means the model fit on one GPU.
 `SPITE_GPUS` is the environment form of `--gpus`. Without `--gpus`,
 `--layer-split` with N shares uses the first N visible GPUs. Shares are
 relative; every share must be large enough to get at least one layer.
+
+On a PCIe P100 box every stage boundary costs one ~20 KiB/token host round-trip
+(`d_model` F32, 5120 floats), whether the pair is PHB or SYS, so stage *order*
+does not matter — only the number of boundaries does.
 
 ### Longer context
 

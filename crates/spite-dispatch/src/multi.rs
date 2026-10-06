@@ -185,6 +185,32 @@ impl MultiGpuSpec {
         }
     }
 
+    /// Upgrade same-vendor links to [`CommLink::DeviceLink`] where a runtime
+    /// probe confirms NVLink/XGMI.
+    ///
+    /// [`MultiGpuSpec::from_cards`] is deliberately conservative and reports
+    /// [`CommLink::PcieDirectP2P`] for every same-vendor pair, because a card
+    /// name alone cannot tell an SXM NVLink part from a PCIe add-in card (the
+    /// normalised id drops the `-SXM2-`/`-PCIE-` form factor). Call this with
+    /// CUDA present to promote a pair only when `cuda::p2p_kind` detects peer
+    /// access over an SXM/NVLink link; on a PCIe/QPI box — 2× or 4× P100-PCIE,
+    /// for example — the pair correctly stays PCIe.
+    pub fn probe_links(&mut self) {
+        for i in 0..self.nodes.len().saturating_sub(1) {
+            if self.nodes[i].link_out != CommLink::PcieDirectP2P
+                || vendor(&self.nodes[i].gpu_arch) != vendor(&self.nodes[i + 1].gpu_arch)
+            {
+                continue;
+            }
+            if matches!(
+                spite_gpu::cuda::p2p_kind(i, i + 1),
+                Ok(spite_gpu::P2pKind::Nvlink)
+            ) {
+                self.nodes[i].link_out = CommLink::DeviceLink;
+            }
+        }
+    }
+
     /// Build one `DispatchTable` per GPU node.
     pub fn build_tables(
         &self,
@@ -288,11 +314,10 @@ fn assign_comm_links(nodes: &mut [GpuNode]) {
         let v_b = vendor(&nodes[i + 1].gpu_arch.clone());
         nodes[i].link_out = if v_a != v_b {
             CommLink::HostCopy
-        } else if v_a == "nvidia" || v_a == "amd" {
-            // Optimistic default: assume direct link available.
-            // TODO: detect actual NVLink / XGMI topology via driver API.
-            CommLink::DeviceLink
         } else {
+            // Conservative: never claim NVLink/XGMI from a card name alone
+            // (the normalised id drops the form factor). `probe_links`
+            // promotes a confirmed pair; PCIe and unknown stay PCIe.
             CommLink::PcieDirectP2P
         };
     }
@@ -314,9 +339,21 @@ mod tests {
         assert_eq!(spec.nodes[1].layers.end, 32);
         assert!(!spec.nodes[0].layers.is_empty());
         assert!(!spec.nodes[1].layers.is_empty());
-        // Same vendor → device link
-        assert_eq!(spec.nodes[0].link_out, CommLink::DeviceLink);
+        // Same vendor, but a card name cannot prove NVLink: conservative PCIe
+        // until `probe_links` confirms a fast link (RTX 30/50 have none).
+        assert_eq!(spec.nodes[0].link_out, CommLink::PcieDirectP2P);
         assert_eq!(spec.nodes[1].link_out, CommLink::None);
+    }
+
+    #[test]
+    fn probe_links_is_safe_without_cuda() {
+        // Must not panic on a host with no CUDA runtime or no second device.
+        let mut spec = MultiGpuSpec::from_cards(&["RTX_5070", "RTX_3090"]);
+        spec.probe_links();
+        assert!(matches!(
+            spec.nodes[0].link_out,
+            CommLink::PcieDirectP2P | CommLink::DeviceLink
+        ));
     }
 
     #[test]

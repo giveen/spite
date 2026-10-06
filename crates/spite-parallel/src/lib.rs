@@ -37,13 +37,21 @@ pub fn gpu_count() -> usize {
 }
 
 /// Returns the best `ShardStrategy` for the detected GPU count.
-/// Use this instead of `ShardStrategy::default()` when you want
-/// the runtime to automatically pick tensor parallelism on multi-GPU boxes.
+///
+/// With more than one GPU this picks **pipeline** parallelism, the strategy the
+/// host actually implements (`pipeline::stage_ranges`,
+/// `spite_models::hybrid::LayerSplit`) and the only one that is safe without a
+/// fast peer link — it moves just the hidden state through host memory, so
+/// PCIe/QPI boxes (including multi-P100-PCIE) work.
+///
+/// Tensor parallelism is *not* chosen here: it is only worthwhile on a
+/// confirmed NVLink/XGMI group. Use `p100_multi::p100_optimal_shard_count` (or
+/// `P100Topology::shard_strategy`) when you know the link is fast.
 pub fn gpu_aware_default() -> ShardStrategy {
     let n = gpu_count();
     if n == 1 {
         ShardStrategy::None
     } else {
-        ShardStrategy::Tensor { n_shards: n }
+        ShardStrategy::Pipeline { n_stages: n }
     }
 }

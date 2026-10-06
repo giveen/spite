@@ -8,5 +8,6 @@ repository.workspace = true
 
 [dependencies]
 spite-abi  = { workspace = true }
+spite-gpu  = { workspace = true }
 libloading = { workspace = true }
 thiserror  = { workspace = true }

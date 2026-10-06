@@ -111,6 +111,23 @@ impl GpuBackend {
     }
 }
 
+/// How two CUDA devices can exchange data directly.
+///
+/// The CUDA runtime exposes peer *access* (`cudaDeviceCanAccessPeer`) but not
+/// whether the link is NVLink or PCIe. [`cuda::p2p_kind`] therefore combines
+/// peer access with the card's form factor from its device name (`...SXM...`
+/// ⇒ NVLink); a name that does not identify an SXM/NVLink part is reported as
+/// [`P2pKind::Pcie`], never NVLink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P2pKind {
+    /// No direct peer access — transfers stage through host memory.
+    None,
+    /// Peer copies run over PCIe (add-in cards, PCIe variants of SXM parts).
+    Pcie,
+    /// An SXM/NVLink form factor *and* peer access are present.
+    Nvlink,
+}
+
 /// A device-side memory allocation.
 pub struct DeviceBuffer {
     pub backend: GpuBackend,

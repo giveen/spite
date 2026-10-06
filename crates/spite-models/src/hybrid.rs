@@ -1349,4 +1349,75 @@ mod tests {
         assert_eq!(devs, vec![0, 1]);
         assert_eq!(counts, vec![5, 3]);
     }
+
+    /// Qwen3.8-27B Q6_K trunk (~18.6 GiB of weights): 48 GDN layers at
+    /// ~293 MiB and 16 full-attention layers at ~284 MiB. Sizes are the real
+    /// per-block tensor footprint from the GGUF, projected to 6.5625 bits/weight.
+    fn qwen38_q6k_trunk() -> Vec<usize> {
+        const MIB: usize = 1 << 20;
+        (0..64)
+            .map(|l| {
+                if (l + 1) % 4 == 0 {
+                    284 * MIB
+                } else {
+                    293 * MIB
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_p100_pcie_hold_qwen38_q6k() {
+        // 2× P100-PCIE-16GB (PHB): the model does not fit one card, so it must
+        // pipeline across both, every layer placed, nothing left on the floor.
+        let layers = qwen38_q6k_trunk();
+        let head = 324 * (1 << 20); // NextN/MTP block
+        let split = LayerSplit {
+            devices: vec![0, 1],
+            shares: Vec::new(),
+        };
+        let free = VRAM_HEADROOM + 15 * (1 << 30);
+        let free_on = |_: usize| Ok(free);
+        let (devs, counts) = plan_split(&split, &layers, head, 0, false, &free_on).unwrap();
+        assert_eq!(devs, vec![0, 1]);
+        assert_eq!(counts.iter().sum::<usize>(), 64);
+        assert!(counts.iter().all(|&c| c > 0));
+    }
+
+    #[test]
+    fn four_p100_pcie_hold_qwen38_q6k_with_the_mtp_head() {
+        // 4× P100-PCIE-16GB (2× PHB pairs, SYS between): same splitter, four
+        // stages; the last stage carries the LM head and the MTP block.
+        let layers = qwen38_q6k_trunk();
+        let head = 324 * (1 << 20);
+        let fixed = 2 * 5120 * 4; // per-stage h + n residual buffers
+        let split = LayerSplit {
+            devices: vec![0, 1, 2, 3],
+            shares: Vec::new(),
+        };
+        let free = VRAM_HEADROOM + 15 * (1 << 30);
+        let free_on = |_: usize| Ok(free);
+        let (devs, counts) = plan_split(&split, &layers, head, fixed, false, &free_on).unwrap();
+        assert_eq!(devs, vec![0, 1, 2, 3]);
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            64,
+            "every layer must be placed"
+        );
+
+        // Recompute each stage's footprint exactly as `load_split` does and
+        // confirm it fits 16 GiB minus headroom.
+        let mut first = 0;
+        for (s, &c) in counts.iter().enumerate() {
+            let bytes = layers[first..first + c].iter().sum::<usize>()
+                + fixed
+                + if s + 1 == counts.len() { head } else { 0 };
+            assert!(
+                bytes + VRAM_HEADROOM <= free,
+                "stage {s} overflows: {} MiB",
+                bytes >> 20
+            );
+            first += c;
+        }
+    }
 }
