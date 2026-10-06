@@ -139,13 +139,22 @@ extern "C" int qwen35_cuda_matmul(SpiteTensor *out, const SpiteTensor *x,
   if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32)
     return -1;
   const int64_t rows = w->ne[1] ? w->ne[1] : 1;
+  const int64_t m = x->ne[1] ? x->ne[1] : 1;
   if (x->ne[0] != w->ne[0])
     return -1; // x must supply exactly `cols` activations
-  if (static_cast<int64_t>(out->ne[0]) * (out->ne[1] ? out->ne[1] : 1) < rows)
+  if (static_cast<int64_t>(out->ne[0]) < rows ||
+      static_cast<int64_t>(out->ne[1] ? out->ne[1] : 1) < m)
     return -1;
-  if (q35_gemv(w, static_cast<const float *>(x->data),
-               static_cast<float *>(out->data), false, q35_stream(ctx)))
-    return -1; // unsupported type, cols % block != 0 or misaligned weights
+  const cudaStream_t st = q35_stream(ctx);
+  if (m == 1) {
+    if (q35_gemv(w, static_cast<const float *>(x->data),
+                 static_cast<float *>(out->data), false, st))
+      return -1; // unsupported type, cols % block != 0 or misaligned weights
+  } else if (q35_gemv_batch(w, static_cast<const float *>(x->data),
+                            static_cast<float *>(out->data), static_cast<int>(m),
+                            false, st)) {
+    return -1;
+  }
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 

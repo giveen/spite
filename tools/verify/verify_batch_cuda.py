@@ -122,6 +122,31 @@ def main(kernel_path, cudart_path):
     d = max(abs(a - b) for a, b in zip(got, ref))
     print(f"ffn batch m={m}: ret={ret} max_abs_diff={d:.2e}")
     ok = ret == 0 and d < 1e-5
+
+    if info.matmul:
+        MatFn = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.POINTER(SpiteTensor),
+                                 ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+                                 ctypes.POINTER(SpiteCtx))
+        mm = MatFn(info.matmul)
+        C, R, k = 5, 7, 3
+        w = [rng.uniform(-1, 1) for _ in range(C * R)]
+        xx = [rng.uniform(-1, 1) for _ in range(C * k)]
+        pW, pX, pO = alloc(C * R * 4), alloc(C * k * 4), alloc(R * k * 4)
+        h2d(pW, w)
+        h2d(pX, xx)
+        ctx2 = SpiteCtx(0, k, 1, 0, 0, 0, None, None, 0)
+        ret2 = mm(ctypes.byref(tensor(pO, [R, k])), ctypes.byref(tensor(pX, [C, k])),
+                  ctypes.byref(tensor(pW, [C, R])), ctypes.byref(ctx2))
+        assert cudart.cudaDeviceSynchronize() == 0
+        got2 = d2h(pO, R * k)
+        ref2 = [sum(w[c + r * C] * xx[c + t * C] for c in range(C))
+                for t in range(k) for r in range(R)]
+        d2 = max(abs(a - b) for a, b in zip(got2, ref2))
+        print(f"matmul batch m={k}: ret={ret2} max_abs_diff={d2:.2e}")
+        ok = ok and ret2 == 0 and d2 < 1e-5
+    else:
+        print("matmul: SKIP")
+
     print("BATCH CUDA PASSED" if ok else "BATCH CUDA FAILED")
     return 0 if ok else 1
 
