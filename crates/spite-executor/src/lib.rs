@@ -263,7 +263,6 @@ impl Executor {
     ) -> Result<Vec<(u32, String)>, ExecutorError> {
         use spite_sampling::sample;
 
-        let eos = tokenizer.eos_id();
         let mut ids = prompt_ids.to_vec();
         let ctx = SpiteCtx {
             n_ctx: self.cfg.ctx_len as c_int,
@@ -285,7 +284,7 @@ impl Executor {
             let tok = sample(&mut logits, &ids, &sampler_cfg, &mut rng)
                 .map_err(|e| ExecutorError::Sampling(e.to_string()))?;
             ids.push(tok);
-            if tok == eos {
+            if tokenizer.is_eog(tok) {
                 break;
             }
             out.push((tok, tokenizer.decode_one(tok).into_owned()));

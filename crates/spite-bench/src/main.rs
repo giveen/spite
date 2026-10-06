@@ -404,6 +404,11 @@ struct MtpBenchRunner {
     vocab_size: usize,
     norm_eps: f32,
     embd_tensor: spite_abi::SpiteTensor,
+    backend: spite_gpu::GpuBackend,
+    /// Device the runner's buffers live on; `draft_step` makes it current so
+    /// the stem kernel launches there even after a pipeline `forward` left a
+    /// different stage's device current.
+    device: usize,
 }
 
 impl MtpBenchRunner {
@@ -414,12 +419,20 @@ impl MtpBenchRunner {
         backend: spite_gpu::GpuBackend,
     ) -> Result<Self> {
         let d = cfg.d_model;
-        let buf_out = spite_gpu::DeviceBuffer::alloc(backend, 2 * d * 4)
+        // Allocate the runner's scratch on one fixed device and make it current
+        // before every launch: after a multi-GPU `forward` the current device is
+        // the last stage, which is not where these buffers live.
+        let device = if backend == spite_gpu::GpuBackend::Cuda {
+            spite_gpu::cuda::current_device().unwrap_or(0)
+        } else {
+            0
+        };
+        let buf_out = spite_gpu::DeviceBuffer::alloc_on(backend, device, 2 * d * 4)
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut buf_embed =
-            spite_gpu::DeviceBuffer::alloc(backend, d * 4).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut buf_hidden =
-            spite_gpu::DeviceBuffer::alloc(backend, d * 4).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut buf_embed = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut buf_hidden = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         let init_zeros = vec![0.0f32; d];
         let bytes_zeros =
@@ -439,9 +452,9 @@ impl MtpBenchRunner {
         let mut buf_hnorm = None;
 
         if !t_en.data.is_null() && !t_hn.data.is_null() {
-            let mut b_en = spite_gpu::DeviceBuffer::alloc(backend, d * 4)
+            let mut b_en = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut b_hn = spite_gpu::DeviceBuffer::alloc(backend, d * 4)
+            let mut b_hn = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
 
             let mut en_f32 = vec![0.0f32; d];
@@ -464,9 +477,9 @@ impl MtpBenchRunner {
             buf_enorm = Some(b_en);
             buf_hnorm = Some(b_hn);
         } else if !cfg.arch.contains("gemma") {
-            let mut b_en = spite_gpu::DeviceBuffer::alloc(backend, d * 4)
+            let mut b_en = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut b_hn = spite_gpu::DeviceBuffer::alloc(backend, d * 4)
+            let mut b_hn = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let ones = vec![1.0f32; d];
             let ones_u8 = unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, d * 4) };
@@ -489,11 +502,18 @@ impl MtpBenchRunner {
             vocab_size: cfg.vocab_size,
             norm_eps: cfg.norm_eps,
             embd_tensor,
+            backend,
+            device,
         })
     }
 
     fn draft_step(&mut self, token: u32, ctx: &spite_abi::SpiteCtx) -> Result<()> {
         let d = self.d_model;
+        // Launch the stem on the device its buffers live on, not whatever a
+        // pipeline `forward` left current.
+        if self.backend == spite_gpu::GpuBackend::Cuda {
+            spite_gpu::cuda::set_device(self.device).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
         if !self.embd_tensor.data.is_null() {
             let tok_idx = (token as usize).min(self.vocab_size.saturating_sub(1));
             let row_offset = tok_idx.saturating_mul(self.embd_tensor.nb[1] as usize);

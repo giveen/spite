@@ -39,6 +39,13 @@ pub trait Tokenize: Send + Sync {
     fn vocab_size(&self) -> usize;
     fn bos_id(&self) -> u32;
     fn eos_id(&self) -> u32;
+
+    /// True when `id` ends generation: the EOS id, or a control token such as
+    /// `<|endoftext|>` / `<|im_end|>` (llama.cpp stops on any control token).
+    /// Defaults to EOS only.
+    fn is_eog(&self, id: u32) -> bool {
+        id == self.eos_id()
+    }
 }
 
 #[derive(Debug, Error)]
@@ -150,6 +157,13 @@ impl Tokenize for Tokenizer {
     }
     fn eos_id(&self) -> u32 {
         self.vocab.eos_id
+    }
+    fn is_eog(&self, id: u32) -> bool {
+        id == self.vocab.eos_id
+            || matches!(
+                self.vocab.token_types.get(id as usize),
+                Some(TokenType::Control)
+            )
     }
 }
 

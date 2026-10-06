@@ -98,6 +98,12 @@ cuobjdump --list-elf kernels/qwen/qwen3_5/nvidia/libkernel_qwen_qwen3_5_nvidia.s
 If libcudart 13 is first on the library path, point spite at the 12.x
 runtime with `SPITE_CUDART=/usr/local/cuda-12.6/lib64/libcudart.so`.
 
+CUDA 12.4 rejects very new host compilers (gcc 15); pass
+`-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/gcc-13` if nvcc errors on the default.
+`cargo test --workspace` also needs the OpenSSL headers (`libssl-dev` on
+Debian/Ubuntu) for `openssl-sys`; a fresh box without them fails only at test
+time — `cargo build --release` does not.
+
 Newer cards build the same way with their own card name
 (`-DSPITE_GPU_ARCHS="RTX_4090"`, etc.).
 
