@@ -1305,6 +1305,7 @@ dependencies = [
  "serde",
  "serde_json",
  "spite-abi",
+ "spite-compute",
  "spite-dispatch",
  "spite-executor",
  "spite-gpu",
@@ -1312,6 +1313,7 @@ dependencies = [
  "spite-loader",
  "spite-models",
  "spite-sampling",
+ "spite-speculative",
  "spite-tokenizer",
 ]
 

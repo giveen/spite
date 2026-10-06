@@ -228,6 +228,11 @@ impl Executor {
         self.n_ctx_used
     }
 
+    /// Roll back the context position by `n` steps (e.g. on rejected speculative draft tokens).
+    pub fn rollback(&mut self, n: usize) {
+        self.n_ctx_used = self.n_ctx_used.saturating_sub(n);
+    }
+
     /// Full generate loop: encode is done by the caller; this runs
     /// prefill → sample/decode until `max_tokens` or EOS.
     ///
