@@ -138,4 +138,14 @@ host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
     on the host GPU through the sm_60 build.
   - **still needs the P100s**: a `spite-bench` prefill before/after (the win is
     expected but unmeasured) and a `.bench` refresh.
-- **PXQ codec, sm_60 attention/GEMV tuning**: not started (see the sections above).
+- **PXQ4 = MXFP4: done.** PXQ4 is pxa's repack of MXFP4 (ggml type 39): 32-element
+  blocks, E8M0 scale, e2m1 codes, 4.25 bpw — the tier that fits a 27B on one
+  16 GB P100. Inference already worked in spite (CPU `dq_mxfp4`, the CUDA
+  `MXFP4` decoder, the loader); this session added the missing **quantizer** and
+  a **GGUF v3 writer** (`crates/spite-quantize/src/{mxfp4,gguf_write}.rs`), so
+  `spite-quantize --type MXFP4` produces a file. Verified: codec round-trip,
+  the tiny fixture quantized/reloaded/decoded on CPU, and MXFP4 matmul exercised
+  by `verify.py` on the sm_60 kernel. 1-D parameters (GDN dt/a/norm, conv and
+  RMS norm weights) stay F32, as the ops require.
+- **sm_60 attention/GEMV tuning**: not started; it is measurement-driven and
+  needs the P100s (see the section above).
