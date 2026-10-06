@@ -11,47 +11,149 @@
 
 use core::ffi::{c_char, c_int, c_void};
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 7;
 
 // ── Tensor type tag ────────────────────────────────────────────────────────
 
+/// Values are the GGUF / ggml tensor type ids (ABI v6), so a file's type id maps
+/// straight onto this enum and block layouts match `core/ggml-common.h`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpiteType {
     F32 = 0,
     F16 = 1,
-    Bf16 = 2,
+    Q4_0 = 2,
+    Q4_1 = 3,
+    Q5_0 = 6,
+    Q5_1 = 7,
     Q8_0 = 8,
-    Q5_1 = 11,
-    Q4_0 = 10,
+    Q2K = 10,
+    Q3K = 11,
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
+    Iq2Xxs = 16,
+    Iq2Xs = 17,
+    Iq3Xxs = 18,
+    Iq1S = 19,
+    Iq4Nl = 20,
+    Iq3S = 21,
+    Iq2S = 22,
+    Iq4Xs = 23,
+    Iq1M = 29,
+    Bf16 = 30,
+    Tq1_0 = 34,
+    Tq2_0 = 35,
+    Mxfp4 = 39,
+    Nvfp4 = 40,
+    Q1_0 = 41,
+    Q2_0 = 42,
 }
 
 impl SpiteType {
+    /// Every defined type, ascending by id.
+    pub const ALL: [SpiteType; 28] = [
+        Self::F32,
+        Self::F16,
+        Self::Q4_0,
+        Self::Q4_1,
+        Self::Q5_0,
+        Self::Q5_1,
+        Self::Q8_0,
+        Self::Q2K,
+        Self::Q3K,
+        Self::Q4K,
+        Self::Q5K,
+        Self::Q6K,
+        Self::Iq2Xxs,
+        Self::Iq2Xs,
+        Self::Iq3Xxs,
+        Self::Iq1S,
+        Self::Iq4Nl,
+        Self::Iq3S,
+        Self::Iq2S,
+        Self::Iq4Xs,
+        Self::Iq1M,
+        Self::Bf16,
+        Self::Tq1_0,
+        Self::Tq2_0,
+        Self::Mxfp4,
+        Self::Nvfp4,
+        Self::Q1_0,
+        Self::Q2_0,
+    ];
+
+    /// The type for a GGUF/ggml tensor type id, if spite supports it.
+    pub fn from_gguf_id(id: u32) -> Option<Self> {
+        Self::ALL.iter().copied().find(|t| *t as u32 == id)
+    }
+
     /// Bytes per atomic storage unit (bytes-per-element for full-precision,
     /// bytes-per-block for block-quantised types).
     pub fn block_bytes(self) -> u64 {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
+            Self::Q4_0 => 18,
+            Self::Q4_1 => 20,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
+            Self::Q8_0 => 34,
+            Self::Q2K => 84,
+            Self::Q3K => 110,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,
+            Self::Iq2Xxs => 66,
+            Self::Iq2Xs => 74,
+            Self::Iq3Xxs => 98,
+            Self::Iq1S => 50,
+            Self::Iq4Nl => 18,
+            Self::Iq3S => 110,
+            Self::Iq2S => 82,
+            Self::Iq4Xs => 136,
+            Self::Iq1M => 56,
             Self::Bf16 => 2,
-            Self::Q8_0 => 34, // 32-elem block: f16 scale + 32×i8
-            Self::Q5_1 => 24, // 32-elem block: f16 d + f16 m + u32 qh + 16×u8
-            Self::Q4_0 => 18, // 32-elem block: f16 scale + 16×u8
-            Self::Q4K => 144, // 256-elem super-block
-            Self::Q5K => 176, // 256-elem super-block
-            Self::Q6K => 210, // 256-elem super-block
+            Self::Tq1_0 => 54,
+            Self::Tq2_0 => 66,
+            Self::Mxfp4 => 17,
+            Self::Nvfp4 => 36,
+            Self::Q1_0 => 18,
+            Self::Q2_0 => 18,
         }
     }
 
     /// Elements per atomic storage block (1 for full-precision types).
     pub fn block_elements(self) -> u64 {
         match self {
-            Self::Q8_0 | Self::Q5_1 | Self::Q4_0 => 32,
-            Self::Q4K | Self::Q5K | Self::Q6K => 256,
-            _ => 1,
+            Self::F32 => 1,
+            Self::F16 => 1,
+            Self::Q4_0 => 32,
+            Self::Q4_1 => 32,
+            Self::Q5_0 => 32,
+            Self::Q5_1 => 32,
+            Self::Q8_0 => 32,
+            Self::Q2K => 256,
+            Self::Q3K => 256,
+            Self::Q4K => 256,
+            Self::Q5K => 256,
+            Self::Q6K => 256,
+            Self::Iq2Xxs => 256,
+            Self::Iq2Xs => 256,
+            Self::Iq3Xxs => 256,
+            Self::Iq1S => 256,
+            Self::Iq4Nl => 32,
+            Self::Iq3S => 256,
+            Self::Iq2S => 256,
+            Self::Iq4Xs => 256,
+            Self::Iq1M => 256,
+            Self::Bf16 => 1,
+            Self::Tq1_0 => 256,
+            Self::Tq2_0 => 256,
+            Self::Mxfp4 => 32,
+            Self::Nvfp4 => 64,
+            Self::Q1_0 => 128,
+            Self::Q2_0 => 64,
         }
     }
 }
@@ -268,6 +370,112 @@ pub type SpecVerifyFn = unsafe extern "C" fn(
     ctx: *const SpiteCtx,
 ) -> c_int;
 
+// ── Extended attention (ABI v7) ────────────────────────────────────────────
+
+/// Attention variant for hybrid Qwen3.5-style full-attention layers.
+///
+/// - `head_dim`: per-head width (not derivable from `wq` when Q is gated).
+/// - `rope_dim`: only the first `rope_dim` dims of each q/k head are rotated
+///   (NEOX pairing `i <-> i + rope_dim/2`); `rope_dim == head_dim` is plain RoPE.
+/// - `gated_q`: 1 when `wq` has `2*n_heads*head_dim` rows laid out per head as
+///   `[q | gate]`; each head's attention output is scaled by `sigmoid(gate)`
+///   before `wo`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpiteAttnParams {
+    pub head_dim: i32,
+    pub rope_dim: i32,
+    pub gated_q: i32,
+}
+
+impl SpiteAttnParams {
+    /// Scratch floats the op needs in `ctx.scratchpad` (mirrors `spite_attn_ex_scratch_floats`).
+    pub fn scratch_floats(&self, n_heads: usize, n_kv_heads: usize, n_ctx: usize) -> usize {
+        let hd = self.head_dim as usize;
+        3 * n_heads * hd + 2 * n_kv_heads * hd + n_heads * n_ctx
+    }
+}
+
+/// `SpiteAttentionFn` plus [`SpiteAttnParams`]; same accumulate-into-`out` semantics.
+pub type AttentionExFn = unsafe extern "C" fn(
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
+    wq: *const SpiteTensor,
+    wk: *const SpiteTensor,
+    wv: *const SpiteTensor,
+    wo: *const SpiteTensor,
+    q_norm: *const SpiteTensor,
+    k_norm: *const SpiteTensor,
+    norm_eps: f32,
+    kvcache: *mut SpiteKvCache,
+    rope_freq_base: f32,
+    params: *const SpiteAttnParams,
+    ctx: *const SpiteCtx,
+) -> c_int;
+
+// ── Linear attention: Gated Delta Net layer (ABI v7) ───────────────────────
+
+/// Geometry of one GDN layer.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpiteGdnParams {
+    /// Key/query heads.
+    pub n_kh: i32,
+    /// Value heads (`n_vh % n_kh == 0`).
+    pub n_vh: i32,
+    /// Key, query and value head width `S`; the state is `S x S` per value head.
+    pub head_dim: i32,
+    /// Depthwise conv taps `K`; the history holds `K - 1` previous inputs.
+    pub d_conv: i32,
+    /// Epsilon of the q/k L2 normalisation and of the gated RMS norm.
+    pub norm_eps: f32,
+}
+
+impl SpiteGdnParams {
+    /// Conv channels `C = 2*n_kh*S + n_vh*S`.
+    pub fn conv_channels(&self) -> usize {
+        (2 * self.n_kh as usize + self.n_vh as usize) * self.head_dim as usize
+    }
+
+    /// Scratch floats needed in `ctx.scratchpad` (mirrors `spite_gdn_scratch_floats`).
+    pub fn scratch_floats(&self) -> usize {
+        let s = self.head_dim as usize;
+        let v = self.n_vh as usize * s;
+        2 * self.n_kh as usize * s + 3 * v + 2 * self.n_vh as usize
+    }
+
+    /// Floats of `conv_hist` storage: `(K - 1) * C`.
+    pub fn conv_hist_floats(&self) -> usize {
+        (self.d_conv as usize).saturating_sub(1) * self.conv_channels()
+    }
+
+    /// Floats of recurrent `state` storage: `n_vh * S * S`.
+    pub fn state_floats(&self) -> usize {
+        self.n_vh as usize * (self.head_dim as usize).pow(2)
+    }
+}
+
+/// One decode token of a complete GDN layer: `out += W_out . gated_norm(core(x))`.
+/// See `SpiteGdnFn` in `core/abi.h` for the full math and layouts. `x` is the
+/// RMS-normalised layer input; `conv_hist`/`state` are updated in place.
+pub type GdnFn = unsafe extern "C" fn(
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
+    w_qkv: *const SpiteTensor,
+    w_gate: *const SpiteTensor,
+    w_beta: *const SpiteTensor,
+    w_alpha: *const SpiteTensor,
+    w_out: *const SpiteTensor,
+    conv_w: *const SpiteTensor,
+    ssm_dt: *const SpiteTensor,
+    ssm_a: *const SpiteTensor,
+    ssm_norm: *const SpiteTensor,
+    conv_hist: *mut SpiteTensor,
+    state: *mut SpiteTensor,
+    params: *const SpiteGdnParams,
+    ctx: *const SpiteCtx,
+) -> c_int;
+
 // ── Model capability declaration ───────────────────────────────────────────
 
 /// What a model supports — derived from GGUF metadata by the runtime.
@@ -332,6 +540,10 @@ pub struct SpiteKernelInfo {
     /// KV-cache tiers the attention op accepts. `None` = F32 only.
     /// Added after ABI v4 as a trailing optional slot (no version bump).
     pub kv_cache_kinds: Option<KvCacheKindsFn>,
+    /// Gated-delta-net layer (hybrid archs). ABI v7.
+    pub linear_attn: Option<GdnFn>,
+    /// Extended attention: partial RoPE + gated Q. ABI v7.
+    pub attention_ex: Option<AttentionExFn>,
 }
 
 unsafe impl Send for SpiteKernelInfo {}

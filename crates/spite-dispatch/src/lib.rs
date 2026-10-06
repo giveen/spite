@@ -25,8 +25,8 @@ use libloading::{Library, Symbol};
 use thiserror::Error;
 
 use spite_abi::{
-    ABI_VERSION, AttentionFn, FfnFn, KERNEL_ENTRY_SYMBOL, KernelInfoFn, LayerFn, MatmulFn,
-    RmsNormFn, SpecVerifyFn, SpiteKernelInfo, SpiteType,
+    ABI_VERSION, AttentionExFn, AttentionFn, FfnFn, GdnFn, KERNEL_ENTRY_SYMBOL, KernelInfoFn,
+    LayerFn, MatmulFn, RmsNormFn, SpecVerifyFn, SpiteKernelInfo, SpiteType,
 };
 
 pub mod cards;
@@ -104,9 +104,15 @@ pub struct DispatchTable {
     /// `SpiteType` values. A kernel that does not declare support reads as
     /// F32-only, so the host never hands it a tier it cannot read.
     pub kv_cache_kinds: u64,
+    /// Same, for the kernel that won `attention_ex` (may differ from `attention`'s).
+    pub kv_cache_kinds_ex: u64,
     pub ffn: (Option<FfnFn>, OpSource),
     pub layer: (Option<LayerFn>, OpSource),
     pub matmul: (Option<MatmulFn>, OpSource),
+    /// Gated-delta-net decode step (hybrid linear-attention archs).
+    pub linear_attn: (Option<GdnFn>, OpSource),
+    /// Attention with partial RoPE and gated Q (hybrid archs).
+    pub attention_ex: (Option<AttentionExFn>, OpSource),
     // ── Engine-level ops (cross-model, card/arch/generic chain) ──────────
     pub speculative_verify: (Option<SpecVerifyFn>, OpSource),
     pub prefill: (Option<LayerFn>, OpSource), // chunked prefill
@@ -123,6 +129,8 @@ impl DispatchTable {
             ("ffn", &self.ffn.1),
             ("layer", &self.layer.1),
             ("matmul", &self.matmul.1),
+            ("linear_attn", &self.linear_attn.1),
+            ("attention_ex", &self.attention_ex.1),
             ("spec_verify", &self.speculative_verify.1),
             ("prefill", &self.prefill.1),
         ];
@@ -191,6 +199,18 @@ impl DispatchBuilder {
         let ffn = find_op(&model_libs, |k| k.info.ffn, generic_src.clone());
         let layer = find_op(&model_libs, |k| k.info.layer, generic_src.clone());
         let matmul = find_op(&model_libs, |k| k.info.matmul, generic_src.clone());
+        let linear_attn = find_op(&model_libs, |k| k.info.linear_attn, generic_src.clone());
+        let attention_ex = find_op(&model_libs, |k| k.info.attention_ex, generic_src.clone());
+        let kv_cache_kinds_ex = model_libs
+            .iter()
+            .find(|l| l.info.attention_ex.is_some())
+            .map_or(1u64 << SpiteType::F32 as u32, |l| {
+                match l.info.kv_cache_kinds {
+                    // SAFETY: the kernel exports this as a plain query function.
+                    Some(cap) => unsafe { cap() },
+                    None => 1u64 << SpiteType::F32 as u32,
+                }
+            });
 
         // Engine ops resolved from their own candidate chains
         let speculative_verify = find_op(
@@ -208,9 +228,12 @@ impl DispatchBuilder {
             rms_norm,
             attention,
             kv_cache_kinds,
+            kv_cache_kinds_ex,
             ffn,
             layer,
             matmul,
+            linear_attn,
+            attention_ex,
             speculative_verify,
             prefill,
             _libs: all_libs,

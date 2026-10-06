@@ -29,6 +29,8 @@ typedef struct {
     SpiteLayerFn     layer;
     SpiteLayerFn     prefill; /* chunked prefill; NULL if not implemented */
     SpiteMatmulFn    matmul;  /* dense projection (LM head); ABI v4 */
+    SpiteGdnFn       linear_attn; /* GDN layer (hybrid archs); ABI v7 */
+    SpiteAttentionExFn attention_ex; /* partial RoPE + gated Q; ABI v7 */
 } spite_dispatch_table_t;
 
 /*

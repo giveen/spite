@@ -25,6 +25,7 @@ pub mod eagle;
 pub mod gemma;
 pub mod glm;
 pub mod gpu_dense;
+pub mod hybrid;
 pub mod kimi;
 pub mod llama;
 pub mod mellum;
@@ -338,8 +339,6 @@ impl Default for ArchRegistry {
                 ("magistral", |c| Box::new(mistral::Mistral4::new(c))),
                 // ── Qwen family ──────────────────────────────────────────────
                 ("qwen3", |c| Box::new(qwen::Qwen3_5::new(c))),
-                ("qwen35", |c| Box::new(qwen::Qwen3_5::new(c))),
-                ("qwen35moe", |c| Box::new(qwen::Qwen3_5::new(c))),
                 ("qwen4", |c| Box::new(qwen::Qwen4::new(c))),
                 ("qwen4exp", |c| Box::new(qwen::Qwen4::new(c))),
                 // ── DeepSeek family ──────────────────────────────────────────

@@ -174,12 +174,16 @@ python3 tools/verify/verify.py \
 ```
 
 ### What `verify.py` Validates
-1. **ABI Check**: Matches `SPITE_ABI_VERSION` (currently `4`).
-2. **Op Correctness**: Tests `rms_norm`, `matmul`, `ffn`, and `attention` with pseudo-random tensors against the generic reference implementation.
+1. **ABI Check**: Matches `SPITE_ABI_VERSION` (currently `7`).
+2. **Op Correctness**: Tests `rms_norm`, `matmul`, `ffn`, `attention` (and the v7 ops below) with pseudo-random tensors against the generic reference implementation.
 3. **Tolerance**:
    - `max_abs_diff <= 1e-4` for FP16 and FP32 outputs.
    - `max_abs_diff <= 1e-3` for Q8_0 weights.
-4. **Clean Exit**: Exits with code `0`.
+4. **Per-type matmul**: every SpiteType (all 28 ids) is tried against the generic reference with random packed blocks; `-1` from a kernel for an undeclared type is a SKIP, a mismatch or a `-1` for a declared type is a FAIL.
+5. **ABI v7 layer ops** (`linear_attn` = Gated Delta Net layer incl. projections, `attention_ex` = partial RoPE + gated Q): F32, Q8_0 and Q4_K/Q5_K/Q6_K weights, several sequential tokens (GDN state/conv history and KV cache carry between calls), GDN geometries up to the 27B shape (n_kh=16, n_vh=48, S=128, d_model=5120). The generic reference is itself checked against independent pure-python float64 models (<= 1e-4) and against malformed input (`-1` bad tensor/geometry, `-2` short scratch, no writes on error); a kernel is compared to the reference (<= 1e-4, <= 1e-3 for packed weights). An op the kernel leaves NULL, or answers `-1` for an unsupported geometry/type, is a SKIP.
+6. **Clean Exit**: Exits with code `0`.
+
+Shared GPU quant decoders (`core/gpu/quant_*.h`) additionally need the device proof (bit-exact decode of all 28 types + GEMV error); build line and flags are at the top of `tools/verify/quant_gpu_test.cu`.
 
 ---
 

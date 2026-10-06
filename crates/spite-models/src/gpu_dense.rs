@@ -25,21 +25,21 @@ use crate::dense::{Activation, packed_bytes};
 use crate::{ModelArch, ModelConfig, ModelError};
 
 /// VRAM kept free beyond the computed need (driver, fragmentation).
-const VRAM_HEADROOM: usize = 512 << 20;
+pub(crate) const VRAM_HEADROOM: usize = 512 << 20;
 
-fn err(msg: impl Into<String>) -> ModelError {
+pub(crate) fn err(msg: impl Into<String>) -> ModelError {
     ModelError::Forward(msg.into())
 }
 
 /// One weight tensor in VRAM.
-struct DeviceWeight {
-    buf: DeviceBuffer,
-    ne: [u32; 4],
-    kind: SpiteType,
+pub(crate) struct DeviceWeight {
+    pub(crate) buf: DeviceBuffer,
+    pub(crate) ne: [u32; 4],
+    pub(crate) kind: SpiteType,
 }
 
 impl DeviceWeight {
-    fn tensor(&self) -> SpiteTensor {
+    pub(crate) fn tensor(&self) -> SpiteTensor {
         SpiteTensor {
             data: self.buf.as_ptr().cast(),
             ne: self.ne,
@@ -50,7 +50,7 @@ impl DeviceWeight {
 }
 
 /// F32 device vector view of `n` elements.
-fn f32_tensor(buf: &DeviceBuffer, n: usize) -> SpiteTensor {
+pub(crate) fn f32_tensor(buf: &DeviceBuffer, n: usize) -> SpiteTensor {
     let ne = [n as u32, 1, 1, 1];
     SpiteTensor {
         data: buf.as_ptr().cast(),
@@ -302,7 +302,7 @@ impl GpuDense {
     }
 }
 
-fn gib(b: usize) -> f64 {
+pub(crate) fn gib(b: usize) -> f64 {
     b as f64 / (1u64 << 30) as f64
 }
 
@@ -430,7 +430,7 @@ fn requantize_kv(
     Ok(())
 }
 
-fn rc(code: c_int, op: &str, layer: usize) -> Result<(), ModelError> {
+pub(crate) fn rc(code: c_int, op: &str, layer: usize) -> Result<(), ModelError> {
     if code == 0 {
         Ok(())
     } else {
@@ -679,12 +679,12 @@ impl ModelArch for GpuDense {
     }
 }
 
-fn f32_bytes(v: &[f32]) -> &[u8] {
+pub(crate) fn f32_bytes(v: &[f32]) -> &[u8] {
     // SAFETY: f32 has no padding; u8 alignment is 1.
     unsafe { std::slice::from_raw_parts(v.as_ptr().cast(), std::mem::size_of_val(v)) }
 }
 
-fn f32_bytes_mut(v: &mut [f32]) -> &mut [u8] {
+pub(crate) fn f32_bytes_mut(v: &mut [f32]) -> &mut [u8] {
     // SAFETY: as above; every bit pattern is a valid f32.
     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast(), std::mem::size_of_val(v)) }
 }

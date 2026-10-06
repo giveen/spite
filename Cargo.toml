@@ -48,6 +48,7 @@ spite-sampling    = { path = "crates/spite-sampling" }
 spite-kvcache     = { path = "crates/spite-kvcache" }
 spite-speculative = { path = "crates/spite-speculative" }
 spite-compute     = { path = "crates/spite-compute" }
+cc                = "1"
 spite-rope        = { path = "crates/spite-rope" }
 spite-grammar     = { path = "crates/spite-grammar" }
 spite-gpu         = { path = "crates/spite-gpu" }

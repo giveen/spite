@@ -10,3 +10,6 @@ repository.workspace = true
 [dependencies]
 spite-abi  = { workspace = true }
 thiserror  = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }

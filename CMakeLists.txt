@@ -228,7 +228,7 @@ endforeach()
 # ── Generic fallback (always built, CPU only) ─────────────────────────────
 file(GLOB _generic_srcs "kernels/generic/generic/*.c" "kernels/generic/generic/*.cpp")
 if(_generic_srcs)
-    add_library(kernel_generic SHARED ${_generic_srcs})
+    add_library(kernel_generic SHARED ${_generic_srcs} "${CMAKE_SOURCE_DIR}/core/quant.c")
     target_include_directories(kernel_generic PRIVATE "${CMAKE_SOURCE_DIR}")
     set_target_properties(kernel_generic PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/kernels/generic/generic"
