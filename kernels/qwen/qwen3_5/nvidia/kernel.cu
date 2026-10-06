@@ -213,6 +213,8 @@ extern "C" int qwen35_cuda_mtp_stem(SpiteTensor *out, const SpiteTensor *embed,
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 
+#include "kernels/_engine/speculative/speculative_round.cuh"
+
 // ── Kernel descriptor ────────────────────────────────────────────────────
 
 static const SpiteKernelInfo KERNEL_INFO = {
@@ -230,7 +232,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     nullptr, /* mla */
     qwen35_cuda_ffn,
     nullptr, /* layer */
-    nullptr, /* speculative_verify */
+    spite::engine::spite_speculative_verify_cuda, /* speculative_verify */
     nullptr, /* prefill */
     qwen35_cuda_matmul,
     qwen35_cuda_kv_cache_kinds,
