@@ -114,10 +114,28 @@ host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
 
 ## Status
 
-- **Item (peer-capable tensor split): done.** pxa measures `-sm tensor` on a 2×
+- **Peer-capable tensor split: done.** pxa measures `-sm tensor` on a 2×
   P100-PCIE **PHB** pair at +17–27% decode / +44% prefill over the layer split, so
   `p100_multi` now gates tensor parallelism on *peer access*
   (`cudaDeviceCanAccessPeer`), not NVLink. NVLink vs PCIe changes the speed, not
   whether the split is allowed. (`crates/spite-parallel/src/p100_multi.rs`.)
-- Items 1 and 2 share the batched-hybrid-forward dependency; 3–5 are kernel/codec
-  work that needs the P100s to build, verify and benchmark.
+- **Batched hybrid prefill: done (needs P100 before/after).** The engine and the
+  sm_60 kernels both implement it:
+  - generic reference ops accept `[cols, m]` (`5430ec4`), and
+    `HybridDecoder::forward` runs a multi-token prompt layer-major via
+    `forward_batch` (`a9bb561`).
+  - the CUDA vendor ops batch too: `q35_gemv_batch` (multi-column GEMV) drives
+    `ffn`, `matmul`, the `attention_ex` projections and the `linear_attn`
+    projections (`a095efe`, `1e4bbff`, `3a61c99`); attention and the GDN
+    recurrence stay per token, the weight stream is amortised over m.
+  - an optional `spite_kernel_caps()` bit (`SPITE_CAP_BATCH`, no ABI bump) lets a
+    kernel advertise batch support; the dispatcher reads it and
+    `batch_capable()` gates on it (`290c102`).
+  - verified with `tools/verify/verify_batch.py` (CPU) and
+    `tools/verify/verify_batch_cuda.py` (device, PTX JIT): ffn/matmul ~8e-8 vs a
+    float64 oracle, attention_ex/linear_attn bit-identical to sequential m=1 with
+    KV/state carried. `verify.py` (m=1) still passes; Qwen3.8-27B runs end to end
+    on the host GPU through the sm_60 build.
+  - **still needs the P100s**: a `spite-bench` prefill before/after (the win is
+    expected but unmeasured) and a `.bench` refresh.
+- **PXQ codec, sm_60 attention/GEMV tuning**: not started (see the sections above).
