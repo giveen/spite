@@ -118,16 +118,30 @@ pub struct DeviceBuffer {
     /// Backend-managed device pointer; for `Cpu` a leaked boxed slice owned by this
     /// buffer (freed in `Drop`), so `as_ptr` is valid for kernels on every backend.
     ptr: *mut u8,
+    /// CUDA ordinal the memory lives on; copies and the free switch to it.
+    /// Always 0 on other backends.
+    device: usize,
 }
 
 unsafe impl Send for DeviceBuffer {}
 unsafe impl Sync for DeviceBuffer {}
 
 impl DeviceBuffer {
-    /// Allocate `size` bytes on `backend`.
+    /// Allocate `size` bytes on `backend` (CUDA: on the current device).
     pub fn alloc(backend: GpuBackend, size: usize) -> Result<Self, GpuError> {
         match backend {
-            GpuBackend::Cuda => cuda::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
+            GpuBackend::Cuda => {
+                let device = cuda::current_device()?;
+                let ptr = cuda::alloc(size)?;
+                // Built directly: struct-update syntax from `from_ptr` would drop
+                // (and free) the temporary it copies the pointer out of.
+                Ok(Self {
+                    backend,
+                    size,
+                    ptr,
+                    device,
+                })
+            }
             GpuBackend::Hip => hip::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
             GpuBackend::HipUnified => {
                 hip_unified::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr))
@@ -148,8 +162,31 @@ impl DeviceBuffer {
         }
     }
 
+    /// Allocate `size` bytes on CUDA device `device`, leaving the current device unchanged.
+    ///
+    /// Every other backend ignores `device` and behaves like [`Self::alloc`].
+    ///
+    /// # Errors
+    /// Allocation failure, or an invalid CUDA ordinal.
+    pub fn alloc_on(backend: GpuBackend, device: usize, size: usize) -> Result<Self, GpuError> {
+        if backend != GpuBackend::Cuda {
+            return Self::alloc(backend, size);
+        }
+        cuda::with_device(device, || Self::alloc(backend, size))
+    }
+
     fn from_ptr(backend: GpuBackend, size: usize, ptr: *mut u8) -> Self {
-        Self { backend, size, ptr }
+        Self {
+            backend,
+            size,
+            ptr,
+            device: 0,
+        }
+    }
+
+    /// CUDA ordinal holding this buffer; 0 on every other backend.
+    pub fn device(&self) -> usize {
+        self.device
     }
 
     /// Copy `src` (host) → this buffer (device).
@@ -161,7 +198,7 @@ impl DeviceBuffer {
                 self.as_cpu_slice_mut()[..src.len()].copy_from_slice(src);
                 Ok(())
             }
-            GpuBackend::Cuda => cuda::upload(self.ptr, src),
+            GpuBackend::Cuda => cuda::with_device(self.device, || cuda::upload(self.ptr, src)),
             GpuBackend::Hip => hip::upload(self.ptr, src),
             GpuBackend::HipUnified => hip_unified::upload(self.ptr, src),
             GpuBackend::Metal => metal::upload(self.ptr, src),
@@ -183,7 +220,7 @@ impl DeviceBuffer {
                 dst.copy_from_slice(&self.as_cpu_slice()[..dst.len()]);
                 Ok(())
             }
-            GpuBackend::Cuda => cuda::download(self.ptr, dst),
+            GpuBackend::Cuda => cuda::with_device(self.device, || cuda::download(self.ptr, dst)),
             GpuBackend::Hip => hip::download(self.ptr, dst),
             GpuBackend::HipUnified => hip_unified::download(self.ptr, dst),
             GpuBackend::Metal => metal::download(self.ptr, dst),
@@ -224,7 +261,18 @@ impl Drop for DeviceBuffer {
             return;
         }
         match self.backend {
-            GpuBackend::Cuda => cuda::free(self.ptr),
+            GpuBackend::Cuda => {
+                let ptr = self.ptr;
+                // A failed switch still attempts the free on the current device.
+                if cuda::with_device(self.device, || {
+                    cuda::free(ptr);
+                    Ok(())
+                })
+                .is_err()
+                {
+                    cuda::free(ptr);
+                }
+            }
             GpuBackend::Hip => hip::free(self.ptr),
             GpuBackend::HipUnified => unsafe { hip_unified::free(self.ptr, self.size) },
             GpuBackend::Metal => metal::free(self.ptr),

@@ -21,6 +21,7 @@ struct Api {
     _lib: Library,
     get_device_count: unsafe extern "C" fn(*mut c_int) -> CudaErr,
     set_device: unsafe extern "C" fn(c_int) -> CudaErr,
+    get_device: unsafe extern "C" fn(*mut c_int) -> CudaErr,
     malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> CudaErr,
     free: unsafe extern "C" fn(*mut c_void) -> CudaErr,
     memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> CudaErr,
@@ -66,6 +67,7 @@ fn load() -> Option<Api> {
         let api = Api {
             get_device_count: sym!(b"cudaGetDeviceCount\0"),
             set_device: sym!(b"cudaSetDevice\0"),
+            get_device: sym!(b"cudaGetDevice\0"),
             malloc: sym!(b"cudaMalloc\0"),
             free: sym!(b"cudaFree\0"),
             memcpy: sym!(b"cudaMemcpy\0"),
@@ -105,6 +107,69 @@ fn check(a: &Api, code: CudaErr, what: &str) -> Result<(), GpuError> {
 /// True when libcudart loads and at least one CUDA device is present.
 pub fn is_available() -> bool {
     api().is_ok()
+}
+
+/// Number of visible CUDA devices (honors `CUDA_VISIBLE_DEVICES`).
+///
+/// # Errors
+/// `BackendUnavailable` without libcudart or a device; `DeviceError` if the query fails.
+pub fn device_count() -> Result<usize, GpuError> {
+    let a = api()?;
+    let mut n: c_int = 0;
+    check(
+        a,
+        unsafe { (a.get_device_count)(&mut n) },
+        "cudaGetDeviceCount",
+    )?;
+    Ok(n.max(0) as usize)
+}
+
+/// Ordinal of the calling thread's current CUDA device.
+///
+/// # Errors
+/// `BackendUnavailable` without libcudart or a device; `DeviceError` if the query fails.
+pub fn current_device() -> Result<usize, GpuError> {
+    let a = api()?;
+    let mut d: c_int = 0;
+    check(a, unsafe { (a.get_device)(&mut d) }, "cudaGetDevice")?;
+    Ok(d.max(0) as usize)
+}
+
+/// Make `device` current for the calling thread.
+///
+/// The current device is per thread: allocations, copies and kernel launches
+/// on the legacy default stream all target it.
+///
+/// # Errors
+/// `BackendUnavailable` without libcudart; `DeviceError` for an invalid ordinal.
+pub fn set_device(device: usize) -> Result<(), GpuError> {
+    let a = api()?;
+    let d = c_int::try_from(device)
+        .map_err(|_| GpuError::DeviceError(format!("device ordinal {device} out of range")))?;
+    check(a, unsafe { (a.set_device)(d) }, "cudaSetDevice")
+}
+
+/// Run `f` with `device` current, then restore the previous device.
+///
+/// Skips both switches when `device` is already current, which is the
+/// single-GPU case.
+///
+/// # Errors
+/// Any error from switching devices, or the error `f` returns.
+pub fn with_device<T>(
+    device: usize,
+    f: impl FnOnce() -> Result<T, GpuError>,
+) -> Result<T, GpuError> {
+    let prev = current_device()?;
+    if prev == device {
+        return f();
+    }
+    set_device(device)?;
+    let out = f();
+    let restored = set_device(prev);
+    let out = out?;
+    restored?;
+    Ok(out)
 }
 
 /// `(free, total)` VRAM in bytes on the current device.

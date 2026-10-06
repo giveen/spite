@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_int;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -116,14 +117,22 @@ struct GdnState {
     state: DeviceBuffer,
 }
 
+/// One pipeline stage's residual stream and scratch, on that stage's device.
+struct StageBufs {
+    device: usize,
+    scratch: DeviceBuffer,
+    h: DeviceBuffer,
+    n: DeviceBuffer,
+}
+
 struct HState {
     /// Owns the device memory every `SpiteTensor` in `layers` points into.
     _weights: HashMap<String, DeviceWeight>,
     kv: Vec<KvPair>,
     gdn: Vec<GdnState>,
-    scratch: DeviceBuffer,
-    h: DeviceBuffer,
-    n: DeviceBuffer,
+    /// Pipeline stages in layer order; the last one also runs the LM head and
+    /// the MTP block, and owns `hid`, `emb`, `pack` and `logits`.
+    stages: Vec<StageBufs>,
     /// Final-normed hidden state of the last trunk token or MTP step: the
     /// `h_t` the next MTP step consumes.
     hid: DeviceBuffer,
@@ -143,8 +152,41 @@ pub struct HybridReport {
     pub kv_kind: SpiteType,
     /// The NextN (MTP) draft head was loaded and `mtp_step` is available.
     pub mtp: bool,
-    /// `(free, total)` device memory after load; `None` off CUDA.
+    /// `(free, total)` memory of the first stage's device after load; `None` off CUDA.
     pub mem: Option<(usize, usize)>,
+    /// Pipeline stages in layer order (one entry on a single device).
+    pub stages: Vec<StageReport>,
+}
+
+/// One loaded pipeline stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageReport {
+    /// CUDA ordinal (0 off CUDA).
+    pub device: usize,
+    /// Trunk layers this stage runs.
+    pub layers: Range<usize>,
+    /// Device bytes the stage allocated: weights, KV, recurrent state,
+    /// activations, scratch, plus the LM head and MTP block on the last stage.
+    pub bytes: usize,
+}
+
+/// How the trunk is spread over CUDA devices (pipeline parallelism).
+///
+/// Consecutive layers form a stage on one device; only the `d_model` hidden
+/// state crosses a stage boundary, through host memory, so the devices need
+/// no peer access (PCIe-only boxes work). The last stage also holds the LM
+/// head and the NextN block.
+///
+/// The default is the current device only, exactly the single-GPU path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayerSplit {
+    /// CUDA ordinals to use, in layer order. Empty: the current device.
+    pub devices: Vec<usize>,
+    /// Relative layer shares, one per device (e.g. `[33, 32]`). Empty: stay
+    /// on the first device when the model fits there, otherwise spread over
+    /// every listed device in proportion to its free memory, balancing bytes
+    /// rather than layer counts.
+    pub shares: Vec<u32>,
 }
 
 /// Hybrid decoder bound to one backend and one dispatch table.
@@ -157,6 +199,8 @@ pub struct HybridDecoder {
     attn: SpiteAttnParams,
     gdn: SpiteGdnParams,
     layers: Vec<Layer>,
+    /// Pipeline stage (index into `HState::stages`) of each layer.
+    layer_stage: Vec<usize>,
     mtp: Option<MtpHead>,
     out_norm: SpiteTensor,
     out_w: SpiteTensor,
@@ -168,6 +212,135 @@ pub struct HybridDecoder {
 /// True for archs this decoder implements: recurrent GDN layers with dense or MoE FFN.
 pub fn is_hybrid(cfg: &ModelConfig) -> bool {
     cfg.ssm_d_state > 0 && cfg.recurrent_layers.iter().any(|&r| r)
+}
+
+/// Block index of a `blk.N.*` tensor name.
+fn block_of(name: &str) -> Option<usize> {
+    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+}
+
+/// Resolve `split` to `(device per stage, layers per stage)`.
+///
+/// `layer_bytes` is each trunk layer's device footprint, `head_bytes` what
+/// the last stage carries on top, `stage_fixed` every stage's scratch and
+/// activations, and `free_on` a device's free bytes.
+fn plan_split(
+    split: &LayerSplit,
+    layer_bytes: &[usize],
+    head_bytes: usize,
+    stage_fixed: usize,
+    cuda_on: bool,
+    free_on: &dyn Fn(usize) -> Result<usize, ModelError>,
+) -> Result<(Vec<usize>, Vec<usize>), ModelError> {
+    let n_layers = layer_bytes.len();
+    let mut devices = split.devices.clone();
+    if cuda_on {
+        if devices.is_empty() {
+            devices.push(cuda::current_device().map_err(|e| err(e.to_string()))?);
+        }
+        let n = cuda::device_count().map_err(|e| err(e.to_string()))?;
+        if let Some(&bad) = devices.iter().find(|&&dev| dev >= n) {
+            return Err(err(format!("GPU {bad} does not exist ({n} visible)")));
+        }
+    } else if devices.is_empty() {
+        devices.push(0);
+    }
+
+    if !split.shares.is_empty() {
+        if split.shares.len() != devices.len() {
+            return Err(err(format!(
+                "layer split has {} shares for {} GPUs",
+                split.shares.len(),
+                devices.len()
+            )));
+        }
+        let counts = share_counts(&split.shares, n_layers)
+            .ok_or_else(|| err("layer split shares must not all be zero"))?;
+        if counts.contains(&0) {
+            return Err(err(format!(
+                "a layer split share is too small to get any of the {n_layers} layers"
+            )));
+        }
+        return Ok((devices, counts));
+    }
+
+    let mut uniq: Vec<usize> = Vec::with_capacity(devices.len());
+    for dev in devices {
+        if !uniq.contains(&dev) {
+            uniq.push(dev);
+        }
+    }
+    let total = layer_bytes.iter().sum::<usize>() + head_bytes + stage_fixed;
+    if uniq.len() == 1 || total + VRAM_HEADROOM <= free_on(uniq[0])? {
+        return Ok((vec![uniq[0]], vec![n_layers]));
+    }
+    let n_st = uniq.len();
+    let budgets = uniq
+        .iter()
+        .enumerate()
+        .map(|(i, &dev)| {
+            let reserved = VRAM_HEADROOM + stage_fixed + if i + 1 == n_st { head_bytes } else { 0 };
+            Ok(free_on(dev)?.saturating_sub(reserved))
+        })
+        .collect::<Result<Vec<_>, ModelError>>()?;
+    let counts = balance_layers(layer_bytes, &budgets);
+    // A device whose budget earned no layer is dropped; the last stage stays
+    // even when empty because it carries the head.
+    Ok(uniq
+        .into_iter()
+        .zip(counts)
+        .enumerate()
+        .filter(|&(i, (_, c))| c > 0 || i + 1 == n_st)
+        .map(|(_, sc)| sc)
+        .unzip())
+}
+
+/// Split `n` layers in proportion to `shares` (largest remainder, ties to
+/// the earlier stage). `None` when every share is zero.
+fn share_counts(shares: &[u32], n: usize) -> Option<Vec<usize>> {
+    let total: u64 = shares.iter().map(|&s| u64::from(s)).sum();
+    if total == 0 {
+        return None;
+    }
+    let scaled = |s: u32| u64::from(s) * n as u64;
+    let mut counts: Vec<usize> = shares
+        .iter()
+        .map(|&s| (scaled(s) / total) as usize)
+        .collect();
+    let mut rem: Vec<(u64, usize)> = shares
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (scaled(s) % total, i))
+        .collect();
+    rem.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let short = n - counts.iter().sum::<usize>();
+    for &(_, i) in rem.iter().take(short) {
+        counts[i] += 1;
+    }
+    Some(counts)
+}
+
+/// Contiguous layer counts per stage so each stage's bytes track its share
+/// of `budgets`. A layer joins a stage while at least half of it fits under
+/// the stage's cumulative target; the last stage takes the rest.
+fn balance_layers(layer_bytes: &[usize], budgets: &[usize]) -> Vec<usize> {
+    let total: u128 = layer_bytes.iter().map(|&b| b as u128).sum();
+    let cap: u128 = budgets.iter().map(|&b| b as u128).sum::<u128>().max(1);
+    let mut counts = vec![0usize; budgets.len()];
+    let (mut l, mut acc, mut target) = (0usize, 0u128, 0u128);
+    for (s, &b) in budgets.iter().enumerate() {
+        if s + 1 == budgets.len() {
+            counts[s] = layer_bytes.len() - l;
+            break;
+        }
+        target += total * b as u128 / cap;
+        while l < layer_bytes.len() && acc + layer_bytes[l] as u128 / 2 <= target {
+            acc += layer_bytes[l] as u128;
+            l += 1;
+            counts[s] += 1;
+        }
+    }
+    counts
 }
 
 impl HybridDecoder {
@@ -211,13 +384,37 @@ impl HybridDecoder {
         ok.then_some((table, backend))
     }
 
-    /// Upload every trunk tensor of `gguf`, allocate KV, GDN state and scratch.
+    /// Upload every trunk tensor of `gguf` to the current device, allocate KV,
+    /// GDN state and scratch.
+    ///
+    /// # Errors
+    /// See [`Self::load_split`].
     pub fn load(
         config: ModelConfig,
         gguf: &GgufModel,
         table: DispatchTable,
         backend: GpuBackend,
         n_ctx: usize,
+    ) -> Result<(Self, HybridReport), ModelError> {
+        Self::load_split(config, gguf, table, backend, n_ctx, &LayerSplit::default())
+    }
+
+    /// Like [`Self::load`], spreading the trunk over devices as `split` says.
+    ///
+    /// Off CUDA the device ordinals are ignored but the stages are still
+    /// built, so the stage hand-off can be exercised on the CPU backend.
+    ///
+    /// # Errors
+    /// Malformed GDN geometry, missing or unsupported weights, an invalid
+    /// `split` (unknown ordinal, share count not matching the devices, a share
+    /// too small to get a layer), or a device without room for its stage.
+    pub fn load_split(
+        config: ModelConfig,
+        gguf: &GgufModel,
+        table: DispatchTable,
+        backend: GpuBackend,
+        n_ctx: usize,
+        split: &LayerSplit,
     ) -> Result<(Self, HybridReport), ModelError> {
         if !is_hybrid(&config) {
             return Err(err("not a hybrid (gated delta net) architecture"));
@@ -277,11 +474,12 @@ impl HybridDecoder {
             && has_tensor(format!("{mtp_b}.nextn.eh_proj.weight"))
             && has_tensor(format!("{mtp_b}.attn_q.weight"));
         let n_blocks = n_layers + usize::from(has_mtp);
-        let is_loaded = |name: &str| {
-            name.strip_prefix("blk.")
-                .and_then(|r| r.split('.').next())
-                .and_then(|i| i.parse::<usize>().ok())
-                .is_none_or(|i| i < n_blocks)
+        // Embedding lookups run on the host copy, so `token_embd` only goes to
+        // the device when it doubles as the LM head (tied embeddings).
+        let tied = !has_tensor("output.weight".into());
+        let is_loaded = |name: &str| match block_of(name) {
+            Some(i) => i < n_blocks,
+            None => tied || name != "token_embd.weight",
         };
         let mut sizes = Vec::new();
         let mut weights_bytes = 0usize;
@@ -318,30 +516,113 @@ impl HybridDecoder {
         .max()
         .unwrap_or(0);
         let scratch_bytes = scratch_floats * 4;
-        // h, n, hid, logits (+ emb and the [2*d] stem pack for MTP).
-        let act_bytes = (3 * d + config.vocab_size + if has_mtp { 3 * d } else { 0 }) * 4;
-        let need = weights_bytes + kv_bytes + state_bytes + scratch_bytes + act_bytes;
-        if backend == GpuBackend::Cuda {
-            let (free, _) = cuda::mem_info().map_err(|e| err(e.to_string()))?;
-            if need + VRAM_HEADROOM > free {
-                return Err(err(format!(
-                    "model needs {:.2} GiB VRAM (weights {:.2} + KV {:.2} @ {n_ctx} ctx + state {:.2}), \
-                     only {:.2} GiB free — reduce --ctx",
-                    gib(need),
-                    gib(weights_bytes),
-                    gib(kv_bytes),
-                    gib(state_bytes),
-                    gib(free)
-                )));
+
+        // Device bytes per trunk layer, of the head (everything outside the
+        // trunk: LM head, final norm, MTP block and its KV, hid/logits/emb/pack)
+        // and of each stage's own scratch + h + n.
+        let mut layer_bytes: Vec<usize> = (0..n_layers)
+            .map(|l| {
+                if config.recurrent_layers[l] {
+                    (gdn.conv_hist_floats() + gdn.state_floats()) * 4
+                } else {
+                    2 * kv_side
+                }
+            })
+            .collect();
+        let mut head_bytes = (d + config.vocab_size + if has_mtp { 3 * d } else { 0 }) * 4
+            + if has_mtp { 2 * kv_side } else { 0 };
+        for (name, _, bytes) in &sizes {
+            match block_of(name) {
+                Some(i) if i < n_layers => layer_bytes[i] += bytes,
+                _ => head_bytes += bytes,
             }
         }
+        let stage_fixed = scratch_bytes + 2 * d * 4;
+        let cuda_on = backend == GpuBackend::Cuda;
+        let free_on = |dev: usize| -> Result<usize, ModelError> {
+            if !cuda_on {
+                return Ok(usize::MAX);
+            }
+            cuda::with_device(dev, cuda::mem_info)
+                .map(|(free, _)| free)
+                .map_err(|e| err(e.to_string()))
+        };
 
-        let alloc = |n: usize| {
-            DeviceBuffer::alloc(backend, n.max(1)).map_err(|e| err(format!("alloc: {e}")))
+        let (devices, counts) = plan_split(
+            split,
+            &layer_bytes,
+            head_bytes,
+            stage_fixed,
+            cuda_on,
+            &free_on,
+        )?;
+        let n_stages = devices.len();
+        let layer_stage: Vec<usize> = counts
+            .iter()
+            .enumerate()
+            .flat_map(|(s, &c)| std::iter::repeat_n(s, c))
+            .collect();
+        let mut stage_reports = Vec::with_capacity(n_stages);
+        let mut first = 0;
+        for (s, (&device, &c)) in devices.iter().zip(&counts).enumerate() {
+            let bytes = layer_bytes[first..first + c].iter().sum::<usize>()
+                + stage_fixed
+                + if s + 1 == n_stages { head_bytes } else { 0 };
+            stage_reports.push(StageReport {
+                device,
+                layers: first..first + c,
+                bytes,
+            });
+            first += c;
+        }
+
+        // Stages that share a device (e.g. a split test on one GPU) add up.
+        if cuda_on {
+            let mut per_dev: Vec<(usize, usize)> = Vec::new();
+            for r in &stage_reports {
+                match per_dev.iter_mut().find(|(dev, _)| *dev == r.device) {
+                    Some((_, b)) => *b += r.bytes,
+                    None => per_dev.push((r.device, r.bytes)),
+                }
+            }
+            for &(dev, need) in &per_dev {
+                let free = free_on(dev)?;
+                if need + VRAM_HEADROOM <= free {
+                    continue;
+                }
+                return Err(err(if per_dev.len() == 1 {
+                    format!(
+                        "model needs {:.2} GiB VRAM on GPU {dev} (weights {:.2} + KV {:.2} @ {n_ctx} ctx \
+                         + state {:.2}), only {:.2} GiB free — reduce --ctx or spread the layers over \
+                         more GPUs (--gpus)",
+                        gib(need),
+                        gib(weights_bytes),
+                        gib(kv_bytes),
+                        gib(state_bytes),
+                        gib(free)
+                    )
+                } else {
+                    format!(
+                        "GPU {dev} needs {:.2} GiB for its pipeline stages, only {:.2} GiB free \
+                         — reduce --ctx, add GPUs (--gpus) or rebalance (--layer-split)",
+                        gib(need),
+                        gib(free)
+                    )
+                }));
+            }
+        }
+        let head_dev = devices[n_stages - 1];
+
+        let alloc = |dev: usize, n: usize| {
+            DeviceBuffer::alloc_on(backend, dev, n.max(1)).map_err(|e| err(format!("alloc: {e}")))
         };
         let mut weights = HashMap::with_capacity(sizes.len());
         for (name, t, bytes) in sizes {
-            let mut buf = alloc(bytes)?;
+            let dev = match block_of(&name) {
+                Some(i) if i < n_layers => devices[layer_stage[i]],
+                _ => head_dev,
+            };
+            let mut buf = alloc(dev, bytes)?;
             // SAFETY: `t.data` points at `bytes` bytes of the GGUF mmap.
             let src = unsafe { std::slice::from_raw_parts(t.data as *const u8, bytes) };
             buf.upload(src)
@@ -471,34 +752,51 @@ impl HybridDecoder {
             buf.upload(&vec![0u8; buf.size])
                 .map_err(|e| err(format!("zero: {e}")))
         };
+        // KV pairs and GDN states in layer order, matching `AttnLayer::kv` and
+        // `GdnLayer::st`, each on its layer's device; the MTP KV comes last.
         let mut kv = Vec::with_capacity(n_kv_layers);
-        for _ in 0..n_kv_layers {
+        let mut gdn_st = Vec::with_capacity(n_gdn);
+        for l in 0..n_layers {
+            let dev = devices[layer_stage[l]];
+            if config.recurrent_layers[l] {
+                let mut g = GdnState {
+                    conv_hist: alloc(dev, gdn.conv_hist_floats() * 4)?,
+                    state: alloc(dev, gdn.state_floats() * 4)?,
+                };
+                zero(&mut g.conv_hist)?;
+                zero(&mut g.state)?;
+                gdn_st.push(g);
+            } else {
+                kv.push(KvPair {
+                    k: alloc(dev, kv_side)?,
+                    v: alloc(dev, kv_side)?,
+                });
+            }
+        }
+        if has_mtp {
             kv.push(KvPair {
-                k: alloc(kv_side)?,
-                v: alloc(kv_side)?,
+                k: alloc(head_dev, kv_side)?,
+                v: alloc(head_dev, kv_side)?,
             });
         }
-        let mut gdn_st = Vec::with_capacity(n_gdn);
-        for _ in 0..n_gdn {
-            let mut g = GdnState {
-                conv_hist: alloc(gdn.conv_hist_floats() * 4)?,
-                state: alloc(gdn.state_floats() * 4)?,
-            };
-            zero(&mut g.conv_hist)?;
-            zero(&mut g.state)?;
-            gdn_st.push(g);
+        let mut stages = Vec::with_capacity(n_stages);
+        for &device in &devices {
+            stages.push(StageBufs {
+                device,
+                scratch: alloc(device, scratch_bytes)?,
+                h: alloc(device, d * 4)?,
+                n: alloc(device, d * 4)?,
+            });
         }
         let st = HState {
             _weights: weights,
             kv,
             gdn: gdn_st,
-            scratch: alloc(scratch_bytes)?,
-            h: alloc(d * 4)?,
-            n: alloc(d * 4)?,
-            hid: alloc(d * 4)?,
-            emb: alloc(if has_mtp { d * 4 } else { 0 })?,
-            pack: alloc(if has_mtp { 2 * d * 4 } else { 0 })?,
-            logits: alloc(config.vocab_size * 4)?,
+            stages,
+            hid: alloc(head_dev, d * 4)?,
+            emb: alloc(head_dev, if has_mtp { d * 4 } else { 0 })?,
+            pack: alloc(head_dev, if has_mtp { 2 * d * 4 } else { 0 })?,
+            logits: alloc(head_dev, config.vocab_size * 4)?,
         };
 
         let embd = gguf.tensor("token_embd.weight");
@@ -520,9 +818,10 @@ impl HybridDecoder {
             scratch_bytes,
             kv_kind,
             mtp: has_mtp,
-            mem: (backend == GpuBackend::Cuda)
-                .then(|| cuda::mem_info().ok())
+            mem: cuda_on
+                .then(|| cuda::with_device(devices[0], cuda::mem_info).ok())
                 .flatten(),
+            stages: stage_reports,
         };
         Ok((
             Self {
@@ -534,6 +833,7 @@ impl HybridDecoder {
                 attn,
                 gdn,
                 layers,
+                layer_stage,
                 mtp,
                 out_norm,
                 out_w,
@@ -609,13 +909,13 @@ impl ModelArch for HybridDecoder {
         };
         let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
         let st = &mut *guard;
+        let last = st.stages.len() - 1;
 
-        let mut h_t = f32_tensor(&st.h, d);
-        let mut n_t = f32_tensor(&st.n, d);
         let mut hid_t = f32_tensor(&st.hid, d);
         let mut logits_t = f32_tensor(&st.logits, vocab);
 
-        let mut emb = vec![0f32; d];
+        // Host bounce buffer: the token embedding, then each stage hand-off.
+        let mut host = vec![0f32; d];
         for (ti, &tok) in tokens.iter().enumerate() {
             let pos = ctx.pos as usize + ti;
             if pos >= self.n_ctx {
@@ -624,12 +924,22 @@ impl ModelArch for HybridDecoder {
                     self.n_ctx
                 )));
             }
-            let kctx = self.kctx(st, pos, ctx.n_threads);
-            self.embed(tok, &mut emb)?;
-            st.h.upload(f32_bytes(&emb))
+            self.embed(tok, &mut host)?;
+            st.stages[0]
+                .h
+                .upload(f32_bytes(&host))
                 .map_err(|e| err(e.to_string()))?;
+            let mut cur = 0;
+            self.enter(st, cur)?;
+            let (mut h_t, mut n_t, mut kctx) = self.stage_view(st, cur, pos, ctx.n_threads);
 
             for (li, layer) in self.layers.iter().enumerate() {
+                let s = self.layer_stage[li];
+                if s != cur {
+                    self.hand_off(st, cur, s, &mut host)?;
+                    cur = s;
+                    (h_t, n_t, kctx) = self.stage_view(st, cur, pos, ctx.n_threads);
+                }
                 let ffn_w = match layer {
                     Layer::Attn(a) => {
                         self.attn_block(st, a, li, &mut h_t, &mut n_t, &kctx)?;
@@ -673,6 +983,10 @@ impl ModelArch for HybridDecoder {
                     }
                 };
                 self.ffn_block(ffn_w, li, &mut h_t, &mut n_t, &kctx)?;
+            }
+            if cur != last {
+                self.hand_off(st, cur, last, &mut host)?;
+                (h_t, _, kctx) = self.stage_view(st, last, pos, ctx.n_threads);
             }
 
             // SAFETY: as above.
@@ -750,7 +1064,10 @@ impl HybridDecoder {
         };
         let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
         let st = &mut *guard;
-        let kctx = self.kctx(st, pos, 1);
+        // The MTP block, its KV and `hid` all live on the last stage.
+        let last = st.stages.len() - 1;
+        self.enter(st, last)?;
+        let (mut h_t, mut n_t, kctx) = self.stage_view(st, last, pos, 1);
         let li = cfg.n_layers;
 
         let mut emb = vec![0f32; d];
@@ -760,8 +1077,6 @@ impl HybridDecoder {
             .map_err(|e| err(e.to_string()))?;
         let emb_t = f32_tensor(&st.emb, d);
         let mut pack_t = f32_tensor(&st.pack, 2 * d);
-        let mut h_t = f32_tensor(&st.h, d);
-        let mut n_t = f32_tensor(&st.n, d);
         let mut hid_t = f32_tensor(&st.hid, d);
         let mut logits_t = f32_tensor(&st.logits, vocab);
 
@@ -798,8 +1113,17 @@ impl HybridDecoder {
             .map_err(|e| err(e.to_string()))
     }
 
-    fn kctx(&self, st: &HState, pos: usize, n_threads: c_int) -> SpiteCtx {
-        SpiteCtx {
+    /// Stage `s`'s residual stream, norm buffer and kernel context.
+    fn stage_view(
+        &self,
+        st: &HState,
+        s: usize,
+        pos: usize,
+        n_threads: c_int,
+    ) -> (SpiteTensor, SpiteTensor, SpiteCtx) {
+        let d = self.config.d_model;
+        let sb = &st.stages[s];
+        let kctx = SpiteCtx {
             n_ctx: self.n_ctx as c_int,
             n_batch: 1,
             n_threads,
@@ -807,9 +1131,42 @@ impl HybridDecoder {
             n_heads: self.config.n_heads as c_int,
             n_kv_heads: self.config.n_kv_heads as c_int,
             gpu_stream: std::ptr::null_mut(),
-            scratchpad: st.scratch.as_ptr().cast(),
-            scratchpad_bytes: st.scratch.size,
+            scratchpad: sb.scratch.as_ptr().cast(),
+            scratchpad_bytes: sb.scratch.size,
+        };
+        (f32_tensor(&sb.h, d), f32_tensor(&sb.n, d), kctx)
+    }
+
+    /// Make stage `s`'s device current, so its kernels launch there.
+    fn enter(&self, st: &HState, s: usize) -> Result<(), ModelError> {
+        if self.backend == GpuBackend::Cuda {
+            cuda::set_device(st.stages[s].device).map_err(|e| err(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    /// Move the residual stream from stage `from` to stage `to` through
+    /// `host`, then make `to` current.
+    ///
+    /// The blocking download waits for `from`'s kernels; the upload is
+    /// ordered before `to`'s kernels on its legacy default stream. No peer
+    /// access is needed.
+    fn hand_off(
+        &self,
+        st: &mut HState,
+        from: usize,
+        to: usize,
+        host: &mut [f32],
+    ) -> Result<(), ModelError> {
+        st.stages[from]
+            .h
+            .download(f32_bytes_mut(host))
+            .map_err(|e| err(e.to_string()))?;
+        st.stages[to]
+            .h
+            .upload(f32_bytes(host))
+            .map_err(|e| err(e.to_string()))?;
+        self.enter(st, to)
     }
 
     /// `h += attention_ex(rms_norm(h))` for one gated full-attention block.
@@ -931,5 +1288,65 @@ impl HybridDecoder {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn share_counts_largest_remainder() {
+        assert_eq!(share_counts(&[33, 32], 65), Some(vec![33, 32]));
+        assert_eq!(
+            share_counts(&[1, 1, 1, 1, 1, 1], 65),
+            Some(vec![11, 11, 11, 11, 11, 10])
+        );
+        assert_eq!(share_counts(&[20, 12], 64), Some(vec![40, 24]));
+        assert_eq!(share_counts(&[1, 0], 4), Some(vec![4, 0]));
+        assert_eq!(share_counts(&[0, 0], 4), None);
+    }
+
+    #[test]
+    fn balance_tracks_bytes_not_counts() {
+        // Every 4th layer is 3x heavier (KV); equal budgets must split bytes
+        // evenly, not layer counts.
+        let bytes: Vec<usize> = (0..64)
+            .map(|l| if l % 4 == 3 { 300 } else { 100 })
+            .collect();
+        let counts = balance_layers(&bytes, &[1, 1]);
+        assert_eq!(counts.iter().sum::<usize>(), 64);
+        let first: usize = bytes[..counts[0]].iter().sum();
+        let total: usize = bytes.iter().sum();
+        assert!(first.abs_diff(total - first) <= 300, "{counts:?}");
+    }
+
+    #[test]
+    fn balance_follows_budgets_and_keeps_all_layers() {
+        let bytes = vec![10usize; 65];
+        assert_eq!(balance_layers(&bytes, &[3, 1]), vec![49, 16]);
+        assert_eq!(balance_layers(&bytes, &[1; 6]).iter().sum::<usize>(), 65);
+        // No room anywhere: everything lands on the last stage, and the
+        // per-device check reports it.
+        assert_eq!(balance_layers(&bytes, &[0, 0]), vec![0, 65]);
+    }
+
+    #[test]
+    fn auto_split_stays_on_one_device_when_it_fits() {
+        let bytes = vec![1usize << 20; 8];
+        let split = LayerSplit {
+            devices: vec![0, 1],
+            shares: Vec::new(),
+        };
+        let roomy = |_: usize| Ok(usize::MAX / 2);
+        let (devs, counts) = plan_split(&split, &bytes, 0, 0, false, &roomy).unwrap();
+        assert_eq!((devs, counts), (vec![0], vec![8]));
+
+        // 8 MiB of layers plus a 3 MiB head; 6 MiB per device after headroom.
+        // The head leaves the last device 3 MiB of layer budget: 8 * 6/9 -> 5/3.
+        let tight = |_: usize| Ok(VRAM_HEADROOM + (6 << 20));
+        let (devs, counts) = plan_split(&split, &bytes, 3 << 20, 0, false, &tight).unwrap();
+        assert_eq!(devs, vec![0, 1]);
+        assert_eq!(counts, vec![5, 3]);
     }
 }

@@ -136,8 +136,28 @@ fn main() -> Result<()> {
             });
             match resolved {
                 Some((table, backend)) => {
-                    let (m, r) = HybridDecoder::load(cfg, &gguf, table, backend, 4096)
-                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    // Every visible GPU is a candidate; the decoder stays on
+                    // the first one unless the model does not fit there.
+                    let split = spite_models::hybrid::LayerSplit {
+                        devices: if backend == spite_gpu::GpuBackend::Cuda {
+                            (0..spite_gpu::cuda::device_count().unwrap_or(0)).collect()
+                        } else {
+                            Vec::new()
+                        },
+                        shares: Vec::new(),
+                    };
+                    let (m, r) =
+                        HybridDecoder::load_split(cfg, &gguf, table, backend, 4096, &split)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    for s in r.stages.iter().filter(|_| r.stages.len() > 1) {
+                        eprintln!(
+                            "stage: GPU {} layers {}..{} ({} MiB)",
+                            s.device,
+                            s.layers.start,
+                            s.layers.end,
+                            s.bytes >> 20
+                        );
+                    }
                     peak_mem_mib = ((r.weights_bytes + r.state_bytes + r.scratch_bytes)
                         / (1024 * 1024)) as u64;
                     let dev = if backend == spite_gpu::GpuBackend::Cpu {

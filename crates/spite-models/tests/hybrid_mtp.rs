@@ -16,7 +16,7 @@ use std::process::Command;
 
 use spite_abi::SpiteCtx;
 use spite_loader::GgufModel;
-use spite_models::hybrid::HybridDecoder;
+use spite_models::hybrid::{HybridDecoder, LayerSplit, StageReport};
 use spite_models::{ModelArch, ModelConfig};
 
 const TOKENS: [u32; 7] = [1, 2, 3, 4, 5, 6, 7];
@@ -52,16 +52,25 @@ fn build_generic_kernel(tag: &str) -> PathBuf {
 }
 
 fn load(file: &str, tag: &str) -> (HybridDecoder, usize, PathBuf) {
+    let kdir = build_generic_kernel(tag);
+    let (model, vocab, _) = load_split(file, &kdir, &LayerSplit::default());
+    (model, vocab, kdir)
+}
+
+fn load_split(
+    file: &str,
+    kdir: &Path,
+    split: &LayerSplit,
+) -> (HybridDecoder, usize, Vec<StageReport>) {
     let gguf = GgufModel::open(data(file)).expect("open fixture");
     let cfg = ModelConfig::from(spite_loader::config::ModelHyperparams::from_gguf(&gguf));
     let vocab = cfg.vocab_size;
-    let kdir = build_generic_kernel(tag);
-    let (table, backend) = HybridDecoder::resolve_table(&cfg.arch, "generic", &kdir, false)
+    let (table, backend) = HybridDecoder::resolve_table(&cfg.arch, "generic", kdir, false)
         .expect("generic kernels provide every hybrid op");
-    let (model, report) =
-        HybridDecoder::load(cfg, &gguf, table, backend, 16).expect("load hybrid decoder");
+    let (model, report) = HybridDecoder::load_split(cfg, &gguf, table, backend, 16, split)
+        .expect("load hybrid decoder");
     assert_eq!(report.mtp, model.has_mtp());
-    (model, vocab, kdir)
+    (model, vocab, report.stages)
 }
 
 fn ctx(pos: usize) -> SpiteCtx {
@@ -173,5 +182,60 @@ fn full_head_depends_on_token_and_replays_exactly() {
         c[TOKENS.len() - 1],
         "draft ignores its input token"
     );
+    let _ = std::fs::remove_dir_all(kdir);
+}
+
+/// A pipeline split hands the residual stream between stages and runs the
+/// head and the NextN block on the last stage. On the CPU backend the stages
+/// share memory, so every trunk and draft logit must match the unsplit
+/// decoder exactly.
+#[test]
+fn layer_split_matches_single_stage() {
+    let file = "tiny-qwen35-mtp-full-f16.gguf";
+    let kdir = build_generic_kernel("split");
+    let (single, vocab, stages) = load_split(file, &kdir, &LayerSplit::default());
+    assert_eq!(stages.len(), 1);
+    let n_layers = stages[0].layers.end;
+    assert!(n_layers >= 2, "fixture needs two trunk layers to split");
+    let (want_trunk, want_draft) = run(&single, vocab, 9);
+
+    let split = LayerSplit {
+        devices: vec![0, 0],
+        shares: vec![1, 1],
+    };
+    let (piped, _, stages) = load_split(file, &kdir, &split);
+    assert_eq!(stages.len(), 2);
+    assert_eq!(stages[0].layers.start, 0);
+    assert_eq!(stages[0].layers.end, stages[1].layers.start);
+    assert_eq!(stages[1].layers.end, n_layers);
+    assert!(stages.iter().all(|s| !s.layers.is_empty()));
+    let (trunk, draft) = run(&piped, vocab, 9);
+    assert_eq!(trunk, want_trunk, "split trunk logits differ");
+    assert_eq!(draft, want_draft, "split MTP logits differ");
+
+    piped.reset_cache();
+    assert_eq!(run(&piped, vocab, 9), (want_trunk, want_draft));
+    let _ = std::fs::remove_dir_all(kdir);
+}
+
+#[test]
+fn layer_split_rejects_bad_shares() {
+    let file = "tiny-qwen35-mtp-full-f16.gguf";
+    let kdir = build_generic_kernel("badsplit");
+    let gguf = GgufModel::open(data(file)).expect("open fixture");
+    for (devices, shares) in [
+        (vec![0, 0], vec![1]),
+        (vec![0, 0], vec![0, 0]),
+        (vec![0, 0], vec![1000, 1]),
+    ] {
+        let cfg = ModelConfig::from(spite_loader::config::ModelHyperparams::from_gguf(&gguf));
+        let (table, backend) = HybridDecoder::resolve_table(&cfg.arch, "generic", &kdir, false)
+            .expect("generic kernels");
+        let split = LayerSplit { devices, shares };
+        assert!(
+            HybridDecoder::load_split(cfg, &gguf, table, backend, 16, &split).is_err(),
+            "{split:?} must be rejected"
+        );
+    }
     let _ = std::fs::remove_dir_all(kdir);
 }
