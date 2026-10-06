@@ -19,6 +19,7 @@
 //! Pipeline parallelism across nodes, tensor parallelism within a node.
 //! 8-GPU server: 4-way tensor × 2-way pipeline.
 
+pub mod p100_multi;
 pub mod pipeline;
 pub mod tensor_par;
 
