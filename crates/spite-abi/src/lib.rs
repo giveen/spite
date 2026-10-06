@@ -232,7 +232,7 @@ impl SpiteTensor {
 // ── Inference context ──────────────────────────────────────────────────────
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SpiteCtx {
     pub n_ctx: c_int,
     pub n_batch: c_int,
@@ -476,6 +476,20 @@ pub type GdnFn = unsafe extern "C" fn(
     ctx: *const SpiteCtx,
 ) -> c_int;
 
+// ── Multi-Token Prediction (MTP) stem (ABI v7 optional slot) ────────────────
+
+/// Fused MTP stem: normalize embedding, normalize hidden state, pack into [2*d, T].
+/// `out` must be a tensor with dimensions `[2*d, T, 1, 1]` or `[2*d]`.
+pub type MtpStemFn = unsafe extern "C" fn(
+    out: *mut SpiteTensor,
+    embed: *const SpiteTensor,
+    hidden: *const SpiteTensor,
+    w_enorm: *const SpiteTensor,
+    w_hnorm: *const SpiteTensor,
+    eps: f32,
+    ctx: *const SpiteCtx,
+) -> c_int;
+
 // ── Model capability declaration ───────────────────────────────────────────
 
 /// What a model supports — derived from GGUF metadata by the runtime.
@@ -544,6 +558,8 @@ pub struct SpiteKernelInfo {
     pub linear_attn: Option<GdnFn>,
     /// Extended attention: partial RoPE + gated Q. ABI v7.
     pub attention_ex: Option<AttentionExFn>,
+    /// Fused MTP stem: normalize embedding, normalize hidden state, pack [2*d, T].
+    pub mtp_stem: Option<MtpStemFn>,
 }
 
 unsafe impl Send for SpiteKernelInfo {}

@@ -216,3 +216,81 @@ fn softmax_at(logits: &[f32], idx: usize, temperature: f32) -> f32 {
     let sum: f32 = exp.iter().sum();
     exp.get(idx).copied().unwrap_or(0.0) / sum.max(1e-10)
 }
+
+// ── MTP Stem ───────────────────────────────────────────────────────────────
+
+/// Pure-Rust fallback for `mtp_stem`: normalize embedding, normalize hidden state, pack [2*d, T].
+///
+/// # Safety
+///
+/// `out`, `embed`, and `hidden` must be valid, non-null pointers to `SpiteTensor`s.
+/// If provided, `w_enorm` and `w_hnorm` must point to valid `SpiteTensor`s.
+pub unsafe fn mtp_stem(
+    out: *mut SpiteTensor,
+    embed: *const SpiteTensor,
+    hidden: *const SpiteTensor,
+    w_enorm: *const SpiteTensor,
+    w_hnorm: *const SpiteTensor,
+    eps: f32,
+    _ctx: *const SpiteCtx,
+) -> i32 {
+    if out.is_null() || embed.is_null() || hidden.is_null() {
+        return -1;
+    }
+    let (out, embed, hidden) = unsafe { (&mut *out, &*embed, &*hidden) };
+    let d = embed.ne[0] as usize;
+    let t = embed.ne[1].max(1) as usize;
+
+    if out.ne[0] as usize != 2 * d {
+        return -1;
+    }
+
+    let e_data = unsafe { std::slice::from_raw_parts(embed.data as *const f32, d * t) };
+    let h_data = unsafe { std::slice::from_raw_parts(hidden.data as *const f32, d * t) };
+    let out_data = unsafe { std::slice::from_raw_parts_mut(out.data as *mut f32, 2 * d * t) };
+
+    let we_data = if !w_enorm.is_null() && !unsafe { (*w_enorm).data }.is_null() {
+        Some(unsafe { std::slice::from_raw_parts((*w_enorm).data as *const f32, d) })
+    } else {
+        None
+    };
+    let wh_data = if !w_hnorm.is_null() && !unsafe { (*w_hnorm).data }.is_null() {
+        Some(unsafe { std::slice::from_raw_parts((*w_hnorm).data as *const f32, d) })
+    } else {
+        None
+    };
+
+    let emb_scale = (d as f32).sqrt();
+
+    for tok in 0..t {
+        let e_slice = &e_data[tok * d..(tok + 1) * d];
+        let h_slice = &h_data[tok * d..(tok + 1) * d];
+        let out_slice = &mut out_data[tok * 2 * d..(tok + 1) * 2 * d];
+
+        if let (Some(we), Some(wh)) = (we_data, wh_data) {
+            let rms_e = (e_slice.iter().map(|&v| v * v).sum::<f32>() / d as f32 + eps).sqrt();
+            let rms_h = (h_slice.iter().map(|&v| v * v).sum::<f32>() / d as f32 + eps).sqrt();
+
+            for i in 0..d {
+                out_slice[i] = (e_slice[i] / rms_e) * we[i];
+                out_slice[d + i] = (h_slice[i] / rms_h) * wh[i];
+            }
+        } else {
+            for i in 0..d {
+                let mut ev = e_slice[i] * emb_scale;
+                if let Some(we) = we_data {
+                    ev *= we[i];
+                }
+                out_slice[i] = ev;
+
+                let mut hv = h_slice[i];
+                if let Some(wh) = wh_data {
+                    hv *= wh[i];
+                }
+                out_slice[d + i] = hv;
+            }
+        }
+    }
+
+    0
+}

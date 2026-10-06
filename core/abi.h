@@ -462,6 +462,17 @@ typedef int (*SpiteGdnFn)(
  */
 typedef uint64_t (*SpiteKvCacheKindsFn)(void);
 
+/* Fused MTP stem: normalize embedding, normalize hidden state, pack [2*d, T]. */
+typedef int (*SpiteMtpStemFn)(
+    SpiteTensor*       out_packed,
+    const SpiteTensor* embed,
+    const SpiteTensor* hidden,
+    const SpiteTensor* w_enorm,
+    const SpiteTensor* w_hnorm,
+    float              eps,
+    const SpiteCtx*    ctx
+);
+
 typedef struct {
     uint32_t    abi_version;
     const char* model_arch;       /* e.g. "llama3" */
@@ -487,6 +498,8 @@ typedef struct {
     SpiteGdnFn       linear_attn;
     /* Extended attention: partial RoPE + gated Q. ABI v7. */
     SpiteAttentionExFn attention_ex;
+    /* Fused MTP stem: normalize embedding, normalize hidden state, pack [2*d, T]. */
+    SpiteMtpStemFn   mtp_stem;
 } SpiteKernelInfo;
 
 /* Every kernel .so must export this symbol. */

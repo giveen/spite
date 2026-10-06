@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use spite_abi::{
     ABI_VERSION, AttentionExFn, AttentionFn, FfnFn, GdnFn, KERNEL_ENTRY_SYMBOL, KernelInfoFn,
-    LayerFn, MatmulFn, RmsNormFn, SpecVerifyFn, SpiteKernelInfo, SpiteType,
+    LayerFn, MatmulFn, MtpStemFn, RmsNormFn, SpecVerifyFn, SpiteKernelInfo, SpiteType,
 };
 
 pub mod cards;
@@ -113,6 +113,8 @@ pub struct DispatchTable {
     pub linear_attn: (Option<GdnFn>, OpSource),
     /// Attention with partial RoPE and gated Q (hybrid archs).
     pub attention_ex: (Option<AttentionExFn>, OpSource),
+    /// Fused MTP stem (normalize embedding, normalize hidden state, pack [2*d, T]).
+    pub mtp_stem: (Option<MtpStemFn>, OpSource),
     // ── Engine-level ops (cross-model, card/arch/generic chain) ──────────
     pub speculative_verify: (Option<SpecVerifyFn>, OpSource),
     pub prefill: (Option<LayerFn>, OpSource), // chunked prefill
@@ -131,11 +133,35 @@ impl DispatchTable {
             ("matmul", &self.matmul.1),
             ("linear_attn", &self.linear_attn.1),
             ("attention_ex", &self.attention_ex.1),
+            ("mtp_stem", &self.mtp_stem.1),
             ("spec_verify", &self.speculative_verify.1),
             ("prefill", &self.prefill.1),
         ];
         for (op, src) in rows {
             println!("  {op:<14} → {}/{}", src.gpu_arch, src.path.display());
+        }
+    }
+
+    /// Construct a fallback dispatch table backed solely by pure-Rust CPU implementations.
+    pub fn fallback() -> Self {
+        let src = OpSource {
+            gpu_arch: "cpu_fallback".to_string(),
+            path: PathBuf::from("fallback"),
+        };
+        Self {
+            rms_norm: (None, src.clone()),
+            attention: (None, src.clone()),
+            kv_cache_kinds: (1 << spite_abi::SpiteType::F32 as u64),
+            kv_cache_kinds_ex: (1 << spite_abi::SpiteType::F32 as u64),
+            ffn: (None, src.clone()),
+            layer: (None, src.clone()),
+            matmul: (None, src.clone()),
+            linear_attn: (None, src.clone()),
+            attention_ex: (None, src.clone()),
+            mtp_stem: (None, src.clone()),
+            speculative_verify: (None, src.clone()),
+            prefill: (None, src),
+            _libs: Vec::new(),
         }
     }
 }
@@ -201,6 +227,7 @@ impl DispatchBuilder {
         let matmul = find_op(&model_libs, |k| k.info.matmul, generic_src.clone());
         let linear_attn = find_op(&model_libs, |k| k.info.linear_attn, generic_src.clone());
         let attention_ex = find_op(&model_libs, |k| k.info.attention_ex, generic_src.clone());
+        let mtp_stem = find_op(&model_libs, |k| k.info.mtp_stem, generic_src.clone());
         let kv_cache_kinds_ex = model_libs
             .iter()
             .find(|l| l.info.attention_ex.is_some())
@@ -234,6 +261,7 @@ impl DispatchBuilder {
             matmul,
             linear_attn,
             attention_ex,
+            mtp_stem,
             speculative_verify,
             prefill,
             _libs: all_libs,

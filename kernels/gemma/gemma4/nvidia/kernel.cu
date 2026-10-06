@@ -270,6 +270,56 @@ extern "C" int gemma4_cuda_matmul(SpiteTensor* out, const SpiteTensor* x, const 
     return finish();
 }
 
+/* Fused Gemma 4 MTP stem: scaled token embedding (x sqrt(d)), trunk hidden, pack [2*d, T]. */
+__global__ void gemma4_mtp_stem_kernel(float* __restrict__ out,
+                                       const float* __restrict__ embed,
+                                       const float* __restrict__ hidden,
+                                       const void* __restrict__ w_enorm, int enorm_kind,
+                                       const void* __restrict__ w_hnorm, int hnorm_kind,
+                                       int d, float emb_scale, float eps) {
+    const int tok = blockIdx.y;
+    const float* e_tok = embed + static_cast<size_t>(tok) * d;
+    const float* h_tok = hidden + static_cast<size_t>(tok) * d;
+    float* out_tok = out + static_cast<size_t>(tok) * (2 * d);
+
+    for (int i = threadIdx.x; i < d; i += blockDim.x) {
+        float e_val = e_tok[i] * emb_scale;
+        if (w_enorm) e_val *= load_w(w_enorm, enorm_kind, i);
+        out_tok[i] = e_val;
+
+        float h_val = h_tok[i];
+        if (w_hnorm) h_val *= load_w(w_hnorm, hnorm_kind, i);
+        out_tok[d + i] = h_val;
+    }
+}
+
+extern "C" int gemma4_cuda_mtp_stem(SpiteTensor* out, const SpiteTensor* embed,
+                                    const SpiteTensor* hidden,
+                                    const SpiteTensor* w_enorm,
+                                    const SpiteTensor* w_hnorm, float eps,
+                                    const SpiteCtx* ctx) {
+    if (!out || !embed || !hidden || !out->data || !embed->data || !hidden->data) return -1;
+    if (embed->kind != SPITE_TYPE_F32 || hidden->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
+
+    const int64_t d = embed->ne[0];
+    const int64_t t = embed->ne[1] ? embed->ne[1] : 1;
+    if (d < 1 || hidden->ne[0] != d || out->ne[0] != 2 * d) return -1;
+
+    const float emb_scale = sqrtf(static_cast<float>(d));
+    int threads = static_cast<int>(((d + 31) / 32) * 32);
+    threads = threads < 32 ? 32 : (threads > 1024 ? 1024 : threads);
+    dim3 grid(1, static_cast<unsigned>(t));
+
+    gemma4_mtp_stem_kernel<<<grid, threads, 0, stream_of(ctx)>>>(
+        static_cast<float*>(out->data), static_cast<const float*>(embed->data),
+        static_cast<const float*>(hidden->data),
+        w_enorm ? w_enorm->data : nullptr, w_enorm ? w_enorm->kind : SPITE_TYPE_F32,
+        w_hnorm ? w_hnorm->data : nullptr, w_hnorm ? w_hnorm->kind : SPITE_TYPE_F32,
+        static_cast<int>(d), emb_scale, eps);
+
+    return finish();
+}
+
 // ── Kernel descriptor ────────────────────────────────────────────────────
 
 /* KV-cache tiers this attention op reads and writes (bit = SpiteType). */
@@ -295,6 +345,9 @@ static const SpiteKernelInfo KERNEL_INFO = {
     nullptr, /* prefill */
     gemma4_cuda_matmul,
     gemma4_cuda_kv_cache_kinds,
+    nullptr, /* linear_attn */
+    nullptr, /* attention_ex */
+    gemma4_cuda_mtp_stem,
 };
 
 extern "C" const SpiteKernelInfo* spite_kernel_info() { return &KERNEL_INFO; }

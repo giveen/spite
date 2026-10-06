@@ -70,6 +70,9 @@ pub enum SpecStrategy {
     Medusa,
     /// Draft model trained to match main model's internal representations.
     Eagle,
+    /// Multi-Token Prediction (NextN / MTP) self-speculative draft head.
+    /// Draft head layers live in the same model weights.
+    Mtp,
 }
 
 // ── Session ───────────────────────────────────────────────────────────────
@@ -109,7 +112,7 @@ impl SpecSession {
             });
         }
 
-        if strategy != SpecStrategy::Medusa {
+        if strategy != SpecStrategy::Medusa && strategy != SpecStrategy::Mtp {
             let dc = draft_caps.ok_or(SpeculativeError::DraftNotSupported)?;
             if !dc.can_draft {
                 return Err(SpeculativeError::DraftNotSupported);

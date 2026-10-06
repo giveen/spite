@@ -15,10 +15,13 @@ spite-abi      = { workspace = true }
 spite-dispatch = { workspace = true }
 spite-models   = { workspace = true }
 spite-loader   = { workspace = true }
+spite-gpu      = { workspace = true }
 spite-executor = { workspace = true }
 spite-sampling = { workspace = true }
 spite-kvcache  = { workspace = true }
 spite-tokenizer = { workspace = true }
+spite-compute   = { workspace = true }
+spite-speculative = { workspace = true }
 anyhow         = { workspace = true }
 clap           = { workspace = true }
 serde          = { workspace = true }
