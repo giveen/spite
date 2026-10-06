@@ -99,20 +99,34 @@ extern "C" int qwen35_cuda_ffn(SpiteTensor *out, const SpiteTensor *x,
       w_up->ne[0] != w_gate->ne[0] || w_down->ne[0] != w_gate->ne[1] ||
       x->ne[0] != w_gate->ne[0] || out->ne[0] < w_down->ne[1])
     return -1;
+  const int64_t m = x->ne[1] ? x->ne[1] : 1;   /* tokens (columns) */
+  const int64_t n_act = d_ffn * m;
   if (!ctx->scratchpad ||
-      ctx->scratchpad_bytes < sizeof(float) * 2 * static_cast<size_t>(d_ffn))
+      ctx->scratchpad_bytes < sizeof(float) * static_cast<size_t>(2 * n_act))
     return -2;
   float *gate = static_cast<float *>(ctx->scratchpad);
-  float *up = gate + d_ffn;
+  float *up = gate + n_act;
   const cudaStream_t st = q35_stream(ctx);
   const float *xin = static_cast<const float *>(x->data);
-  const Q35GemvJob proj[2] = {{w_gate, gate}, {w_up, up}};
-  if (q35_gemv_multi(proj, 2, xin, false, st))
+  if (m == 1) {
+    const Q35GemvJob proj[2] = {{w_gate, gate}, {w_up, up}};
+    if (q35_gemv_multi(proj, 2, xin, false, st))
+      return -1;
+  } else {
+    /* Batched: one weight read per kBatchChunk columns. */
+    if (q35_gemv_batch(w_gate, xin, gate, static_cast<int>(m), false, st) ||
+        q35_gemv_batch(w_up, xin, up, static_cast<int>(m), false, st))
+      return -1;
+  }
+  glu_act<<<static_cast<unsigned>((n_act + 255) / 256), 256, 0, st>>>(
+      gate, up, static_cast<int>(n_act), act == SPITE_FFN_GELU_GATE);
+  if (m == 1) {
+    if (q35_gemv(w_down, gate, static_cast<float *>(out->data), true, st))
+      return -1;
+  } else if (q35_gemv_batch(w_down, gate, static_cast<float *>(out->data),
+                            static_cast<int>(m), true, st)) {
     return -1;
-  glu_act<<<static_cast<unsigned>((d_ffn + 255) / 256), 256, 0, st>>>(
-      gate, up, static_cast<int>(d_ffn), act == SPITE_FFN_GELU_GATE);
-  if (q35_gemv(w_down, gate, static_cast<float *>(out->data), true, st))
-    return -1;
+  }
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
 

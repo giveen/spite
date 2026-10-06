@@ -113,6 +113,94 @@ __global__ void __launch_bounds__(kRowThreads)
   }
 }
 
+/*
+ * Batched (multi-column) GEMV: y[r, t] (+)= sum_c W[r, c] * x[c, t] for m
+ * columns (tokens). One block per output row, as above, but the weight row is
+ * decoded once per chunk of kBatchChunk columns and FMA'd against all of them,
+ * so the weight is read m/kBatchChunk times instead of m times. This is the
+ * prefill/verify win: the weight stream is the bandwidth wall, extra columns
+ * are near-free. x is [cols, m] and y is [rows, m], both token-major.
+ */
+constexpr int kBatchChunk = 4;
+
+template <class Q>
+__global__ void __launch_bounds__(kRowThreads)
+    gemv_batch_kernel(const uint8_t *__restrict__ w, float *__restrict__ y,
+                      const float *__restrict__ x, int cols, int rows, int m,
+                      size_t row_bytes, int x_aligned16, int accumulate) {
+  __shared__ float red[kWarps];
+  const int row = blockIdx.x;
+  const int tid = threadIdx.x;
+  const uint8_t *wr = w + static_cast<size_t>(row) * row_bytes;
+
+  for (int t0 = 0; t0 < m; t0 += kBatchChunk) {
+    const int tn = min(kBatchChunk, m - t0);
+    float acc[kBatchChunk];
+#pragma unroll
+    for (int j = 0; j < kBatchChunk; ++j)
+      acc[j] = 0.0f;
+
+    if constexpr (Q::DENSE) {
+      for (int c = tid; c < cols; c += kRowThreads) {
+        const float wv = Q::load(wr, c);
+#pragma unroll
+        for (int j = 0; j < kBatchChunk; ++j)
+          if (j < tn)
+            acc[j] = fmaf(wv, __ldg(x + static_cast<size_t>(t0 + j) * cols + c),
+                          acc[j]);
+      }
+    } else {
+      constexpr int NS = Q::NS, BPS = kRowThreads / NS;
+      const int slot = tid % NS, sub = tid / NS;
+      const int nb = cols / Q::QK;
+      for (int b = sub; b < nb; b += BPS) {
+        float v[Q::NV];
+        Q::decode(wr + static_cast<size_t>(b) * Q::BYTES, slot, v);
+#pragma unroll
+        for (int j = 0; j < kBatchChunk; ++j) {
+          if (j >= tn)
+            continue;
+          const float *xb =
+              x + static_cast<size_t>(t0 + j) * cols + static_cast<size_t>(b) * Q::QK;
+#pragma unroll
+          for (int g = 0; g < Q::NG; ++g) {
+            const float *xp = xb + Q::start(slot, g);
+            float4 xv;
+            if (x_aligned16)
+              xv = __ldg(reinterpret_cast<const float4 *>(xp));
+            else
+              xv = make_float4(__ldg(xp), __ldg(xp + 1), __ldg(xp + 2),
+                               __ldg(xp + 3));
+            acc[j] = fmaf(v[4 * g + 0], xv.x, acc[j]);
+            acc[j] = fmaf(v[4 * g + 1], xv.y, acc[j]);
+            acc[j] = fmaf(v[4 * g + 2], xv.z, acc[j]);
+            acc[j] = fmaf(v[4 * g + 3], xv.w, acc[j]);
+          }
+        }
+      }
+    }
+
+#pragma unroll
+    for (int j = 0; j < kBatchChunk; ++j) {
+      if (j >= tn)
+        continue;
+      const float a = q35_warp_sum(acc[j]);
+      if ((tid & 31) == 0)
+        red[tid >> 5] = a;
+      __syncthreads();
+      if (tid == 0) {
+        float t = 0.0f;
+#pragma unroll
+        for (int i = 0; i < kWarps; ++i)
+          t += red[i];
+        float *yp = y + static_cast<size_t>(t0 + j) * rows + row;
+        *yp = accumulate ? *yp + t : t;
+      }
+      __syncthreads();
+    }
+  }
+}
+
 bool job_ok(const SpiteTensor *w, const float *x, const float *y) {
   return w && w->data && x && y && w->ne[0] > 0 && w->ne[1] > 0 &&
          spite_tensor_is_contiguous(w);
@@ -156,6 +244,31 @@ int launch(const Q35GemvJob *jobs, int n, const float *x, bool accumulate,
   });
 }
 
+/* One batched launch for a single weight, m columns. */
+int launch_batch(const SpiteTensor *w, const float *x, float *y, int m,
+                 bool accumulate, cudaStream_t s) {
+  const int cols = static_cast<int>(w->ne[0]);
+  const int rows = static_cast<int>(w->ne[1]);
+  const int x_aligned16 = (reinterpret_cast<uintptr_t>(x) & 15) == 0;
+  return sq::visit_type(w->kind, [&](auto tag) -> int {
+    using Q = typename decltype(tag)::type;
+    if (reinterpret_cast<uintptr_t>(w->data) % Q::ALIGN)
+      return -1;
+    size_t row_bytes;
+    if constexpr (Q::DENSE) {
+      row_bytes = static_cast<size_t>(cols) * Q::BYTES;
+    } else {
+      if (cols % Q::QK)
+        return -1;
+      row_bytes = static_cast<size_t>(cols / Q::QK) * Q::BYTES;
+    }
+    gemv_batch_kernel<Q><<<static_cast<unsigned>(rows), kRowThreads, 0, s>>>(
+        static_cast<const uint8_t *>(w->data), y, x, cols, rows, m, row_bytes,
+        x_aligned16, accumulate ? 1 : 0);
+    return 0;
+  });
+}
+
 } // namespace
 
 int q35_gemv_multi(const Q35GemvJob *jobs, int n, const float *x,
@@ -182,4 +295,15 @@ int q35_gemv(const SpiteTensor *w, const float *x, float *y, bool accumulate,
              cudaStream_t s) {
   const Q35GemvJob job = {w, y};
   return q35_gemv_multi(&job, 1, x, accumulate, s);
+}
+
+/* y[r, t] (+)= sum_c W[r, c] * x[c, t] for m columns (tokens); x is [cols, m]
+ * and y is [rows, m], both token-major. The weight row is decoded once per
+ * kBatchChunk columns. */
+int q35_gemv_batch(const SpiteTensor *w, const float *x, float *y, int m,
+                   bool accumulate, cudaStream_t s) {
+  if (!w || !w->data || !x || !y || m < 1 || w->ne[0] < 1 || w->ne[1] < 1 ||
+      !spite_tensor_is_contiguous(w))
+    return -1;
+  return launch_batch(w, x, y, m, accumulate, s);
 }

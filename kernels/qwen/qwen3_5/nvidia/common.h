@@ -35,6 +35,13 @@ struct Q35GemvJob {
 int q35_gemv_multi(const Q35GemvJob *jobs, int n, const float *x, bool accumulate,
                    cudaStream_t s);
 
+/* Batched projection: y[r, t] (+)= W[r,:] . x[:, t] for m columns (tokens).
+ * x is [cols, m] and y is [rows, m], both token-major (x[c,t] = x[c + t*cols]).
+ * The weight row is decoded once per kBatchChunk columns, so the weight stream
+ * is amortised over m tokens. (gemv.cu) */
+int q35_gemv_batch(const SpiteTensor *w, const float *x, float *y, int m,
+                   bool accumulate, cudaStream_t s);
+
 inline int64_t q35_numel(const SpiteTensor *t) {
   int64_t n = 1;
   for (int i = 0; i < 4; ++i)
