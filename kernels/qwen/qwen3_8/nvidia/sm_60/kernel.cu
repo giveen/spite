@@ -14,10 +14,10 @@
  *   - No Tensor Cores / wmma / mma.sync — those require sm_70+.
  *   - No cp.async / async barriers — those require sm_80+.
  *
- * The flash-decode attention tile uses KVFLASH_TILE=64 and KVFLASH_WARPS=4
- * (128 threads/block), fitting the K+V tiles within Pascal's 48 KB shared
- * memory limit at head_dim=128: 64 * 128 * 2 * 4 bytes = 65536 bytes → exactly
- * 64 KB, so we set the shared-memory limit explicitly to 64 KB before launch.
+ * The flash-decode attention tile uses KVFLASH_TILE=32 and KVFLASH_WARPS=4
+ * (128 threads/block).  K/V stored as __half2 → 32 × 64 × 2 × 4 = 16 KB/block,
+ * enabling 4 concurrent blocks/SM on GP100 within its 64 KB shared memory.
+ * TILE=32 keeps blockDim.x within one warp, making warp_sum() correct.
  *
  * Override: tesla_p100/kernel.cu further refines tile sizes and adds multi-GPU
  * NVLink all-reduce via multi_gpu.cuh.
@@ -192,12 +192,12 @@ inline int finish() { return cudaGetLastError() == cudaSuccess ? 0 : -2; }
 }  // namespace
 
 /*
- * Pascal flash-decode tile: KVFLASH_TILE=64 (64 KV steps per tile),
- * KVFLASH_WARPS=4 (4 query heads per block).  One tile of K+V at head_dim=128:
- *   2 * 64 * 128 * 4 bytes = 65536 bytes = exactly 64 KB.
- * We request 64 KB shared memory per block at launch; GP100 supports it.
+ * Pascal flash-decode tile: KVFLASH_TILE=32 (32 KV steps per tile, one warp),
+ * KVFLASH_WARPS=4 (4 query heads per block, 128 threads total).
+ * K/V stored as __half2 in smem → 2 × 32 × 64 × 4 = 16 384 bytes = 16 KB/block.
+ * TILE=32 ensures blockDim.x fits in one warp, making warp_sum() correct.
  */
-#define KVFLASH_TILE  64
+#define KVFLASH_TILE  32
 #define KVFLASH_WARPS 4
 
 #include "kernels/qwen/qwen3_8/nvidia/kv_attn.inl"

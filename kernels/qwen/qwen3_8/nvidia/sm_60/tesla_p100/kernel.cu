@@ -6,7 +6,7 @@
  * This is the narrowest kernel in the hierarchy: it inherits everything from
  * the sm_60 layer and applies P100-specific tile constants from p100_tuning.cuh:
  *
- *   KVFLASH_TILE=64, KVFLASH_WARPS=4  (64 KB smem per attn block)
+ *   KVFLASH_TILE=32, KVFLASH_WARPS=4  (16 KB smem/block, 4 blocks/SM on GP100)
  *   ROWS_PER_BLOCK=8 (8 output rows per thread block for matvec)
  *
  * Multi-GPU tensor parallelism (multi_gpu.cuh):
@@ -184,9 +184,10 @@ inline int finish() { return cudaGetLastError() == cudaSuccess ? 0 : -2; }
 
 }  // namespace
 
-/* P100 tile sizes, then the flash-decode scaffolding. */
-#define KVFLASH_TILE  P100_KVFLASH_TILE
-#define KVFLASH_WARPS P100_KVFLASH_WARPS
+/* P100 tile sizes and launch-bounds hint, then the flash-decode scaffolding. */
+#define KVFLASH_TILE          P100_KVFLASH_TILE
+#define KVFLASH_WARPS         P100_KVFLASH_WARPS
+#define KVFLASH_LAUNCH_BOUNDS P100_KVFLASH_LAUNCH_BOUNDS
 
 #include "kernels/qwen/qwen3_8/nvidia/kv_attn.inl"
 #include "kernels/qwen/qwen3_8/nvidia/kv_attn_flash.inl"
@@ -219,10 +220,7 @@ extern "C" int qwen38_p100_attention(SpiteTensor* out, const SpiteTensor* x,
                                       const SpiteTensor* q_norm, const SpiteTensor* k_norm,
                                       float norm_eps, SpiteKvCache* kv,
                                       float rope_freq_base, const SpiteCtx* ctx) {
-    /* Launch the attn tile with 64 KB shared memory per block. */
-    cudaFuncSetAttribute(
-        reinterpret_cast<const void*>(kvflash_tile),
-        cudaFuncAttributeMaxDynamicSharedMemorySize, P100_ATTN_SMEM_BYTES);
+    /* 16 KB smem/block — within GP100's default 48 KB limit, no opt-in needed. */
     return kvflash_run(out, x, wq, wk, wv, wo, q_norm, k_norm,
                        norm_eps, kv, rope_freq_base, ctx);
 }
@@ -264,7 +262,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     SPITE_ABI_VERSION,
     "qwen38",
     "cuda",
-    "spite project (qwen3.8 tesla p100: 64KB attn tile, __half2 SIMD, NVLink TP)",
+    "spite project (qwen3.8 tesla p100: half2 KV smem, 4blk/SM, __launch_bounds__, NVLink TP)",
     {SPITE_TYPE_F16, SPITE_TYPE_Q8_0, SPITE_TYPE_Q4_K, SPITE_TYPE_Q5_K,
      SPITE_TYPE_Q6_K, SPITE_TYPE_Q4_0, SPITE_TYPE_Q3_K, 0},
     qwen38_p100_rms_norm,
