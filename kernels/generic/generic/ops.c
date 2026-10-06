@@ -107,16 +107,28 @@ static float silu(float x) {
     return x / (1.0f + expf(-x));
 }
 
-static void matmul_f32(float *out, const float *a, const float *b,
-                        int m, int k, int n) {
-    /* out[m,n] = a[m,k] × b[k,n]  (row-major) */
-    for (int i = 0; i < m; i++) {
-        for (int j = 0; j < n; j++) {
+/*
+ * Batched projection in the SpiteTensor `[cols, rows]` layout:
+ *
+ *   out[r + t*R] = sum_c w[c + r*C] * x[c + t*C]
+ *
+ * `w` is a weight `[C, R]` (ne[0]=C cols, ne[1]=R rows), `x` is the
+ * activation `[C, m]` (m tokens), `out` is `[R, m]`. m == 1 reproduces the
+ * single-token GEMV exactly. This is the reference for batched prefill: the
+ * same weight is read once for all m tokens instead of once per token.
+ */
+static void gemm_nt(float *out, const float *w, const float *x,
+                    int R, int C, int m) {
+    for (int t = 0; t < m; t++) {
+        const float *xt = x + (size_t)t * C;
+        float *ot = out + (size_t)t * R;
+        for (int r = 0; r < R; r++) {
+            const float *wr = w + (size_t)r * C;
             float acc = 0.0f;
-            for (int p = 0; p < k; p++) {
-                acc += a[i * k + p] * b[p * n + j];
+            for (int c = 0; c < C; c++) {
+                acc += wr[c] * xt[c];
             }
-            out[i * n + j] = acc;
+            ot[r] = acc;
         }
     }
 }
@@ -140,29 +152,31 @@ int spite_generic_ffn(
     float *wd = dequant_to_f32(w_down);
     if (!wg || !wu || !wd) { free(wg); free(wu); free(wd); return -1; }
 
-    /* Dimensions: single token assumed (batch_size=1) */
+    /* m tokens; m == 1 is the decode case. */
     int hidden = tensor_cols(x);
     int ffn    = tensor_rows(w_gate);  /* ffn_dim: output of gate/up proj */
+    int m      = tensor_rows(x);
+    if (m < 1) m = 1;
 
-    float *gate = (float *)malloc((size_t)ffn * sizeof(float));
-    float *up   = (float *)malloc((size_t)ffn * sizeof(float));
+    float *gate = (float *)malloc((size_t)ffn * m * sizeof(float));
+    float *up   = (float *)malloc((size_t)ffn * m * sizeof(float));
     if (!gate || !up) { free(gate); free(up); free(wg); free(wu); free(wd); return -1; }
 
-    /* gate = w_gate × x  [ffn, hidden] × [hidden, 1] → [ffn, 1] */
-    matmul_f32(gate, wg, (const float *)x->data, ffn, hidden, 1);
+    /* gate = w_gate × x  [ffn, hidden] × [hidden, m] → [ffn, m] */
+    gemm_nt(gate, wg, (const float *)x->data, ffn, hidden, m);
     /* up   = w_up   × x */
-    matmul_f32(up,   wu, (const float *)x->data, ffn, hidden, 1);
+    gemm_nt(up,   wu, (const float *)x->data, ffn, hidden, m);
 
     /* fuse: gate = silu(gate) * up */
-    for (int i = 0; i < ffn; i++) gate[i] = silu(gate[i]) * up[i];
+    for (int i = 0; i < ffn * m; i++) gate[i] = silu(gate[i]) * up[i];
 
-    /* out += w_down × gate  [hidden, ffn] × [ffn, 1] → [hidden, 1]
+    /* out += w_down × gate  [hidden, ffn] × [ffn, m] → [hidden, m]
      * ABI v4: ffn accumulates into out (residual fused). */
-    float *down = (float *)malloc((size_t)hidden * sizeof(float));
+    float *down = (float *)malloc((size_t)hidden * m * sizeof(float));
     if (!down) { free(gate); free(up); free(wg); free(wu); free(wd); return -1; }
-    matmul_f32(down, wd, gate, hidden, ffn, 1);
+    gemm_nt(down, wd, gate, hidden, ffn, m);
     float *o = (float *)out->data;
-    for (int i = 0; i < hidden; i++) o[i] += down[i];
+    for (int i = 0; i < hidden * m; i++) o[i] += down[i];
     free(down);
 
     free(gate); free(up);
@@ -285,8 +299,9 @@ int spite_generic_attention_ex(
     const int q_stride  = gated ? 2 * hd : hd;     /* floats per head in qfull */
     const int d_model   = (int)x->ne[0];
     const int d_out     = (int)out->ne[0];
-    if (d_model < 1 || d_out < 1) return -1;
-    if (!ref_f32_vec(x, d_model) || !ref_f32_vec(out, d_out)) return -1;
+    const int m = x->ne[1] ? (int)x->ne[1] : 1;
+    if (d_model < 1 || d_out < 1 || m < 1) return -1;
+    if (!ref_f32_mat(x, d_model, m) || !ref_f32_mat(out, d_out, m)) return -1;
     if (!ref_weight_ok(wq, d_model, (int64_t)nh * q_stride) ||
         !ref_weight_ok(wk, d_model, kv_stride) || !ref_weight_ok(wv, d_model, kv_stride) ||
         !ref_weight_ok(wo, (int64_t)nh * hd, d_out))
@@ -301,9 +316,9 @@ int spite_generic_attention_ex(
     if (kvcache->k.kind != SPITE_TYPE_F32) return -1; /* see note above */
     const int n_ctx = (int)(kvcache->k.ne[1] < kvcache->v.ne[1] ? kvcache->k.ne[1]
                                                                : kvcache->v.ne[1]);
-    if (pos < 0 || pos >= n_ctx) return -2;
+    if (pos < 0 || pos + m > n_ctx) return -2;
 
-    const int n_tok = pos + 1;
+    const int n_tok = pos + m;   /* widest attention row across the batch */
 
     /* qfull[nh*q_stride] k_stage[kv_stride] att[nh*hd] scores[nh*n_tok] + the
      * decoded q/k norm weights when those are not F32 */
@@ -325,72 +340,80 @@ int spite_generic_attention_ex(
     const float *nw_q = norm_weights(q_norm, nq_tmp, hd);
     const float *nw_k = norm_weights(k_norm, nk_tmp, hd);
 
-    const float *xin  = (const float *)x->data;
+    const float *xin   = (const float *)x->data;
+    float       *outd  = (float *)out->data;
     const int    group = nh / nkv;
+    const float  scale = 1.0f / sqrtf((float)hd);
 
-    /* Row `pos` of the cache, addressed by byte stride exactly as the GPU
-     * kernel does — nb[1] is not assumed to be 4 * kv_stride. */
-    float *k_row = (float *)((uint8_t *)kvcache->k.data + (size_t)pos * kvcache->k.nb[1]);
-    float *v_row = (float *)((uint8_t *)kvcache->v.data + (size_t)pos * kvcache->v.nb[1]);
+    /* One column of `x` per token, at positions pos..pos+m-1. Each token writes
+     * its own KV row and attends causally over every row up to its position. */
+    for (int t = 0; t < m; t++) {
+        const float *xt = xin + (size_t)t * d_model;
+        const int    p  = pos + t;
+        const int    nt = p + 1;
 
-    /* Projections. V goes straight into its cache row, as on the GPU. */
-    ref_gemv(wq, xin, q, 0, 0);
-    ref_gemv(wk, xin, k_stage, 0, 0);
-    ref_gemv(wv, xin, v_row, 0, 0);
+        /* Row `p` of the cache, addressed by byte stride exactly as the GPU
+         * kernel does — nb[1] is not assumed to be 4 * kv_stride. */
+        float *k_row = (float *)((uint8_t *)kvcache->k.data + (size_t)p * kvcache->k.nb[1]);
+        float *v_row = (float *)((uint8_t *)kvcache->v.data + (size_t)p * kvcache->v.nb[1]);
 
-    /* Per-head QK RMSNorm + NEOX RoPE (q part only; the gate half is untouched).
-     * K lands in the cache row. */
-    for (int h = 0; h < nh; h++)
-        qk_norm_rope(q + (size_t)h * q_stride, q + (size_t)h * q_stride, nw_q, norm_eps, hd, rd,
-                     pos, rope_freq_base);
-    for (int h = 0; h < nkv; h++)
-        qk_norm_rope(k_row + (size_t)h * hd, k_stage + (size_t)h * hd, nw_k, norm_eps, hd, rd, pos,
-                     rope_freq_base);
+        /* Projections. V goes straight into its cache row, as on the GPU. */
+        ref_gemv(wq, xt, q, 0, 0);
+        ref_gemv(wk, xt, k_stage, 0, 0);
+        ref_gemv(wv, xt, v_row, 0, 0);
 
-    const float scale = 1.0f / sqrtf((float)hd);
+        /* Per-head QK RMSNorm + NEOX RoPE (q part only; the gate half is
+         * untouched). K lands in the cache row. */
+        for (int h = 0; h < nh; h++)
+            qk_norm_rope(q + (size_t)h * q_stride, q + (size_t)h * q_stride, nw_q, norm_eps, hd, rd,
+                         p, rope_freq_base);
+        for (int h = 0; h < nkv; h++)
+            qk_norm_rope(k_row + (size_t)h * hd, k_stage + (size_t)h * hd, nw_k, norm_eps, hd, rd, p,
+                         rope_freq_base);
 
-    /* scores -> online softmax -> weighted V, per head. Fusing these three
-     * passes is a GPU concern; the reference keeps them separate so it reads
-     * like the maths. */
-    for (int h = 0; h < nh; h++) {
-        const float *qh = q + (size_t)h * q_stride;
-        const int    kh = h / group;
-        float       *sc = scores + (size_t)h * n_tok;
+        /* scores -> online softmax -> weighted V, per head. Fusing these three
+         * passes is a GPU concern; the reference keeps them separate so it reads
+         * like the maths. */
+        for (int h = 0; h < nh; h++) {
+            const float *qh = q + (size_t)h * q_stride;
+            const int    kh = h / group;
+            float       *sc = scores + (size_t)h * n_tok;
 
-        for (int t = 0; t < n_tok; t++) {
-            const float *kt = (const float *)((const uint8_t *)kvcache->k.data +
-                                              (size_t)t * kvcache->k.nb[1]) + (size_t)kh * hd;
-            float acc = 0.0f;
-            for (int i = 0; i < hd; i++) acc += qh[i] * kt[i];
-            sc[t] = acc * scale;
-        }
-
-        float m = -INFINITY;
-        for (int t = 0; t < n_tok; t++) m = fmaxf(m, sc[t]);
-        float sum = 0.0f;
-        for (int t = 0; t < n_tok; t++) { sc[t] = expf(sc[t] - m); sum += sc[t]; }
-        const float inv = 1.0f / sum;
-        for (int t = 0; t < n_tok; t++) sc[t] *= inv;
-
-        const int vh = h / group;
-        float    *ah = att + (size_t)h * hd;
-        for (int i = 0; i < hd; i++) {
-            float acc = 0.0f;
-            for (int t = 0; t < n_tok; t++) {
-                const float *vt = (const float *)((const uint8_t *)kvcache->v.data +
-                                                  (size_t)t * kvcache->v.nb[1]) + (size_t)vh * hd;
-                acc += sc[t] * vt[i];
+            for (int tt = 0; tt < nt; tt++) {
+                const float *kt = (const float *)((const uint8_t *)kvcache->k.data +
+                                                  (size_t)tt * kvcache->k.nb[1]) + (size_t)kh * hd;
+                float acc = 0.0f;
+                for (int i = 0; i < hd; i++) acc += qh[i] * kt[i];
+                sc[tt] = acc * scale;
             }
-            ah[i] = acc;
-        }
-        if (gated) {
-            const float *gh = qh + hd;
-            for (int i = 0; i < hd; i++) ah[i] *= 1.0f / (1.0f + expf(-gh[i]));
-        }
-    }
 
-    /* out += Wo·att (ABI v4 residual fusion). */
-    ref_gemv(wo, att, (float *)out->data, 1, 0);
+            float mx = -INFINITY;
+            for (int tt = 0; tt < nt; tt++) mx = fmaxf(mx, sc[tt]);
+            float sum = 0.0f;
+            for (int tt = 0; tt < nt; tt++) { sc[tt] = expf(sc[tt] - mx); sum += sc[tt]; }
+            const float inv = 1.0f / sum;
+            for (int tt = 0; tt < nt; tt++) sc[tt] *= inv;
+
+            const int vh = h / group;
+            float    *ah = att + (size_t)h * hd;
+            for (int i = 0; i < hd; i++) {
+                float acc = 0.0f;
+                for (int tt = 0; tt < nt; tt++) {
+                    const float *vt = (const float *)((const uint8_t *)kvcache->v.data +
+                                                      (size_t)tt * kvcache->v.nb[1]) + (size_t)vh * hd;
+                    acc += sc[tt] * vt[i];
+                }
+                ah[i] = acc;
+            }
+            if (gated) {
+                const float *gh = qh + hd;
+                for (int i = 0; i < hd; i++) ah[i] *= 1.0f / (1.0f + expf(-gh[i]));
+            }
+        }
+
+        /* out += Wo·att (ABI v4 residual fusion). */
+        ref_gemv(wo, att, outd + (size_t)t * d_out, 1, 0);
+    }
 
     if (owned) free(buf);
     return 0;
@@ -430,10 +453,13 @@ int spite_generic_matmul(
 ) {
     (void)ctx;
     if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
+    int R = tensor_rows(w), C = tensor_cols(w);
+    int m = tensor_rows(x);
+    if (m < 1) m = 1;
+    if (tensor_cols(out) != R || tensor_rows(out) < m) return -1;
     float *wf = dequant_to_f32(w);
     if (!wf) return -1;
-    matmul_f32((float *)out->data, wf, (const float *)x->data,
-               tensor_rows(w), tensor_cols(w), 1);
+    gemm_nt((float *)out->data, wf, (const float *)x->data, R, C, m);
     free(wf);
     return 0;
 }

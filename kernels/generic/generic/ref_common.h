@@ -39,6 +39,17 @@ static inline int ref_f32_vec(const SpiteTensor *t, int64_t n) {
     return ref_elems(t) == (uint64_t)n && spite_tensor_is_contiguous(t);
 }
 
+/* Contiguous F32 `[cols, rows]` matrix (rows >= 1): the batched activation shape,
+ * `cols` along ne[0] and one column per token along ne[1].  rows == 1 is the
+ * single-token case and matches ref_f32_vec(cols). */
+static inline int ref_f32_mat(const SpiteTensor *t, int64_t cols, int64_t rows) {
+    if (!t || t->kind != SPITE_TYPE_F32 || !t->data) return 0;
+    if (cols < 1 || rows < 1) return 0;
+    if ((int64_t)t->ne[0] != cols || (int64_t)t->ne[1] != rows) return 0;
+    if (t->ne[2] > 1 || t->ne[3] > 1) return 0;
+    return spite_tensor_is_contiguous(t);
+}
+
 /*
  * Weight matrix [cols, rows] (GGUF layout: row r is contiguous, `cols` along
  * ne[0]) of any type spite_dequantize_row() decodes.  The type is probed by
