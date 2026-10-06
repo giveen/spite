@@ -279,6 +279,228 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
+// ── NInfer Engine Codecs: INT8_G64, FP8_E4M3, NVFP4_G16 ────────────────────
+
+/// Signed INT8 Group-64 codec.
+///
+/// HeadDim = 256, Group = 64. Scale: FP16-RNE(absmax / 127.0).
+/// Packed: 4 groups * (2 bytes scale + 64 bytes codes) = 264 bytes per 256-elem row.
+pub fn quant_int8_g64(src: &[f32], dst: &mut [u8]) {
+    const G: usize = 64;
+    assert_eq!(src.len() % G, 0, "src must be a multiple of group size 64");
+    let n_groups = src.len() / G;
+    assert!(dst.len() >= n_groups * (2 + G));
+
+    for g in 0..n_groups {
+        let blk = &src[g * G..(g + 1) * G];
+        let amax = blk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let s = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+        let s_f16 = f32_to_f16(s);
+        let rep_s = f16_to_f32(s_f16);
+        let inv_s = if rep_s > 0.0 { 1.0 / rep_s } else { 0.0 };
+
+        let off = g * (2 + G);
+        dst[off..off + 2].copy_from_slice(&s_f16.to_le_bytes());
+        for i in 0..G {
+            let q = (blk[i] * inv_s).round().clamp(-127.0, 127.0) as i8;
+            dst[off + 2 + i] = q as u8;
+        }
+    }
+}
+
+pub fn dequant_int8_g64(src: &[u8], n_elem: usize, dst: &mut [f32]) {
+    const G: usize = 64;
+    assert_eq!(n_elem % G, 0, "n_elem must be a multiple of group size 64");
+    let n_groups = n_elem / G;
+    assert!(src.len() >= n_groups * (2 + G));
+    assert!(dst.len() >= n_elem);
+
+    for g in 0..n_groups {
+        let off = g * (2 + G);
+        let s_bits = u16::from_le_bytes([src[off], src[off + 1]]);
+        let s = f16_to_f32(s_bits);
+        for i in 0..G {
+            dst[g * G + i] = (src[off + 2 + i] as i8 as f32) * s;
+        }
+    }
+}
+
+/// FP8 (E4M3) Row-scaled D256 codec.
+///
+/// HeadDim = 256. Scale: FP16-RNE(absmax / 448.0) bounded to [2^-24, 65504.0].
+/// Packed: 2 bytes FP16 scale + 256 bytes E4M3 codes = 258 bytes per 256-elem row.
+pub fn f32_to_e4m3(val: f32) -> u8 {
+    if val == 0.0 {
+        return 0;
+    }
+    let bits = val.to_bits();
+    let sign = ((bits >> 31) & 1) as u8;
+    let abs_val = val.abs().min(448.0);
+
+    // E4M3 table / quant: 1 sign bit, 4 exp bits, 3 mantissa bits, bias = 7.
+    // Max finite = 448. Smallest normal = 2^-6 = 0.015625.
+    if abs_val < 0.001953125 {
+        // Underflow / zero
+        return sign << 7;
+    }
+    if abs_val < 0.015625 {
+        // Subnormals: abs_val = m * 2^-9
+        let m = (abs_val * 512.0).round().clamp(1.0, 7.0) as u8;
+        return (sign << 7) | m;
+    }
+    // Normals
+    let e = (abs_val.log2().floor() as i32).clamp(-6, 8);
+    let exp_field = (e + 7) as u8;
+    let norm = abs_val / 2f32.powi(e); // in [1.0, 2.0)
+    let m = ((norm - 1.0) * 8.0).round().clamp(0.0, 7.0) as u8;
+    (sign << 7) | (exp_field << 3) | m
+}
+
+pub fn e4m3_to_f32(code: u8) -> f32 {
+    let sign = if (code >> 7) != 0 { -1.0f32 } else { 1.0f32 };
+    let exp = ((code >> 3) & 0x0F) as i32;
+    let man = (code & 0x07) as f32;
+
+    if exp == 0 {
+        if man == 0.0 {
+            0.0
+        } else {
+            sign * man * 2f32.powi(-9)
+        }
+    } else if exp == 15 && man == 7.0 {
+        // NaN in E4M3FN
+        f32::NAN
+    } else {
+        sign * (1.0 + man / 8.0) * 2f32.powi(exp - 7)
+    }
+}
+
+pub fn quant_fp8_e4m3(src: &[f32], dst: &mut [u8]) {
+    const ROW: usize = 256;
+    assert_eq!(src.len() % ROW, 0, "src must be a multiple of row size 256");
+    let n_rows = src.len() / ROW;
+    assert!(dst.len() >= n_rows * (2 + ROW));
+
+    for r in 0..n_rows {
+        let blk = &src[r * ROW..(r + 1) * ROW];
+        let amax = blk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let raw_scale = if amax > 0.0 { amax / 448.0 } else { 0.0 };
+        let bounded = raw_scale.clamp(2f32.powi(-24), 65504.0);
+        let s_f16 = if amax > 0.0 { f32_to_f16(bounded) } else { 0 };
+        let rep_s = f16_to_f32(s_f16);
+        let inv_s = if rep_s > 0.0 { 1.0 / rep_s } else { 0.0 };
+
+        let off = r * (2 + ROW);
+        dst[off..off + 2].copy_from_slice(&s_f16.to_le_bytes());
+        for i in 0..ROW {
+            dst[off + 2 + i] = f32_to_e4m3(blk[i] * inv_s);
+        }
+    }
+}
+
+pub fn dequant_fp8_e4m3(src: &[u8], n_elem: usize, dst: &mut [f32]) {
+    const ROW: usize = 256;
+    assert_eq!(n_elem % ROW, 0, "n_elem must be a multiple of row size 256");
+    let n_rows = n_elem / ROW;
+    assert!(src.len() >= n_rows * (2 + ROW));
+    assert!(dst.len() >= n_elem);
+
+    for r in 0..n_rows {
+        let off = r * (2 + ROW);
+        let s_bits = u16::from_le_bytes([src[off], src[off + 1]]);
+        let s = f16_to_f32(s_bits);
+        for i in 0..ROW {
+            dst[r * ROW + i] = e4m3_to_f32(src[off + 2 + i]) * s;
+        }
+    }
+}
+
+/// NVFP4 Group-16 codec.
+///
+/// HeadDim = 256, Group = 16.
+/// Each group: 1 byte E4M3 scale + 8 bytes (16 packed E2M1 nibbles) = 9 bytes.
+/// Packed: 16 groups * 9 bytes = 144 bytes per 256-elem row.
+const E2M1_VALS: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+pub fn quant_nvfp4_g16(src: &[f32], dst: &mut [u8]) {
+    const G: usize = 16;
+    assert_eq!(src.len() % G, 0, "src must be a multiple of group size 16");
+    let n_groups = src.len() / G;
+    assert!(dst.len() >= n_groups * 9);
+
+    for g in 0..n_groups {
+        let blk = &src[g * G..(g + 1) * G];
+        let amax = blk.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let raw_scale = if amax > 0.0 { amax / 6.0 } else { 0.0 };
+        let bounded = raw_scale.clamp(2f32.powi(-9), 448.0);
+        let scale_byte = if amax > 0.0 { f32_to_e4m3(bounded) } else { 0 };
+        let rep_scale = e4m3_to_f32(scale_byte);
+        let inv_scale = if rep_scale > 0.0 {
+            1.0 / rep_scale
+        } else {
+            0.0
+        };
+
+        let off = g * 9;
+        dst[off] = scale_byte;
+
+        // Encode 16 elements into 8 bytes (pairs of 4-bit nibbles)
+        for p in 0..8 {
+            let x0 = blk[2 * p] * inv_scale;
+            let x1 = blk[2 * p + 1] * inv_scale;
+
+            let encode_e2m1 = |v: f32| -> u8 {
+                let sign = if v < 0.0 { 8u8 } else { 0u8 };
+                let av = v.abs();
+                let idx = if av < 0.25 {
+                    0
+                } else if av < 0.75 {
+                    1
+                } else if av < 1.25 {
+                    2
+                } else if av < 1.75 {
+                    3
+                } else if av < 2.5 {
+                    4
+                } else if av < 3.5 {
+                    5
+                } else if av < 5.0 {
+                    6
+                } else {
+                    7
+                };
+                sign | idx
+            };
+
+            let nib0 = encode_e2m1(x0);
+            let nib1 = encode_e2m1(x1);
+            dst[off + 1 + p] = nib0 | (nib1 << 4);
+        }
+    }
+}
+
+pub fn dequant_nvfp4_g16(src: &[u8], n_elem: usize, dst: &mut [f32]) {
+    const G: usize = 16;
+    assert_eq!(n_elem % G, 0, "n_elem must be a multiple of group size 16");
+    let n_groups = n_elem / G;
+    assert!(src.len() >= n_groups * 9);
+    assert!(dst.len() >= n_elem);
+
+    for g in 0..n_groups {
+        let off = g * 9;
+        let scale = e4m3_to_f32(src[off]);
+        for p in 0..8 {
+            let byte = src[off + 1 + p];
+            let nib0 = (byte & 0x0F) as usize;
+            let nib1 = (byte >> 4) as usize;
+            dst[g * G + 2 * p] = E2M1_VALS[nib0] * scale;
+            dst[g * G + 2 * p + 1] = E2M1_VALS[nib1] * scale;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +603,42 @@ mod tests {
         dequantize(KvQuant::Q5_1, &packed, 32, &mut back);
         for b in back {
             assert!((b - 1.25).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn int8_g64_roundtrip() {
+        let src: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.05).sin() * 5.0).collect();
+        let mut packed = vec![0u8; 4 * (2 + 64)];
+        quant_int8_g64(&src, &mut packed);
+        let mut dst = vec![0.0f32; 256];
+        dequant_int8_g64(&packed, 256, &mut dst);
+        for (a, b) in src.iter().zip(dst.iter()) {
+            assert!((a - b).abs() < 0.08, "int8_g64 mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn fp8_e4m3_roundtrip() {
+        let src: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.05).cos() * 8.0).collect();
+        let mut packed = vec![0u8; 2 + 256];
+        quant_fp8_e4m3(&src, &mut packed);
+        let mut dst = vec![0.0f32; 256];
+        dequant_fp8_e4m3(&packed, 256, &mut dst);
+        for (a, b) in src.iter().zip(dst.iter()) {
+            assert!((a - b).abs() < 0.8, "fp8_e4m3 mismatch: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn nvfp4_g16_roundtrip() {
+        let src: Vec<f32> = (0..256).map(|i| ((i as f32) * 0.1).sin() * 3.0).collect();
+        let mut packed = vec![0u8; 16 * 9];
+        quant_nvfp4_g16(&src, &mut packed);
+        let mut dst = vec![0.0f32; 256];
+        dequant_nvfp4_g16(&packed, 256, &mut dst);
+        for (a, b) in src.iter().zip(dst.iter()) {
+            assert!((a - b).abs() < 1.0, "nvfp4_g16 mismatch: {a} vs {b}");
         }
     }
 }

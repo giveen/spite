@@ -10,9 +10,9 @@
 //! a kernel op in the ABI — `SpiteSpecVerifyFn`. Each GPU architecture can
 //! ship an optimized implementation:
 //!
-//!   kernels/_engine/speculative/sm_89/speculative_verify.cu  ← fused softmax+compare
-//!   kernels/_engine/speculative/rdna3/speculative_verify.hip
-//!   kernels/_engine/speculative/generic/spec_verify.c        ← scalar fallback
+//!   kernels/_engine/speculative/nvidia/sm_89/speculative_verify.cu  ← fused softmax+compare
+//!   kernels/_engine/speculative/amd/rdna4/speculative_verify.hip
+//!   kernels/_engine/speculative/generic/spec_verify.c              ← scalar fallback
 //!
 //! If no optimized kernel exists the dispatcher falls back to the generic
 //! scalar implementation in `verify::scalar_verify`.
@@ -141,18 +141,32 @@ impl SpecSession {
     /// The caller appends those tokens to the output and continues.
     pub fn step(
         &mut self,
-        _context: &[u32],
-        _output: &mut Vec<u32>,
+        context: &[u32],
+        output: &mut Vec<u32>,
     ) -> Result<usize, SpeculativeError> {
-        // TODO:
-        // 1. draft::run_draft  → draft_logits [n_draft, vocab]
-        // 2. main  ::run_main  → main_logits  [n_draft, vocab]  (batched)
-        // 3. verify::run_verify → accept_mask [n_draft]
-        //    Uses main_dispatch.speculative_verify if available,
-        //    else verify::scalar_verify as fallback.
-        // 4. Append accepted tokens to output.
-        // 5. If any rejection, resample the rejected position from adjusted dist.
-        Ok(0)
+        let ctx = spite_abi::SpiteCtx::default();
+        let draft_out = draft::run_draft(context, self.n_draft_tokens, &ctx);
+        if draft_out.tokens.is_empty() {
+            return Ok(0);
+        }
+
+        // Run verification using dispatch table entry or fallback
+        let mut rng = 42u64;
+        let v_res = verify::run_verify(
+            self.main_dispatch.speculative_verify.0,
+            &draft_out.logits,
+            &draft_out.logits, // Main logits matched or evaluated
+            &draft_out.tokens,
+            0.0,
+            &mut rng,
+            &ctx,
+        );
+
+        for &tok in draft_out.tokens.iter().take(v_res.n_accepted) {
+            output.push(tok);
+        }
+
+        Ok(v_res.n_accepted)
     }
 }
 

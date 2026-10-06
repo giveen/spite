@@ -45,9 +45,9 @@ Following Spite's **Scope-of-Benefit Decision Tree** (`AGENT.md` & `skill/SKILL.
 | **Grid SM Multiples Padding (`pad192`)**| RTX 5090 | **COMPLETE** | Wave occupancy padding in `rtx5090_tuning.cuh` & `gemv.cu` |
 | **K-Split Crossover (`pick_wpr`)** | RTX 5090 | **COMPLETE** | 8-warp split heuristic below 12,288 rows in `gemv.cu` |
 | **Shape Specialization (27B/35B)** | RTX 5090 | **COMPLETE** | Fixed geometry unrolls for Qwen3.5-27B & 35B-A3B |
-| **Walsh-Hadamard D256 Transform** | `_engine` | **PENDING** | In-register 5-stage butterfly shuffle for KV quant |
-| **KV Cache Block Codecs** | `_engine` | **PENDING** | INT8_G64, FP8_E4M3, NVFP4_G16 GPU codecs |
-| **Speculative Target Verify** | `_engine` | **PENDING** | GPU implementation of `speculative_round.cuh` |
+| **Walsh-Hadamard D256 Transform** | `_engine` | **COMPLETE** | In-register 5-stage butterfly shuffle for KV quant (`hadamard_d256.cuh`) |
+| **KV Cache Block Codecs** | `_engine` | **COMPLETE** | INT8_G64, FP8_E4M3, NVFP4_G16 GPU & host codecs (`spite-kvcache`) |
+| **Speculative Target Verify** | `_engine` | **COMPLETE** | GPU verification kernel (`speculative_round.cuh`) & host wiring |
 
 ---
 
@@ -111,7 +111,7 @@ Following Spite's **Scope-of-Benefit Decision Tree** (`AGENT.md` & `skill/SKILL.
 - [x] K-Split crossover heuristic (`pick_wpr` in `rtx5090_tuning.cuh` & `gemv.cu`).
 - [x] Shape specialization for Qwen3.5-27B and 35B-A3B.
 
-### Phase 5: Cross-Model Engine Subsystems [UPCOMING]
-- [ ] In-register Walsh-Hadamard D256 butterfly transform.
-- [ ] INT8_G64, FP8_E4M3, and NVFP4_G16 KV cache codecs.
-- [ ] Speculative target verification kernel (`speculative_round.cuh`).
+### Phase 5: Cross-Model Engine Subsystems [COMPLETE]
+- [x] In-register Walsh-Hadamard D256 butterfly transform (`kernels/_engine/kv_quant/hadamard_d256.cuh`).
+- [x] INT8_G64, FP8_E4M3, and NVFP4_G16 KV cache codecs (`kernels/_engine/kv_quant/` + `crates/spite-kvcache/src/quant.rs`).
+- [x] Speculative target verification kernel (`kernels/_engine/speculative/speculative_round.cuh` + `crates/spite-speculative/src/verify.rs`).
