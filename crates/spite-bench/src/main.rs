@@ -73,6 +73,14 @@ struct Args {
     /// Convenience flag to enable MTP speculative decoding (equivalent to --spec mtp).
     #[arg(long)]
     mtp: bool,
+
+    /// Prompt text to benchmark with.
+    #[arg(long)]
+    prompt: Option<String>,
+
+    /// Number of prompt tokens for prefill throughput test (pads/repeats prompt if larger).
+    #[arg(long)]
+    n_prompt: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -214,7 +222,23 @@ fn main() -> Result<()> {
     };
 
     // Fixed prompt keeps runs comparable; real-model runs use --n-tokens.
-    let prompt_ids = tokenizer.encode("Benchmark prompt for throughput measurement.", true)?;
+    let prompt_text = args
+        .prompt
+        .as_deref()
+        .unwrap_or("Benchmark prompt for throughput measurement.");
+    let mut prompt_ids = tokenizer.encode(prompt_text, true)?;
+    if let Some(target_len) = args.n_prompt {
+        if target_len > prompt_ids.len() && !prompt_ids.is_empty() {
+            let base = prompt_ids.clone();
+            while prompt_ids.len() < target_len {
+                let take = (target_len - prompt_ids.len()).min(base.len());
+                prompt_ids.extend_from_slice(&base[..take]);
+            }
+        } else if target_len > 0 && target_len < prompt_ids.len() {
+            prompt_ids.truncate(target_len);
+        }
+    }
+
     let exec_cfg = ExecutorConfig {
         kv_quant: kv_cfg.clone(),
         ..ExecutorConfig::default()
@@ -226,6 +250,8 @@ fn main() -> Result<()> {
     let _ = exec.generate(&tokenizer, &prompt_ids, 4, 0.0, 0)?;
 
     let mut ttft_ms = 0f64;
+    let mut prefill_s = 0f64;
+    let mut n_prefill_tok = 0usize;
     let mut decode_s = 0f64;
     let mut n_tok = 0usize;
     let mut total_drafts = 0usize;
@@ -248,7 +274,11 @@ fn main() -> Result<()> {
             scratchpad_bytes: 0,
         };
         let mut logits = exec.prefill(&ids, &ctx)?;
-        ttft_ms += t0.elapsed().as_secs_f64() * 1000.0;
+        let prefill_elapsed = t0.elapsed().as_secs_f64();
+        ttft_ms += prefill_elapsed * 1000.0;
+        prefill_s += prefill_elapsed;
+        n_prefill_tok += ids.len();
+
         let t1 = std::time::Instant::now();
         let cfg = spite_sampling::SamplerConfig {
             temperature: 0.0,
@@ -311,6 +341,8 @@ fn main() -> Result<()> {
         n_tok += run_tokens;
     }
     let runs = args.n_runs.max(1) as f64;
+    let prefill_tps = n_prefill_tok as f64 / prefill_s.max(1e-9);
+    let decode_tps = n_tok as f64 / decode_s.max(1e-9);
     let full_label = if use_mtp {
         format!(
             "{} [{}, spec=mtp K={}]",
@@ -326,7 +358,8 @@ fn main() -> Result<()> {
     };
     let result = spite_bench::BenchResult {
         label: full_label,
-        tps: n_tok as f64 / decode_s.max(1e-9),
+        tps: decode_tps,
+        prefill_tps,
         ttft_ms: ttft_ms / runs,
         peak_mem_mib,
         n_runs: args.n_runs,
@@ -540,6 +573,8 @@ fn result_json(r: &spite_bench::BenchResult) -> serde_json::Value {
     let mut v = serde_json::json!({
         "label": r.label,
         "tps": r.tps,
+        "decode_tps": r.tps,
+        "prefill_tps": r.prefill_tps,
         "ttft_ms": r.ttft_ms,
         "peak_mem_mib": r.peak_mem_mib,
         "n_runs": r.n_runs,
@@ -548,6 +583,14 @@ fn result_json(r: &spite_bench::BenchResult) -> serde_json::Value {
         v.as_object_mut()
             .unwrap()
             .insert("acceptance_rate".into(), serde_json::json!(acc));
+        v.as_object_mut().unwrap().insert(
+            "acceptance_percentage".into(),
+            serde_json::json!(acc * 100.0),
+        );
+        v.as_object_mut().unwrap().insert(
+            "acceptance_pct".into(),
+            serde_json::json!(format!("{:.1}%", acc * 100.0)),
+        );
     }
     v
 }
