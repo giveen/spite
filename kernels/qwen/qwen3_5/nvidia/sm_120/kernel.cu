@@ -311,7 +311,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     "sm_120",
     "spite project (Qwen3.5 Blackwell sm_120: float4 vectorized + dual-issue reductions)",
     {SPITE_TYPE_F16, SPITE_TYPE_BF16, SPITE_TYPE_Q8_0, SPITE_TYPE_Q4_K,
-     SPITE_TYPE_Q5_K, SPITE_TYPE_Q6_K, SPITE_TYPE_Q4_0, 0},
+     SPITE_TYPE_Q5_K, SPITE_TYPE_Q6_K, SPITE_TYPE_NVFP4, 0},
     qwen35_sm120_rms_norm,
     nullptr, /* attention (hybrid attends via attention_ex) */
     nullptr, /* mla */

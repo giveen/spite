@@ -37,11 +37,11 @@ Following Spite's **Scope-of-Benefit Decision Tree** (`AGENT.md` & `skill/SKILL.
 | **GDN Recurrent Online Step** | General CUDA | **COMPLETE** | Portable state recurrence in `gdn.cu` (`gdn_recurrent_kernel`) |
 | **SIMT Row-Split GEMV (28 quants)**| General CUDA | **COMPLETE** | 256-thread row reduction + multi-job fusion (`gemv.cu`) |
 | **Fused MTP Stem** | CUDA / sm_120 | **COMPLETE** | Dual RMSNorm + projection packing across CUDA, sm_120, 5090 |
-| **Bitonic Top-8 MoE Router** | General CUDA | **IN PROGRESS** | Porting NInfer `sparse_moe_route.cuh` for `qwen35moe` |
-| **MoE Layer Execution (Qwen3.5 MoE)**| Host & Kernels | **IN PROGRESS** | 256 routed experts + 1 shared expert in `hybrid.rs` & CUDA |
-| **K-Split MMA Contraction** | sm_120 | **PENDING** | Porting `q4_ksplit_mma.cuh` Tensor Core GEMV |
-| **Blackwell NVFP4 W4A4 MMA** | sm_120 | **PENDING** | `mma.sync.aligned.kind::mxf4nvf4` PTX integration |
-| **TMA Asynchronous Pipelines** | sm_120 | **PENDING** | `cuTensorMapEncodeTiled` + `cp.async.bulk` |
+| **Bitonic Top-8 MoE Router** | General CUDA | **COMPLETE** | Ported NInfer `sparse_moe_route.cuh` for `qwen35moe` |
+| **MoE Layer Execution (Qwen3.5 MoE)**| Host & Kernels | **COMPLETE** | 256 routed experts + 1 shared expert in `hybrid.rs` & CUDA |
+| **K-Split MMA Contraction** | sm_120 | **COMPLETE** | 8-warp K-split MMA GEMV in `sm120_ksplit_mma.cuh` & `gemv.cu` |
+| **Blackwell NVFP4 W4A4 MMA** | sm_120 | **COMPLETE** | `mma.sync.aligned.kind::mxf4nvf4` PTX in `sm120_mma.cuh` |
+| **TMA Asynchronous Pipelines** | sm_120 | **COMPLETE** | `cuTensorMapEncodeTiled` + `cp.async.bulk` in `sm120_tma.cuh` |
 | **Grid SM Multiples Padding (`pad192`)**| RTX 5090 | **PENDING** | Wave occupancy padding in `rtx_5090/kernel.cu` |
 | **K-Split Crossover (`pick_wpr`)** | RTX 5090 | **PENDING** | 8-warp split heuristic below 12,288 rows |
 | **Shape Specialization (27B/35B)** | RTX 5090 | **PENDING** | Fixed geometry unrolls for Qwen3.5-27B & 35B-A3B |
@@ -101,10 +101,10 @@ Following Spite's **Scope-of-Benefit Decision Tree** (`AGENT.md` & `skill/SKILL.
   - [x] Wire `qwen35moe` GGUF loader tensor mappings in `spite-loader` and `spite-dispatch`.
   - [x] End-to-end live testing on RTX 5090 (`Kwaipilot_KAT-Coder-V2.5-Dev-Q5_K_S.gguf`).
 
-### Phase 3: Blackwell sm_120 Acceleration [UPCOMING]
-- [ ] Blackwell NVFP4 W4A4 MMA (`mma.sync.aligned.kind::mxf4nvf4.m16n8k64`).
-- [ ] TMA Asynchronous Pipelines (`cuTensorMap` + `cp.async.bulk`).
-- [ ] Tensor Core K-Split MMA for Q4_K, Q5_K, Q8_0 (`q4_ksplit_mma.cuh`).
+### Phase 3: Blackwell sm_120 Acceleration [COMPLETE]
+- [x] Blackwell NVFP4 W4A4 MMA (`mma.sync.aligned.kind::mxf4nvf4.m16n8k64` in `sm120_mma.cuh`).
+- [x] TMA Asynchronous Pipelines (`cuTensorMap` + `cp.async.bulk` in `sm120_tma.cuh`).
+- [x] Tensor Core K-Split MMA for Q4_K, Q5_K, Q8_0, and NVFP4 (`sm120_ksplit_mma.cuh` & `gemv.cu`).
 
 ### Phase 4: RTX 5090 Physical Tuning [UPCOMING]
 - [ ] 192-SM wave occupancy padding (`pad192`).
