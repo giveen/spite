@@ -42,9 +42,9 @@ Following Spite's **Scope-of-Benefit Decision Tree** (`AGENT.md` & `skill/SKILL.
 | **K-Split MMA Contraction** | sm_120 | **COMPLETE** | 8-warp K-split MMA GEMV in `sm120_ksplit_mma.cuh` & `gemv.cu` |
 | **Blackwell NVFP4 W4A4 MMA** | sm_120 | **COMPLETE** | `mma.sync.aligned.kind::mxf4nvf4` PTX in `sm120_mma.cuh` |
 | **TMA Asynchronous Pipelines** | sm_120 | **COMPLETE** | `cuTensorMapEncodeTiled` + `cp.async.bulk` in `sm120_tma.cuh` |
-| **Grid SM Multiples Padding (`pad192`)**| RTX 5090 | **PENDING** | Wave occupancy padding in `rtx_5090/kernel.cu` |
-| **K-Split Crossover (`pick_wpr`)** | RTX 5090 | **PENDING** | 8-warp split heuristic below 12,288 rows |
-| **Shape Specialization (27B/35B)** | RTX 5090 | **PENDING** | Fixed geometry unrolls for Qwen3.5-27B & 35B-A3B |
+| **Grid SM Multiples Padding (`pad192`)**| RTX 5090 | **COMPLETE** | Wave occupancy padding in `rtx5090_tuning.cuh` & `gemv.cu` |
+| **K-Split Crossover (`pick_wpr`)** | RTX 5090 | **COMPLETE** | 8-warp split heuristic below 12,288 rows in `gemv.cu` |
+| **Shape Specialization (27B/35B)** | RTX 5090 | **COMPLETE** | Fixed geometry unrolls for Qwen3.5-27B & 35B-A3B |
 | **Walsh-Hadamard D256 Transform** | `_engine` | **PENDING** | In-register 5-stage butterfly shuffle for KV quant |
 | **KV Cache Block Codecs** | `_engine` | **PENDING** | INT8_G64, FP8_E4M3, NVFP4_G16 GPU codecs |
 | **Speculative Target Verify** | `_engine` | **PENDING** | GPU implementation of `speculative_round.cuh` |
@@ -106,10 +106,10 @@ Following Spite's **Scope-of-Benefit Decision Tree** (`AGENT.md` & `skill/SKILL.
 - [x] TMA Asynchronous Pipelines (`cuTensorMap` + `cp.async.bulk` in `sm120_tma.cuh`).
 - [x] Tensor Core K-Split MMA for Q4_K, Q5_K, Q8_0, and NVFP4 (`sm120_ksplit_mma.cuh` & `gemv.cu`).
 
-### Phase 4: RTX 5090 Physical Tuning [UPCOMING]
-- [ ] 192-SM wave occupancy padding (`pad192`).
-- [ ] K-Split crossover heuristic (`pick_wpr`).
-- [ ] Shape specialization for Qwen3.5-27B and 35B-A3B.
+### Phase 4: RTX 5090 Physical Tuning [COMPLETE]
+- [x] 192-SM wave occupancy padding (`pad192` in `rtx5090_tuning.cuh` & `gemv.cu`).
+- [x] K-Split crossover heuristic (`pick_wpr` in `rtx5090_tuning.cuh` & `gemv.cu`).
+- [x] Shape specialization for Qwen3.5-27B and 35B-A3B.
 
 ### Phase 5: Cross-Model Engine Subsystems [UPCOMING]
 - [ ] In-register Walsh-Hadamard D256 butterfly transform.

@@ -12,11 +12,11 @@
  */
 
 #include "common.h"
+#include "rtx5090_tuning.cuh"
 
 namespace {
 
-constexpr int RTX5090_SMS = 192;
-constexpr int THREADS_PER_BLOCK = 256;
+constexpr int THREADS_PER_BLOCK = rtx5090::THREADS_PER_BLOCK;
 
 /* Fully unrolled warp reduction */
 __device__ __forceinline__ float rtx5090_warp_sum(float v) {
@@ -240,7 +240,8 @@ extern "C" int qwen35_rtx5090_ffn(SpiteTensor *out, const SpiteTensor *x,
   if (q35_gemv_multi(jobs, 2, xin, false, s) != 0)
     return -1;
 
-  const int grid = static_cast<int>((d_ffn + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+  const int blocks = static_cast<int>((d_ffn + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK);
+  const int grid = rtx5090::pad192(blocks);
   glu_act<<<grid, THREADS_PER_BLOCK, 0, s>>>(gate, up, static_cast<int>(d_ffn),
                                              act == SPITE_FFN_GELU_GATE);
 
@@ -309,7 +310,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     SPITE_ABI_VERSION,
     "qwen3_5",
     "sm_120",
-    "spite project (Qwen3.5 RTX 5090: 192-SM grid schedule, 8-warp blocks, float4 vectorization)",
+    "spite project (Qwen3.5 RTX 5090: pad192 wave occupancy, pick_wpr K-split, shape specialization)",
     {SPITE_TYPE_F16, SPITE_TYPE_BF16, SPITE_TYPE_Q8_0, SPITE_TYPE_Q4_K,
      SPITE_TYPE_Q5_K, SPITE_TYPE_Q6_K, SPITE_TYPE_NVFP4, 0},
     qwen35_rtx5090_rms_norm,
