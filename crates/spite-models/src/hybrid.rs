@@ -95,6 +95,17 @@ enum Layer {
     Gdn(GdnLayer),
 }
 
+/// NextN / MTP draft head: one gated full-attention block stored after the
+/// trunk as `blk.{n_layers}`, fed `[enorm(embed(x_{t+1})) || hnorm(h_t)]`.
+struct MtpHead {
+    enorm: SpiteTensor,
+    hnorm: SpiteTensor,
+    eh_proj: SpiteTensor,
+    layer: AttnLayer,
+    head_norm: SpiteTensor,
+    head: SpiteTensor,
+}
+
 struct KvPair {
     k: DeviceBuffer,
     v: DeviceBuffer,
@@ -113,6 +124,12 @@ struct HState {
     scratch: DeviceBuffer,
     h: DeviceBuffer,
     n: DeviceBuffer,
+    /// Final-normed hidden state of the last trunk token or MTP step: the
+    /// `h_t` the next MTP step consumes.
+    hid: DeviceBuffer,
+    /// MTP only: the draft token's embedding and the packed `[2*d]` stem.
+    emb: DeviceBuffer,
+    pack: DeviceBuffer,
     logits: DeviceBuffer,
 }
 
@@ -124,6 +141,8 @@ pub struct HybridReport {
     pub state_bytes: usize,
     pub scratch_bytes: usize,
     pub kv_kind: SpiteType,
+    /// The NextN (MTP) draft head was loaded and `mtp_step` is available.
+    pub mtp: bool,
     /// `(free, total)` device memory after load; `None` off CUDA.
     pub mem: Option<(usize, usize)>,
 }
@@ -138,6 +157,7 @@ pub struct HybridDecoder {
     attn: SpiteAttnParams,
     gdn: SpiteGdnParams,
     layers: Vec<Layer>,
+    mtp: Option<MtpHead>,
     out_norm: SpiteTensor,
     out_w: SpiteTensor,
     embd_host: Vec<u8>,
@@ -245,16 +265,27 @@ impl HybridDecoder {
             norm_eps: config.norm_eps,
         };
 
-        // Trunk tensors only: NextN/MTP blocks (index >= n_layers) are not run.
-        let is_trunk = |name: &str| {
+        // NextN/MTP: only the first block (`blk.{n_layers}`) is used, and only
+        // when it is a full-attention block and an mtp_stem op runs on this
+        // backend; otherwise its tensors are not uploaded at all.
+        let mtp_b = format!("blk.{n_layers}");
+        let mtp_stem_ok = table.mtp_stem.0.is_some()
+            && (table.mtp_stem.1.gpu_arch == GENERIC) == (backend == GpuBackend::Cpu);
+        let has_tensor = |name: String| gguf.tensor_names().any(|n| n == name);
+        let has_mtp = config.n_nextn_predict_layers > 0
+            && mtp_stem_ok
+            && has_tensor(format!("{mtp_b}.nextn.eh_proj.weight"))
+            && has_tensor(format!("{mtp_b}.attn_q.weight"));
+        let n_blocks = n_layers + usize::from(has_mtp);
+        let is_loaded = |name: &str| {
             name.strip_prefix("blk.")
                 .and_then(|r| r.split('.').next())
                 .and_then(|i| i.parse::<usize>().ok())
-                .is_none_or(|i| i < n_layers)
+                .is_none_or(|i| i < n_blocks)
         };
         let mut sizes = Vec::new();
         let mut weights_bytes = 0usize;
-        for name in gguf.tensor_names().filter(|n| is_trunk(n)) {
+        for name in gguf.tensor_names().filter(|n| is_loaded(n)) {
             let t = gguf.tensor(name);
             let n_elem: usize = t.ne.iter().map(|&x| x.max(1) as usize).product();
             let bytes = packed_bytes(t.kind, n_elem)
@@ -274,8 +305,9 @@ impl HybridDecoder {
             .filter(|&i| !config.recurrent_layers[i])
             .count();
         let n_gdn = n_layers - n_attn;
+        let n_kv_layers = n_attn + usize::from(has_mtp);
         let kv_side = n_ctx * kv_row * kv_elem;
-        let kv_bytes = n_attn * 2 * kv_side;
+        let kv_bytes = n_kv_layers * 2 * kv_side;
         let state_bytes = n_gdn * (gdn.conv_hist_floats() + gdn.state_floats()) * 4;
         let scratch_floats = [
             2 * config.d_ffn,
@@ -286,7 +318,8 @@ impl HybridDecoder {
         .max()
         .unwrap_or(0);
         let scratch_bytes = scratch_floats * 4;
-        let act_bytes = (2 * d + config.vocab_size) * 4;
+        // h, n, hid, logits (+ emb and the [2*d] stem pack for MTP).
+        let act_bytes = (3 * d + config.vocab_size + if has_mtp { 3 * d } else { 0 }) * 4;
         let need = weights_bytes + kv_bytes + state_bytes + scratch_bytes + act_bytes;
         if backend == GpuBackend::Cuda {
             let (free, _) = cuda::mem_info().map_err(|e| err(e.to_string()))?;
@@ -329,12 +362,9 @@ impl HybridDecoder {
                 .map(DeviceWeight::tensor)
                 .ok_or_else(|| ModelError::MissingWeight(name.into()))
         };
-        let mut layers = Vec::with_capacity(n_layers);
-        let (mut kv_i, mut gdn_i) = (0usize, 0usize);
-        for l in 0..n_layers {
-            let b = format!("blk.{l}");
+        let load_ffn = |b: &str| -> Result<LayerFfn, ModelError> {
             let post_norm = get(&format!("{b}.post_attention_norm.weight"))?;
-            let ffn = if config.n_expert > 0 {
+            Ok(if config.n_expert > 0 {
                 let w_gate_inp = get(&format!("{b}.ffn_gate_inp.weight"))?;
                 let w_up_exps = get(&format!("{b}.ffn_up_exps.weight"))?;
                 let w_gate_exps = get(&format!("{b}.ffn_gate_exps.weight"))?;
@@ -369,11 +399,36 @@ impl HybridDecoder {
                     up: get(&format!("{b}.ffn_up.weight"))?,
                     down: get(&format!("{b}.ffn_down.weight"))?,
                 }))
-            };
-            let norm = get(&format!("{b}.attn_norm.weight"))?;
+            })
+        };
+        let load_attn = |b: &str, kv: usize| -> Result<AttnLayer, ModelError> {
+            let wq = get(&format!("{b}.attn_q.weight"))?;
+            if wq.ne[1] as usize != 2 * n_heads * head_dim {
+                return Err(ModelError::ShapeMismatch {
+                    name: format!("{b}.attn_q.weight"),
+                    expected: vec![wq.ne[0], (2 * n_heads * head_dim) as u32],
+                    actual: wq.ne.to_vec(),
+                });
+            }
+            Ok(AttnLayer {
+                norm: get(&format!("{b}.attn_norm.weight"))?,
+                wq,
+                wk: get(&format!("{b}.attn_k.weight"))?,
+                wv: get(&format!("{b}.attn_v.weight"))?,
+                wo: get(&format!("{b}.attn_output.weight"))?,
+                q_norm: get(&format!("{b}.attn_q_norm.weight"))?,
+                k_norm: get(&format!("{b}.attn_k_norm.weight"))?,
+                kv,
+                ffn: load_ffn(b)?,
+            })
+        };
+        let mut layers = Vec::with_capacity(n_layers);
+        let (mut kv_i, mut gdn_i) = (0usize, 0usize);
+        for l in 0..n_layers {
+            let b = format!("blk.{l}");
             if config.recurrent_layers[l] {
                 layers.push(Layer::Gdn(GdnLayer {
-                    norm,
+                    norm: get(&format!("{b}.attn_norm.weight"))?,
                     w_qkv: get(&format!("{b}.attn_qkv.weight"))?,
                     w_gate: get(&format!("{b}.attn_gate.weight"))?,
                     w_beta: get(&format!("{b}.ssm_beta.weight"))?,
@@ -384,42 +439,40 @@ impl HybridDecoder {
                     ssm_a: get(&format!("{b}.ssm_a"))?,
                     ssm_norm: get(&format!("{b}.ssm_norm.weight"))?,
                     st: gdn_i,
-                    ffn,
+                    ffn: load_ffn(&b)?,
                 }));
                 gdn_i += 1;
             } else {
-                let wq = get(&format!("{b}.attn_q.weight"))?;
-                if wq.ne[1] as usize != 2 * n_heads * head_dim {
-                    return Err(ModelError::ShapeMismatch {
-                        name: format!("{b}.attn_q.weight"),
-                        expected: vec![wq.ne[0], (2 * n_heads * head_dim) as u32],
-                        actual: wq.ne.to_vec(),
-                    });
-                }
-                layers.push(Layer::Attn(AttnLayer {
-                    norm,
-                    wq,
-                    wk: get(&format!("{b}.attn_k.weight"))?,
-                    wv: get(&format!("{b}.attn_v.weight"))?,
-                    wo: get(&format!("{b}.attn_output.weight"))?,
-                    q_norm: get(&format!("{b}.attn_q_norm.weight"))?,
-                    k_norm: get(&format!("{b}.attn_k_norm.weight"))?,
-                    kv: kv_i,
-                    ffn,
-                }));
+                layers.push(Layer::Attn(load_attn(&b, kv_i)?));
                 kv_i += 1;
             }
         }
         let out_norm = get("output_norm.weight")?;
         // Tied embeddings: token_embd doubles as the LM head.
         let out_w = get("output.weight").or_else(|_| get("token_embd.weight"))?;
+        let mtp = if has_mtp {
+            let b = &mtp_b;
+            Some(MtpHead {
+                enorm: get(&format!("{b}.nextn.enorm.weight"))?,
+                hnorm: get(&format!("{b}.nextn.hnorm.weight"))?,
+                eh_proj: get(&format!("{b}.nextn.eh_proj.weight"))?,
+                layer: load_attn(b, n_attn)?,
+                head_norm: get(&format!("{b}.nextn.shared_head_norm.weight"))
+                    .or_else(|_| get("output_norm.weight"))?,
+                head: get(&format!("{b}.nextn.shared_head_head.weight"))
+                    .or_else(|_| get("output.weight"))
+                    .or_else(|_| get("token_embd.weight"))?,
+            })
+        } else {
+            None
+        };
 
         let zero = |buf: &mut DeviceBuffer| {
             buf.upload(&vec![0u8; buf.size])
                 .map_err(|e| err(format!("zero: {e}")))
         };
-        let mut kv = Vec::with_capacity(n_attn);
-        for _ in 0..n_attn {
+        let mut kv = Vec::with_capacity(n_kv_layers);
+        for _ in 0..n_kv_layers {
             kv.push(KvPair {
                 k: alloc(kv_side)?,
                 v: alloc(kv_side)?,
@@ -442,6 +495,9 @@ impl HybridDecoder {
             scratch: alloc(scratch_bytes)?,
             h: alloc(d * 4)?,
             n: alloc(d * 4)?,
+            hid: alloc(d * 4)?,
+            emb: alloc(if has_mtp { d * 4 } else { 0 })?,
+            pack: alloc(if has_mtp { 2 * d * 4 } else { 0 })?,
             logits: alloc(config.vocab_size * 4)?,
         };
 
@@ -463,6 +519,7 @@ impl HybridDecoder {
             state_bytes,
             scratch_bytes,
             kv_kind,
+            mtp: has_mtp,
             mem: (backend == GpuBackend::Cuda)
                 .then(|| cuda::mem_info().ok())
                 .flatten(),
@@ -477,6 +534,7 @@ impl HybridDecoder {
                 attn,
                 gdn,
                 layers,
+                mtp,
                 out_norm,
                 out_w,
                 embd_host,
@@ -541,7 +599,7 @@ impl ModelArch for HybridDecoder {
         if logits_out.len() != tokens.len() * vocab {
             return Err(err("logits_out shape mismatch"));
         }
-        let (Some(rms_norm), Some(attention_ex), Some(linear_attn), Some(matmul)) = (
+        let (Some(rms_norm), Some(_), Some(linear_attn), Some(matmul)) = (
             self.table.rms_norm.0,
             self.table.attention_ex.0,
             self.table.linear_attn.0,
@@ -554,8 +612,8 @@ impl ModelArch for HybridDecoder {
 
         let mut h_t = f32_tensor(&st.h, d);
         let mut n_t = f32_tensor(&st.n, d);
+        let mut hid_t = f32_tensor(&st.hid, d);
         let mut logits_t = f32_tensor(&st.logits, vocab);
-        let kv_row = cfg.n_kv_heads * self.attn.head_dim as usize;
 
         let mut emb = vec![0f32; d];
         for (ti, &tok) in tokens.iter().enumerate() {
@@ -566,17 +624,7 @@ impl ModelArch for HybridDecoder {
                     self.n_ctx
                 )));
             }
-            let kctx = SpiteCtx {
-                n_ctx: self.n_ctx as c_int,
-                n_batch: 1,
-                n_threads: ctx.n_threads,
-                pos: pos as c_int,
-                n_heads: cfg.n_heads as c_int,
-                n_kv_heads: cfg.n_kv_heads as c_int,
-                gpu_stream: std::ptr::null_mut(),
-                scratchpad: st.scratch.as_ptr().cast(),
-                scratchpad_bytes: st.scratch.size,
-            };
+            let kctx = self.kctx(st, pos, ctx.n_threads);
             self.embed(tok, &mut emb)?;
             st.h.upload(f32_bytes(&emb))
                 .map_err(|e| err(e.to_string()))?;
@@ -584,47 +632,15 @@ impl ModelArch for HybridDecoder {
             for (li, layer) in self.layers.iter().enumerate() {
                 let ffn_w = match layer {
                     Layer::Attn(a) => {
-                        let kvp = &st.kv[a.kv];
-                        let mut kv = SpiteKvCache {
-                            k: kv_tensor(&kvp.k, self.kv_kind, kv_row, self.n_ctx),
-                            v: kv_tensor(&kvp.v, self.kv_kind, kv_row, self.n_ctx),
-                            layer: li as c_int,
-                        };
-                        // SAFETY: every tensor points at live memory owned by `st` / `self`;
-                        // the kernel ABI version is checked at load.
-                        unsafe {
-                            rc(
-                                rms_norm(&mut n_t, &h_t, &a.norm, cfg.norm_eps, &kctx),
-                                "rms_norm",
-                                li,
-                            )?;
-                            rc(
-                                attention_ex(
-                                    &mut h_t,
-                                    &n_t,
-                                    &a.wq,
-                                    &a.wk,
-                                    &a.wv,
-                                    &a.wo,
-                                    &a.q_norm,
-                                    &a.k_norm,
-                                    cfg.norm_eps,
-                                    &mut kv,
-                                    cfg.rope_theta,
-                                    &self.attn,
-                                    &kctx,
-                                ),
-                                "attention_ex",
-                                li,
-                            )?;
-                        }
+                        self.attn_block(st, a, li, &mut h_t, &mut n_t, &kctx)?;
                         &a.ffn
                     }
                     Layer::Gdn(g) => {
                         let gs = &st.gdn[g.st];
                         let mut conv_hist = f32_tensor(&gs.conv_hist, self.gdn.conv_hist_floats());
                         let mut state = f32_tensor(&gs.state, self.gdn.state_floats());
-                        // SAFETY: as above.
+                        // SAFETY: every tensor points at live memory owned by `st` / `self`;
+                        // the kernel ABI version is checked at load.
                         unsafe {
                             rc(
                                 rms_norm(&mut n_t, &h_t, &g.norm, cfg.norm_eps, &kctx),
@@ -656,85 +672,18 @@ impl ModelArch for HybridDecoder {
                         &g.ffn
                     }
                 };
-                match ffn_w {
-                    LayerFfn::Dense(d) => {
-                        let Some(ffn) = self.table.ffn.0 else {
-                            return Err(err("ffn op missing"));
-                        };
-                        unsafe {
-                            rc(
-                                rms_norm(&mut n_t, &h_t, &d.norm, cfg.norm_eps, &kctx),
-                                "rms_norm",
-                                li,
-                            )?;
-                            rc(
-                                ffn(
-                                    &mut h_t,
-                                    &n_t,
-                                    &d.gate,
-                                    &d.up,
-                                    &d.down,
-                                    FfnActivation::SiluGate,
-                                    &kctx,
-                                ),
-                                "ffn",
-                                li,
-                            )?;
-                        }
-                    }
-                    LayerFfn::Moe(m) => {
-                        let Some(moe_ffn) = self.table.moe_ffn.0 else {
-                            return Err(err("moe_ffn op missing"));
-                        };
-                        let p_up_sh = m
-                            .w_up_shexp
-                            .as_ref()
-                            .map_or(std::ptr::null(), |t| t as *const _);
-                        let p_gate_sh = m
-                            .w_gate_shexp
-                            .as_ref()
-                            .map_or(std::ptr::null(), |t| t as *const _);
-                        let p_down_sh = m
-                            .w_down_shexp
-                            .as_ref()
-                            .map_or(std::ptr::null(), |t| t as *const _);
-                        unsafe {
-                            rc(
-                                rms_norm(&mut n_t, &h_t, &m.norm, cfg.norm_eps, &kctx),
-                                "rms_norm",
-                                li,
-                            )?;
-                            rc(
-                                moe_ffn(
-                                    &mut h_t,
-                                    &n_t,
-                                    &m.w_gate_inp,
-                                    &m.w_up_exps,
-                                    &m.w_gate_exps,
-                                    &m.w_down_exps,
-                                    p_up_sh,
-                                    p_gate_sh,
-                                    p_down_sh,
-                                    &m.params,
-                                    &kctx,
-                                ),
-                                "moe_ffn",
-                                li,
-                            )?;
-                        }
-                    }
-                }
+                self.ffn_block(ffn_w, li, &mut h_t, &mut n_t, &kctx)?;
             }
 
             // SAFETY: as above.
             unsafe {
                 rc(
-                    rms_norm(&mut n_t, &h_t, &self.out_norm, cfg.norm_eps, &kctx),
+                    rms_norm(&mut hid_t, &h_t, &self.out_norm, cfg.norm_eps, &kctx),
                     "rms_norm",
                     cfg.n_layers,
                 )?;
                 rc(
-                    matmul(&mut logits_t, &n_t, &self.out_w, &kctx),
+                    matmul(&mut logits_t, &hid_t, &self.out_w, &kctx),
                     "matmul",
                     cfg.n_layers,
                 )?;
@@ -752,5 +701,235 @@ impl HybridDecoder {
     /// Backend this decoder's buffers live on.
     pub fn backend(&self) -> GpuBackend {
         self.backend
+    }
+
+    /// True when the NextN (MTP) draft head is loaded; see [`Self::mtp_step`].
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// One NextN (MTP) draft step, on the same backend and ops as the trunk.
+    ///
+    /// Consumes the final-normed hidden state `h_t` left by the latest
+    /// [`ModelArch::forward`] token (or the previous `mtp_step`, when chaining)
+    /// together with `token` = x_{t+1}, runs the draft block at RoPE position
+    /// `pos` = t, and writes the logits for x_{t+2}. Its own normed output
+    /// replaces `h_t`, so the next chained call takes the drafted token and
+    /// `pos + 1`.
+    ///
+    /// The draft block attends over its own KV cache, so every position up to
+    /// `pos` must have been through `mtp_step` (run it after each trunk token,
+    /// prompt included); a rejected draft is undone by re-running the trunk,
+    /// whose `forward` refreshes `h_t`, and the stale rows are overwritten.
+    pub fn mtp_step(
+        &self,
+        token: u32,
+        pos: usize,
+        logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        let Some(m) = &self.mtp else {
+            return Err(err("model has no usable NextN (MTP) head"));
+        };
+        let cfg = &self.config;
+        let (d, vocab) = (cfg.d_model, cfg.vocab_size);
+        if logits_out.len() != vocab {
+            return Err(err("logits_out shape mismatch"));
+        }
+        if pos >= self.n_ctx {
+            return Err(err(format!(
+                "position {pos} exceeds allocated context {}",
+                self.n_ctx
+            )));
+        }
+        let (Some(rms_norm), Some(matmul), Some(mtp_stem)) = (
+            self.table.rms_norm.0,
+            self.table.matmul.0,
+            self.table.mtp_stem.0,
+        ) else {
+            return Err(err("dispatch table incomplete for the MTP head"));
+        };
+        let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+        let st = &mut *guard;
+        let kctx = self.kctx(st, pos, 1);
+        let li = cfg.n_layers;
+
+        let mut emb = vec![0f32; d];
+        self.embed(token, &mut emb)?;
+        st.emb
+            .upload(f32_bytes(&emb))
+            .map_err(|e| err(e.to_string()))?;
+        let emb_t = f32_tensor(&st.emb, d);
+        let mut pack_t = f32_tensor(&st.pack, 2 * d);
+        let mut h_t = f32_tensor(&st.h, d);
+        let mut n_t = f32_tensor(&st.n, d);
+        let mut hid_t = f32_tensor(&st.hid, d);
+        let mut logits_t = f32_tensor(&st.logits, vocab);
+
+        // SAFETY: every tensor points at live memory owned by `st` / `self`.
+        unsafe {
+            rc(
+                mtp_stem(
+                    &mut pack_t,
+                    &emb_t,
+                    &hid_t,
+                    &m.enorm,
+                    &m.hnorm,
+                    cfg.norm_eps,
+                    &kctx,
+                ),
+                "mtp_stem",
+                li,
+            )?;
+            rc(matmul(&mut h_t, &pack_t, &m.eh_proj, &kctx), "matmul", li)?;
+        }
+        self.attn_block(st, &m.layer, li, &mut h_t, &mut n_t, &kctx)?;
+        self.ffn_block(&m.layer.ffn, li, &mut h_t, &mut n_t, &kctx)?;
+        // SAFETY: as above.
+        unsafe {
+            rc(
+                rms_norm(&mut hid_t, &h_t, &m.head_norm, cfg.norm_eps, &kctx),
+                "rms_norm",
+                li,
+            )?;
+            rc(matmul(&mut logits_t, &hid_t, &m.head, &kctx), "matmul", li)?;
+        }
+        st.logits
+            .download(f32_bytes_mut(logits_out))
+            .map_err(|e| err(e.to_string()))
+    }
+
+    fn kctx(&self, st: &HState, pos: usize, n_threads: c_int) -> SpiteCtx {
+        SpiteCtx {
+            n_ctx: self.n_ctx as c_int,
+            n_batch: 1,
+            n_threads,
+            pos: pos as c_int,
+            n_heads: self.config.n_heads as c_int,
+            n_kv_heads: self.config.n_kv_heads as c_int,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: st.scratch.as_ptr().cast(),
+            scratchpad_bytes: st.scratch.size,
+        }
+    }
+
+    /// `h += attention_ex(rms_norm(h))` for one gated full-attention block.
+    fn attn_block(
+        &self,
+        st: &HState,
+        a: &AttnLayer,
+        li: usize,
+        h_t: &mut SpiteTensor,
+        n_t: &mut SpiteTensor,
+        kctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let (Some(rms_norm), Some(attention_ex)) =
+            (self.table.rms_norm.0, self.table.attention_ex.0)
+        else {
+            return Err(err("dispatch table incomplete for hybrid decoder"));
+        };
+        let cfg = &self.config;
+        let kv_row = cfg.n_kv_heads * self.attn.head_dim as usize;
+        let kvp = &st.kv[a.kv];
+        let mut kv = SpiteKvCache {
+            k: kv_tensor(&kvp.k, self.kv_kind, kv_row, self.n_ctx),
+            v: kv_tensor(&kvp.v, self.kv_kind, kv_row, self.n_ctx),
+            layer: li as c_int,
+        };
+        // SAFETY: every tensor points at live memory owned by `st` / `self`;
+        // the kernel ABI version is checked at load.
+        unsafe {
+            rc(
+                rms_norm(n_t, h_t, &a.norm, cfg.norm_eps, kctx),
+                "rms_norm",
+                li,
+            )?;
+            rc(
+                attention_ex(
+                    h_t,
+                    n_t,
+                    &a.wq,
+                    &a.wk,
+                    &a.wv,
+                    &a.wo,
+                    &a.q_norm,
+                    &a.k_norm,
+                    cfg.norm_eps,
+                    &mut kv,
+                    cfg.rope_theta,
+                    &self.attn,
+                    kctx,
+                ),
+                "attention_ex",
+                li,
+            )
+        }
+    }
+
+    /// `h += ffn(rms_norm(h))`, dense SwiGLU or MoE.
+    fn ffn_block(
+        &self,
+        ffn_w: &LayerFfn,
+        li: usize,
+        h_t: &mut SpiteTensor,
+        n_t: &mut SpiteTensor,
+        kctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let Some(rms_norm) = self.table.rms_norm.0 else {
+            return Err(err("rms_norm op missing"));
+        };
+        let eps = self.config.norm_eps;
+        match ffn_w {
+            LayerFfn::Dense(d) => {
+                let Some(ffn) = self.table.ffn.0 else {
+                    return Err(err("ffn op missing"));
+                };
+                // SAFETY: as in `attn_block`.
+                unsafe {
+                    rc(rms_norm(n_t, h_t, &d.norm, eps, kctx), "rms_norm", li)?;
+                    rc(
+                        ffn(
+                            h_t,
+                            n_t,
+                            &d.gate,
+                            &d.up,
+                            &d.down,
+                            FfnActivation::SiluGate,
+                            kctx,
+                        ),
+                        "ffn",
+                        li,
+                    )
+                }
+            }
+            LayerFfn::Moe(m) => {
+                let Some(moe_ffn) = self.table.moe_ffn.0 else {
+                    return Err(err("moe_ffn op missing"));
+                };
+                let opt = |t: &Option<SpiteTensor>| {
+                    t.as_ref().map_or(std::ptr::null(), |t| t as *const _)
+                };
+                // SAFETY: as in `attn_block`.
+                unsafe {
+                    rc(rms_norm(n_t, h_t, &m.norm, eps, kctx), "rms_norm", li)?;
+                    rc(
+                        moe_ffn(
+                            h_t,
+                            n_t,
+                            &m.w_gate_inp,
+                            &m.w_up_exps,
+                            &m.w_gate_exps,
+                            &m.w_down_exps,
+                            opt(&m.w_up_shexp),
+                            opt(&m.w_gate_shexp),
+                            opt(&m.w_down_shexp),
+                            &m.params,
+                            kctx,
+                        ),
+                        "moe_ffn",
+                        li,
+                    )
+                }
+            }
+        }
     }
 }

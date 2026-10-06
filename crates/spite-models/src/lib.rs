@@ -354,8 +354,6 @@ impl Default for ArchRegistry {
                 ("magistral", |c| Box::new(mistral::Mistral4::new(c))),
                 // ── Qwen family ──────────────────────────────────────────────
                 ("qwen3", |c| Box::new(qwen::Qwen3_5::new(c))),
-                // Qwen3.8: the dense Qwen3 decoder; its NextN head is qwen::Qwen3_8Mtp.
-                ("qwen38", |c| Box::new(qwen::Qwen3_5::new(c))),
                 ("qwen4", |c| Box::new(qwen::Qwen4::new(c))),
                 ("qwen4exp", |c| Box::new(qwen::Qwen4::new(c))),
                 // ── DeepSeek family ──────────────────────────────────────────

@@ -10,7 +10,7 @@
 //!
 //! The kernel-side all-reduce is exported by the P100 card kernel as
 //! `spite_p100_enable_peer_access` / `spite_p100_allreduce_f32`
-//! (`kernels/qwen/qwen3_8/nvidia/sm_60/tesla_p100/kernel.cu`). The executor
+//! (`kernels/qwen/qwen3_5/nvidia/sm_60/tesla_p100/kernel.cu`). The executor
 //! does not call it yet: per-device weight sharding and the per-op
 //! all-reduce still have to be wired into the host.
 

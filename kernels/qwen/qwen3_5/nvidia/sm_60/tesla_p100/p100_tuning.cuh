@@ -1,5 +1,5 @@
 /*
- * kernels/qwen/qwen3_8/nvidia/sm_60/tesla_p100/p100_tuning.cuh
+ * kernels/qwen/qwen3_5/nvidia/sm_60/tesla_p100/p100_tuning.cuh
  *
  * Constants specific to the Tesla P100 card (as opposed to GP100/sm_60 in
  * general, whose tile geometry lives in ../kvflash_pascal.cuh).

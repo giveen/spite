@@ -1,0 +1,4 @@
+# Tesla P100 (sm_60): NOT YET MEASURED — no P100 has run this tree.
+# Every op resolves to kernels/qwen/qwen3_5/nvidia/ (the card .so only exports
+# NVLink helpers). Replace these lines with spite-bench output from a P100,
+# same format as ../../sm_120/rtx_5090/qwen3_5.bench, before opening a kernel PR.

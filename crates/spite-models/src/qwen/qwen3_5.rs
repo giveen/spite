@@ -16,15 +16,15 @@ use spite_loader::GgufModel;
 use crate::dense::{DenseWeights, matvec, rmsnorm};
 use crate::{ModelArch, ModelConfig, ModelError};
 
-pub(super) struct LayerState {
-    pub(super) k: VbrRows,
-    pub(super) v: VbrRows,
+struct LayerState {
+    k: VbrRows,
+    v: VbrRows,
 }
 
 /// Per-head width. Qwen3-family GGUFs store it as `attention.key_length`,
 /// which need not equal `d_model / n_heads` (e.g. 64 heads x 128 on a
 /// 5120-wide model); older files without the key fall back to the quotient.
-pub(super) fn qwen3_head_dim(cfg: &ModelConfig) -> usize {
+fn qwen3_head_dim(cfg: &ModelConfig) -> usize {
     if cfg.key_length > 0 {
         cfg.key_length
     } else {
@@ -188,7 +188,7 @@ impl ModelArch for Qwen3_5 {
 /// Attention layer: split Q/K/V, per-head QK RMSNorm, RoPE, causal GQA,
 /// output proj.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn full_attn(
+fn full_attn(
     w: &DenseWeights,
     b: &str,
     n: &[f32],

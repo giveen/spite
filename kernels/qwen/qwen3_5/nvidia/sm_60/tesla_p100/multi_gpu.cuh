@@ -1,5 +1,5 @@
 /*
- * kernels/qwen/qwen3_8/nvidia/sm_60/tesla_p100/multi_gpu.cuh
+ * kernels/qwen/qwen3_5/nvidia/sm_60/tesla_p100/multi_gpu.cuh
  *
  * NVLink tensor-parallel helpers for Tesla P100 SXM2 groups (<= 4 GPUs).
  *
@@ -29,7 +29,7 @@
 #include <cuda_runtime.h>
 #include <stddef.h>
 
-#include "kernels/qwen/qwen3_8/nvidia/sm_60/tesla_p100/p100_tuning.cuh"
+#include "kernels/qwen/qwen3_5/nvidia/sm_60/tesla_p100/p100_tuning.cuh"
 
 static __global__ void p100_vec_add_f32(float* __restrict__ dst, const float* __restrict__ src, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
