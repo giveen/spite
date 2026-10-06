@@ -79,6 +79,39 @@ quantizer — ABI-additive but cross-cutting. PXQ4 is MXFP4-compatible (32-eleme
 blocks, 4.25 bits/weight), so the format itself is simple; the work is the surface
 area. Start on the CPU codec (testable without a GPU).
 
+## Building and verifying sm_60 without a Pascal card
+
+The host toolkit here is CUDA 13.x, which dropped sm_60, but a CUDA 12.x
+container builds it and the host GPU can still *run* the result through PTX
+JIT — enough to gate **correctness** on kernel changes without a P100. (Speed
+still needs the P100s; JIT on a different arch is not a P100 measurement.)
+
+```bash
+# CUDA 12.6 has nvcc for sm_60; the host only has CUDA 13.
+docker run -d --name spite-p100 -v "$PWD":/work -w /work \
+  nvidia/cuda:12.6.3-devel-ubuntu22.04 sleep infinity
+docker exec spite-p100 bash -lc \
+  'apt-get update -qq && apt-get install -y -qq cmake python3 python3-pip && pip install -q cmake'
+
+# Build the P100 kernels; also emit PTX so the host driver can JIT them.
+docker exec spite-p100 bash -lc 'rm -rf /tmp/build && \
+  cmake -S /work -B /tmp/build -DSPITE_MODELS=qwen/qwen3_5 \
+    -DSPITE_GPU_ARCHS=TESLA_P100 -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_CUDA_FLAGS="--generate-code=arch=compute_60,code=compute_60" && \
+  cmake --build /tmp/build -j$(nproc)'
+
+# Pull the .so and a CUDA 12 libcudart out, then verify on the host GPU.
+docker cp spite-p100:/tmp/build/kernels /tmp/p100-build/kernels
+docker cp spite-p100:/usr/local/cuda/lib64/libcudart.so.12.6.77 /tmp/p100-build/lib/
+ln -sf libcudart.so.12.6.77 /tmp/p100-build/lib/libcudart.so
+LD_LIBRARY_PATH=/tmp/p100-build/lib python3 tools/verify/verify.py \
+  /tmp/p100-build/kernels/qwen/qwen3_5/nvidia/libkernel_qwen_qwen3_5_nvidia.so
+```
+
+`cuobjdump --list-elf` shows the `sm_60` cubins; `--list-ptx` shows the PTX the
+host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
+93 OK / 12 SKIP / 0 FAIL on the tester's box).
+
 ## Status
 
 - **Item (peer-capable tensor split): done.** pxa measures `-sm tensor` on a 2×
