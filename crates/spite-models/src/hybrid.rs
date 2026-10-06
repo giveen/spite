@@ -870,6 +870,31 @@ fn kv_tensor(buf: &DeviceBuffer, kind: SpiteType, row: usize, n_ctx: usize) -> S
     }
 }
 
+/// `[cols, rows]` F32 view of a device buffer (one column per token) — the
+/// batched-prefill activation shape.
+fn f32_tensor2(buf: &DeviceBuffer, cols: usize, rows: usize) -> SpiteTensor {
+    let ne = [cols as u32, rows as u32, 1, 1];
+    SpiteTensor {
+        data: buf.as_ptr().cast(),
+        ne,
+        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &ne),
+        kind: SpiteType::F32,
+    }
+}
+
+/// `[cols, 1]` F32 view of column `t` of a `[cols, m]` buffer.
+fn f32_tensor_col(buf: &DeviceBuffer, cols: usize, t: usize) -> SpiteTensor {
+    // SAFETY: the buffer holds cols*m floats and t < m.
+    let data = unsafe { buf.as_ptr().add(t * cols * 4) };
+    let ne = [cols as u32, 1, 1, 1];
+    SpiteTensor {
+        data: data.cast(),
+        ne,
+        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &ne),
+        kind: SpiteType::F32,
+    }
+}
+
 impl ModelArch for HybridDecoder {
     fn config(&self) -> &ModelConfig {
         &self.config
@@ -899,7 +924,13 @@ impl ModelArch for HybridDecoder {
         if logits_out.len() != tokens.len() * vocab {
             return Err(err("logits_out shape mismatch"));
         }
-        let (Some(rms_norm), Some(_), Some(linear_attn), Some(matmul)) = (
+        // A multi-token prompt on a batch-capable (generic) kernel goes through
+        // the layer-major batched path; decode (one token) and GPU kernels
+        // without batch support keep the per-token path.
+        if tokens.len() > 1 && self.batch_capable() {
+            return self.forward_batch(tokens, logits_out, ctx);
+        }
+        let (Some(rms_norm), Some(_), Some(_), Some(matmul)) = (
             self.table.rms_norm.0,
             self.table.attention_ex.0,
             self.table.linear_attn.0,
@@ -946,39 +977,7 @@ impl ModelArch for HybridDecoder {
                         &a.ffn
                     }
                     Layer::Gdn(g) => {
-                        let gs = &st.gdn[g.st];
-                        let mut conv_hist = f32_tensor(&gs.conv_hist, self.gdn.conv_hist_floats());
-                        let mut state = f32_tensor(&gs.state, self.gdn.state_floats());
-                        // SAFETY: every tensor points at live memory owned by `st` / `self`;
-                        // the kernel ABI version is checked at load.
-                        unsafe {
-                            rc(
-                                rms_norm(&mut n_t, &h_t, &g.norm, cfg.norm_eps, &kctx),
-                                "rms_norm",
-                                li,
-                            )?;
-                            rc(
-                                linear_attn(
-                                    &mut h_t,
-                                    &n_t,
-                                    &g.w_qkv,
-                                    &g.w_gate,
-                                    &g.w_beta,
-                                    &g.w_alpha,
-                                    &g.w_out,
-                                    &g.conv_w,
-                                    &g.ssm_dt,
-                                    &g.ssm_a,
-                                    &g.ssm_norm,
-                                    &mut conv_hist,
-                                    &mut state,
-                                    &self.gdn,
-                                    &kctx,
-                                ),
-                                "linear_attn",
-                                li,
-                            )?;
-                        }
+                        self.gdn_block(st, g, li, &mut h_t, &mut n_t, &kctx)?;
                         &g.ffn
                     }
                 };
@@ -1113,6 +1112,114 @@ impl HybridDecoder {
             .map_err(|e| err(e.to_string()))
     }
 
+    /// True when the resolved ops can take a batched `[d, m]` activation and the
+    /// decoder is on a single stage. The generic reference implements batching;
+    /// the per-card CUDA kernels do not yet, so they keep the per-token path.
+    fn batch_capable(&self) -> bool {
+        let generic = |s: &spite_dispatch::OpSource| s.gpu_arch == GENERIC;
+        self.layer_stage.iter().all(|&s| s == 0)
+            && generic(&self.table.rms_norm.1)
+            && generic(&self.table.ffn.1)
+            && generic(&self.table.matmul.1)
+            && self
+                .table
+                .attention_ex
+                .0
+                .is_none_or(|_| generic(&self.table.attention_ex.1))
+            && self
+                .table
+                .linear_attn
+                .0
+                .is_none_or(|_| generic(&self.table.linear_attn.1))
+    }
+
+    /// Layer-major batched prefill: one batched op call per layer for `m`
+    /// tokens (columns), instead of m sequential passes. The KV cache and the
+    /// GDN conv/state advance in token order, so the result matches the
+    /// per-token path. Requires [`Self::batch_capable`].
+    fn forward_batch(
+        &self,
+        tokens: &[u32],
+        logits_out: &mut [f32],
+        ctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let cfg = &self.config;
+        let (d, vocab) = (cfg.d_model, cfg.vocab_size);
+        let m = tokens.len();
+        let (Some(rms_norm), Some(matmul)) = (self.table.rms_norm.0, self.table.matmul.0) else {
+            return Err(err("dispatch table incomplete for batched prefill"));
+        };
+        let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+        let st = &mut *guard;
+        let dev = st.stages[0].device;
+
+        // Batched residual stream and norm buffer, one column per token.
+        let mut hbuf = DeviceBuffer::alloc_on(self.backend, dev, d * m * 4)
+            .map_err(|e| err(format!("alloc: {e}")))?;
+        let nbuf = DeviceBuffer::alloc_on(self.backend, dev, d * m * 4)
+            .map_err(|e| err(format!("alloc: {e}")))?;
+
+        // Token embeddings, token-major host buffer [d, m].
+        let mut host = vec![0f32; d * m];
+        for (t, &tok) in tokens.iter().enumerate() {
+            self.embed(tok, &mut host[t * d..(t + 1) * d])?;
+        }
+        hbuf.upload(f32_bytes(&host))
+            .map_err(|e| err(e.to_string()))?;
+
+        let mut h_t = f32_tensor2(&hbuf, d, m);
+        let mut n_t = f32_tensor2(&nbuf, d, m);
+        let kctx = SpiteCtx {
+            n_ctx: self.n_ctx as c_int,
+            n_batch: m as c_int,
+            n_threads: ctx.n_threads,
+            pos: ctx.pos,
+            n_heads: cfg.n_heads as c_int,
+            n_kv_heads: cfg.n_kv_heads as c_int,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: std::ptr::null_mut(),
+            scratchpad_bytes: 0,
+        };
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            let ffn_w = match layer {
+                Layer::Attn(a) => {
+                    self.attn_block(st, a, li, &mut h_t, &mut n_t, &kctx)?;
+                    &a.ffn
+                }
+                Layer::Gdn(g) => {
+                    self.gdn_block(st, g, li, &mut h_t, &mut n_t, &kctx)?;
+                    &g.ffn
+                }
+            };
+            self.ffn_block(ffn_w, li, &mut h_t, &mut n_t, &kctx)?;
+        }
+
+        // Final norm + LM head, one column at a time (logits are per token).
+        let mut hid = f32_tensor(&st.hid, d);
+        let mut logits = f32_tensor(&st.logits, vocab);
+        for t in 0..m {
+            let ht = f32_tensor_col(&hbuf, d, t);
+            // SAFETY: every tensor points at live memory owned by `st` / `self`.
+            unsafe {
+                rc(
+                    rms_norm(&mut hid, &ht, &self.out_norm, cfg.norm_eps, &kctx),
+                    "rms_norm",
+                    cfg.n_layers,
+                )?;
+                rc(
+                    matmul(&mut logits, &hid, &self.out_w, &kctx),
+                    "matmul",
+                    cfg.n_layers,
+                )?;
+            }
+            st.logits
+                .download(f32_bytes_mut(&mut logits_out[t * vocab..(t + 1) * vocab]))
+                .map_err(|e| err(e.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Stage `s`'s residual stream, norm buffer and kernel context.
     fn stage_view(
         &self,
@@ -1217,6 +1324,58 @@ impl HybridDecoder {
                     kctx,
                 ),
                 "attention_ex",
+                li,
+            )
+        }
+    }
+
+    /// `h += linear_attn(rms_norm(h))` for one Gated Delta Net block.
+    ///
+    /// `h`/`n` are `[d, 1]` for one token or `[d, m]` for a batch of columns;
+    /// the conv history and delta-rule state carry across the columns in order.
+    fn gdn_block(
+        &self,
+        st: &HState,
+        g: &GdnLayer,
+        li: usize,
+        h_t: &mut SpiteTensor,
+        n_t: &mut SpiteTensor,
+        kctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let (Some(rms_norm), Some(linear_attn)) = (self.table.rms_norm.0, self.table.linear_attn.0)
+        else {
+            return Err(err("dispatch table incomplete for hybrid decoder"));
+        };
+        let gs = &st.gdn[g.st];
+        let mut conv_hist = f32_tensor(&gs.conv_hist, self.gdn.conv_hist_floats());
+        let mut state = f32_tensor(&gs.state, self.gdn.state_floats());
+        // SAFETY: every tensor points at live memory owned by `st` / `self`;
+        // the kernel ABI version is checked at load.
+        unsafe {
+            rc(
+                rms_norm(n_t, h_t, &g.norm, self.config.norm_eps, kctx),
+                "rms_norm",
+                li,
+            )?;
+            rc(
+                linear_attn(
+                    h_t,
+                    n_t,
+                    &g.w_qkv,
+                    &g.w_gate,
+                    &g.w_beta,
+                    &g.w_alpha,
+                    &g.w_out,
+                    &g.conv_w,
+                    &g.ssm_dt,
+                    &g.ssm_a,
+                    &g.ssm_norm,
+                    &mut conv_hist,
+                    &mut state,
+                    &self.gdn,
+                    kctx,
+                ),
+                "linear_attn",
                 li,
             )
         }

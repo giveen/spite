@@ -239,3 +239,33 @@ fn layer_split_rejects_bad_shares() {
     }
     let _ = std::fs::remove_dir_all(kdir);
 }
+
+/// The layer-major batched prefill path (one op call per layer for the whole
+/// prompt) must produce the same logits as feeding the prompt one token at a
+/// time. Runs on the generic reference, which is the only batch-capable kernel.
+#[test]
+fn batched_prefill_matches_sequential() {
+    let (model, vocab, kdir) = load("tiny-qwen35-f16.gguf", "batch");
+    let tokens = [1u32, 2, 3, 4, 5];
+
+    model.reset_cache();
+    let mut batched = vec![0f32; tokens.len() * vocab];
+    model
+        .forward(&tokens, &mut batched, &ctx(0))
+        .expect("batched forward");
+
+    model.reset_cache();
+    let mut seq = Vec::with_capacity(tokens.len() * vocab);
+    for (i, &t) in tokens.iter().enumerate() {
+        let mut l = vec![0f32; vocab];
+        model.forward(&[t], &mut l, &ctx(i)).expect("forward");
+        seq.extend_from_slice(&l);
+    }
+
+    let d = batched
+        .iter()
+        .zip(&seq)
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(d < 1e-6, "batched vs sequential logits differ by {d:e}");
+    let _ = std::fs::remove_dir_all(kdir);
+}
