@@ -1,1 +1,2 @@
-/mnt/storage/models/uncensored/qwen3.8/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf [cuda (sm_120)]       42.8 tok/s  TTFT   139.1 ms  mem  19098 MiB  (n=3)
+/mnt/storage/models/uncensored/qwen3.8/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-Q5_K_P.gguf [cuda (sm_120)]       43.4 tok/s  prefill     50.5 tok/s  TTFT   138.6 ms  mem  19098 MiB  (n=3)
+/mnt/storage/models/qwen3.6/35B/Kwaipilot_KAT-Coder-V2.5-Dev-Q5_K_S.gguf [cuda (sm_120)]                          87.0 tok/s  prefill    146.7 tok/s  TTFT    47.7 ms  mem  23089 MiB  (n=3)
