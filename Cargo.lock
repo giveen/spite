@@ -1459,6 +1459,7 @@ dependencies = [
  "anyhow",
  "clap",
  "spite-abi",
+ "spite-compute",
  "spite-loader",
  "thiserror",
 ]

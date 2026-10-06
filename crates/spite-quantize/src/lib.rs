@@ -12,6 +12,8 @@
 //!   Q5KM   — 5-bit K-quants mixed
 //!   Q6K    — 6-bit K-quants, near-lossless
 
+pub mod gguf_write;
+pub mod mxfp4;
 pub mod q4k;
 pub mod q8_0;
 
@@ -38,6 +40,8 @@ pub enum QuantType {
     Q4KS,
     Q5KM,
     Q6K,
+    /// PXA's PXQ4 tier: MXFP4 (32-element blocks, E8M0 scale, e2m1 codes).
+    MXFP4,
 }
 
 impl QuantType {
@@ -49,6 +53,7 @@ impl QuantType {
             Self::Q4KS => "Q4_K_S",
             Self::Q5KM => "Q5_K_M",
             Self::Q6K => "Q6_K",
+            Self::MXFP4 => "MXFP4",
         }
     }
 
@@ -61,6 +66,7 @@ impl QuantType {
             Self::Q4KS => 4.58,
             Self::Q5KM => 5.68,
             Self::Q6K => 6.57,
+            Self::MXFP4 => 4.25,
         }
     }
 }
@@ -102,6 +108,10 @@ pub fn quantize_f32(
             q4k::quantize_q4k(src, dst, n_elem);
             Ok(())
         }
+        QuantType::MXFP4 => {
+            mxfp4::quantize(src, dst, n_elem);
+            Ok(())
+        }
         _ => Err(QuantizeError::UnsupportedSource(format!(
             "{} not yet implemented",
             kind.name()
@@ -109,22 +119,90 @@ pub fn quantize_f32(
     }
 }
 
-/// Read `src_path` (F32 GGUF), quantize tensors per `cfg`, write `dst_path`.
+/// Read `src_path` (any supported GGUF), quantize tensors per `cfg`, write
+/// `dst_path` as a new GGUF v3 file (metadata carried over verbatim).
+///
+/// Tensors whose name matches a `keep_f32` prefix are written as F32; the rest
+/// are dequantized to F32 and requantized to `cfg.target`.
 pub fn quantize_model(
-    _src_path: &Path,
-    _dst_path: &Path,
-    _cfg: &QuantizeConfig,
+    src_path: &Path,
+    dst_path: &Path,
+    cfg: &QuantizeConfig,
 ) -> Result<(), QuantizeError> {
-    // TODO:
-    // 1. Open src GGUF with spite-loader
-    // 2. Write GGUF header + all metadata verbatim
-    // 3. For each tensor:
-    //    - if name matches keep_f32 prefix → copy as F32
-    //    - else: dequant to F32 if needed → quantize_f32(data, buf, cfg.target)
-    // 4. Write tensor index + data section
-    Err(QuantizeError::Gguf(
-        "quantize_model not yet implemented".into(),
-    ))
+    let model =
+        spite_loader::GgufModel::open(src_path).map_err(|e| QuantizeError::Gguf(e.to_string()))?;
+
+    let mut names: Vec<String> = model.tensor_names().map(str::to_owned).collect();
+    names.sort(); // deterministic output
+
+    let mut outs: Vec<gguf_write::OutTensor> = Vec::with_capacity(names.len());
+    for name in &names {
+        let t = model.tensor(name);
+        let n: usize = t.ne.iter().map(|&x| x.max(1) as usize).product();
+        let blk = t.kind.block_elements() as usize;
+        if !n.is_multiple_of(blk) {
+            return Err(QuantizeError::TensorError {
+                tensor: name.clone(),
+                msg: format!("{n} elements is not a multiple of the {blk}-element block"),
+            });
+        }
+        let nbytes = n / blk * t.kind.block_bytes() as usize;
+        // SAFETY: `t.data` points at `nbytes` of the loader's mmap.
+        let src = unsafe { std::slice::from_raw_parts(t.data as *const u8, nbytes) };
+        let mut f32buf = vec![0f32; n];
+        spite_compute::dequant::dequant_to_f32(src, t.kind, n, &mut f32buf).map_err(|e| {
+            QuantizeError::TensorError {
+                tensor: name.clone(),
+                msg: e.to_string(),
+            }
+        })?;
+
+        let keep = cfg.keep_f32.iter().any(|p| name.starts_with(p.as_str()))
+            // 1-D tensors are parameters the ops read as F32 (GDN dt/a/norm,
+            // conv weights, RMS norm weights) and cannot be block-quantized;
+            // a 2-D weight whose row length is not a multiple of the block is
+            // equally unquantizable.
+            || model.tensor_rank(name) < 2
+            || !(t.ne[0] as usize).is_multiple_of(target_type(cfg.target).block_elements() as usize);
+        let (kind, bytes) = if keep {
+            (spite_abi::SpiteType::F32, f32_to_bytes(&f32buf))
+        } else {
+            let mut b = vec![0u8; block_bytes(cfg.target, n)];
+            quantize_f32(&f32buf, &mut b, cfg.target, n)?;
+            (target_type(cfg.target), b)
+        };
+        outs.push(gguf_write::OutTensor {
+            name: name.clone(),
+            ne: t.ne,
+            ndim: model.tensor_rank(name).max(1),
+            type_id: kind as u32,
+            bytes,
+        });
+    }
+
+    gguf_write::write(dst_path, &model.meta, &outs)?;
+    Ok(())
+}
+
+fn f32_to_bytes(v: &[f32]) -> Vec<u8> {
+    let mut b = vec![0u8; v.len() * 4];
+    for (i, x) in v.iter().enumerate() {
+        b[i * 4..i * 4 + 4].copy_from_slice(&x.to_le_bytes());
+    }
+    b
+}
+
+/// The SpiteType (== GGUF type id) a `QuantType` writes.
+fn target_type(q: QuantType) -> spite_abi::SpiteType {
+    use spite_abi::SpiteType as T;
+    match q {
+        QuantType::Q8_0 => T::Q8_0,
+        QuantType::Q4_0 => T::Q4_0,
+        QuantType::Q4KM | QuantType::Q4KS => T::Q4K,
+        QuantType::Q5KM => T::Q5K,
+        QuantType::Q6K => T::Q6K,
+        QuantType::MXFP4 => T::Mxfp4,
+    }
 }
 
 /// Required output buffer size in bytes for `n_elem` elements of `kind`.
@@ -135,6 +213,7 @@ pub fn block_bytes(kind: QuantType, n_elem: usize) -> usize {
         QuantType::Q4KM | QuantType::Q4KS => (256, 144), // 2+2+12+128 bytes
         QuantType::Q5KM => (256, 176),
         QuantType::Q6K => (256, 210),
+        QuantType::MXFP4 => (32, 17), // PXA PXQ4
     };
     let n_blocks = n_elem.div_ceil(block_elems);
     n_blocks * block_bytes

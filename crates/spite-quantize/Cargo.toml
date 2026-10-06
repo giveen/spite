@@ -12,8 +12,9 @@ name = "spite-quantize"
 path = "src/main.rs"
 
 [dependencies]
-spite-abi    = { workspace = true }
-spite-loader = { workspace = true }
-thiserror    = { workspace = true }
-anyhow       = { workspace = true }
-clap         = { workspace = true }
+spite-abi     = { workspace = true }
+spite-loader  = { workspace = true }
+spite-compute = { workspace = true }
+thiserror     = { workspace = true }
+anyhow        = { workspace = true }
+clap          = { workspace = true }
