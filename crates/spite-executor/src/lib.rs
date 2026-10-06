@@ -134,6 +134,22 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// Default sampler settings for [`Executor::generate`].
+///
+/// A mild repetition penalty keeps small models from looping under top-p, but
+/// it must be **off** for greedy decoding (`temperature == 0`): greedy is
+/// defined as the raw argmax of the logits, and a penalty scaled per occurrence
+/// can promote a different token, so "greedy" output stops matching
+/// llama.cpp's greedy decode.
+pub fn default_sampler_config(temperature: f32) -> spite_sampling::SamplerConfig {
+    spite_sampling::SamplerConfig {
+        temperature,
+        // 1.0 = disabled.
+        repetition_penalty: if temperature > 0.0 { 1.1 } else { 1.0 },
+        ..Default::default()
+    }
+}
+
 /// Owns the model, dispatch table, KV cache, and GPU activation buffers.
 ///
 /// One `Executor` per loaded model; share it across requests using
@@ -245,7 +261,7 @@ impl Executor {
         temperature: f32,
         seed: u64,
     ) -> Result<Vec<(u32, String)>, ExecutorError> {
-        use spite_sampling::{SamplerConfig, sample};
+        use spite_sampling::sample;
 
         let eos = tokenizer.eos_id();
         let mut ids = prompt_ids.to_vec();
@@ -260,15 +276,7 @@ impl Executor {
             scratchpad: std::ptr::null_mut(),
             scratchpad_bytes: 0,
         };
-        let sampler_cfg = SamplerConfig {
-            temperature,
-            // Base 8B models fall into verbatim repetition loops under plain
-            // top-p sampling; a mild penalty keeps generations moving without
-            // distorting the distribution. Callers wanting the raw library
-            // default can still override it.
-            repetition_penalty: 1.1,
-            ..Default::default()
-        };
+        let sampler_cfg = default_sampler_config(temperature);
         let mut rng = seed;
         let mut out = Vec::new();
 
@@ -402,5 +410,37 @@ impl Engine {
     /// Resolve the KV cache that best matches `key`.
     pub fn cache(&self, key: &PluginKey) -> Option<&dyn Cache> {
         self.registries.caches.resolve(key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use spite_sampling::sample;
+
+    #[test]
+    fn greedy_disables_the_repetition_penalty() {
+        assert_eq!(default_sampler_config(0.0).repetition_penalty, 1.0);
+        assert_eq!(default_sampler_config(1.0).repetition_penalty, 1.1);
+    }
+
+    /// Regression: a per-occurrence penalty used to run even at temperature 0,
+    /// so a repeated token (2.0) could lose to a lower one (1.95) — i.e. greedy
+    /// was not the argmax.
+    #[test]
+    fn greedy_is_the_raw_argmax() {
+        let mut rng = 0x1234_5678;
+        let logits = [0.0f32, 2.0, 1.95];
+
+        let mut a = logits;
+        assert_eq!(
+            sample(&mut a, &[1], &default_sampler_config(0.0), &mut rng).unwrap(),
+            1
+        );
+
+        let mut penalized = default_sampler_config(0.0);
+        penalized.repetition_penalty = 1.1;
+        let mut b = logits;
+        assert_eq!(sample(&mut b, &[1], &penalized, &mut rng).unwrap(), 2);
     }
 }
