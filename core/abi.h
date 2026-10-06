@@ -21,24 +21,49 @@
 #  define SPITE_NODISCARD
 #endif
 
-#define SPITE_ABI_VERSION 4
+#define SPITE_ABI_VERSION 7
 
 /* ── Quant type tag ───────────────────────────────────────────────────── */
 
+/*
+ * Values are the GGUF / ggml tensor type ids, so the loader hands the file's
+ * type id straight through and block layouts match ggml-common.h exactly
+ * (vendored as core/ggml-common.h). ABI v6: ids changed from the earlier ad-hoc
+ * numbering (Q4_0=10, Q4_K=12 meant a different type in a GGUF file).
+ */
 typedef enum {
-    SPITE_TYPE_F32   = 0,
-    SPITE_TYPE_F16   = 1,
-    SPITE_TYPE_BF16  = 2,
-    SPITE_TYPE_Q8_0  = 8,
-    SPITE_TYPE_Q5_1  = 11,
-    SPITE_TYPE_Q4_0  = 10,
-    SPITE_TYPE_Q4_K  = 12,
-    SPITE_TYPE_Q5_K  = 13,
-    SPITE_TYPE_Q6_K  = 14,
+    SPITE_TYPE_F32      = 0,
+    SPITE_TYPE_F16      = 1,
+    SPITE_TYPE_Q4_0     = 2,
+    SPITE_TYPE_Q4_1     = 3,
+    SPITE_TYPE_Q5_0     = 6,
+    SPITE_TYPE_Q5_1     = 7,
+    SPITE_TYPE_Q8_0     = 8,
+    SPITE_TYPE_Q2_K     = 10,
+    SPITE_TYPE_Q3_K     = 11,
+    SPITE_TYPE_Q4_K     = 12,
+    SPITE_TYPE_Q5_K     = 13,
+    SPITE_TYPE_Q6_K     = 14,
+    SPITE_TYPE_IQ2_XXS  = 16,
+    SPITE_TYPE_IQ2_XS   = 17,
+    SPITE_TYPE_IQ3_XXS  = 18,
+    SPITE_TYPE_IQ1_S    = 19,
+    SPITE_TYPE_IQ4_NL   = 20,
+    SPITE_TYPE_IQ3_S    = 21,
+    SPITE_TYPE_IQ2_S    = 22,
+    SPITE_TYPE_IQ4_XS   = 23,
+    SPITE_TYPE_IQ1_M    = 29,
+    SPITE_TYPE_BF16     = 30,
+    SPITE_TYPE_TQ1_0    = 34,
+    SPITE_TYPE_TQ2_0    = 35,
+    SPITE_TYPE_MXFP4    = 39,
+    SPITE_TYPE_NVFP4    = 40,
+    SPITE_TYPE_Q1_0     = 41,
+    SPITE_TYPE_Q2_0     = 42,
 } SpiteType;
 
 /*
- * Byte size of the atomic storage unit for each type.
+ * Byte size of the atomic storage unit for each type (0 = unknown type).
  *
  * For full-precision types this is bytes-per-element.
  * For block-quantised types this is bytes-per-block; the number of
@@ -48,29 +73,70 @@ typedef enum {
  */
 static inline uint64_t spite_type_block_bytes(SpiteType t) {
     switch (t) {
-        case SPITE_TYPE_F32:  return 4;
-        case SPITE_TYPE_F16:  return 2;
+        case SPITE_TYPE_F32: return 4;
+        case SPITE_TYPE_F16: return 2;
+        case SPITE_TYPE_Q4_0: return 18;
+        case SPITE_TYPE_Q4_1: return 20;
+        case SPITE_TYPE_Q5_0: return 22;
+        case SPITE_TYPE_Q5_1: return 24;
+        case SPITE_TYPE_Q8_0: return 34;
+        case SPITE_TYPE_Q2_K: return 84;
+        case SPITE_TYPE_Q3_K: return 110;
+        case SPITE_TYPE_Q4_K: return 144;
+        case SPITE_TYPE_Q5_K: return 176;
+        case SPITE_TYPE_Q6_K: return 210;
+        case SPITE_TYPE_IQ2_XXS: return 66;
+        case SPITE_TYPE_IQ2_XS: return 74;
+        case SPITE_TYPE_IQ3_XXS: return 98;
+        case SPITE_TYPE_IQ1_S: return 50;
+        case SPITE_TYPE_IQ4_NL: return 18;
+        case SPITE_TYPE_IQ3_S: return 110;
+        case SPITE_TYPE_IQ2_S: return 82;
+        case SPITE_TYPE_IQ4_XS: return 136;
+        case SPITE_TYPE_IQ1_M: return 56;
         case SPITE_TYPE_BF16: return 2;
-        case SPITE_TYPE_Q8_0: return 34;   /* 32-elem block: f16 scale + 32×i8 */
-        case SPITE_TYPE_Q5_1: return 24;   /* 32-elem block: f16 d + f16 m + u32 qh + 16×u8 */
-        case SPITE_TYPE_Q4_0: return 18;   /* 32-elem block: f16 scale + 16×u8 */
-        case SPITE_TYPE_Q4_K: return 144;  /* 256-elem super-block */
-        case SPITE_TYPE_Q5_K: return 176;  /* 256-elem super-block */
-        case SPITE_TYPE_Q6_K: return 210;  /* 256-elem super-block */
-        default:              return 0;
+        case SPITE_TYPE_TQ1_0: return 54;
+        case SPITE_TYPE_TQ2_0: return 66;
+        case SPITE_TYPE_MXFP4: return 17;
+        case SPITE_TYPE_NVFP4: return 36;
+        case SPITE_TYPE_Q1_0: return 18;
+        case SPITE_TYPE_Q2_0: return 18;
+        default: return 0;
     }
 }
 
-/* Elements per atomic storage block (1 for full-precision types). */
+/* Elements per atomic storage block (1 for full-precision types, 0 = unknown). */
 static inline uint32_t spite_type_block_elements(SpiteType t) {
     switch (t) {
-        case SPITE_TYPE_Q8_0:
-        case SPITE_TYPE_Q5_1:
+        case SPITE_TYPE_F32: return 1;
+        case SPITE_TYPE_F16: return 1;
         case SPITE_TYPE_Q4_0: return 32;
-        case SPITE_TYPE_Q4_K:
-        case SPITE_TYPE_Q5_K:
+        case SPITE_TYPE_Q4_1: return 32;
+        case SPITE_TYPE_Q5_0: return 32;
+        case SPITE_TYPE_Q5_1: return 32;
+        case SPITE_TYPE_Q8_0: return 32;
+        case SPITE_TYPE_Q2_K: return 256;
+        case SPITE_TYPE_Q3_K: return 256;
+        case SPITE_TYPE_Q4_K: return 256;
+        case SPITE_TYPE_Q5_K: return 256;
         case SPITE_TYPE_Q6_K: return 256;
-        default:              return 1;
+        case SPITE_TYPE_IQ2_XXS: return 256;
+        case SPITE_TYPE_IQ2_XS: return 256;
+        case SPITE_TYPE_IQ3_XXS: return 256;
+        case SPITE_TYPE_IQ1_S: return 256;
+        case SPITE_TYPE_IQ4_NL: return 32;
+        case SPITE_TYPE_IQ3_S: return 256;
+        case SPITE_TYPE_IQ2_S: return 256;
+        case SPITE_TYPE_IQ4_XS: return 256;
+        case SPITE_TYPE_IQ1_M: return 256;
+        case SPITE_TYPE_BF16: return 1;
+        case SPITE_TYPE_TQ1_0: return 256;
+        case SPITE_TYPE_TQ2_0: return 256;
+        case SPITE_TYPE_MXFP4: return 32;
+        case SPITE_TYPE_NVFP4: return 64;
+        case SPITE_TYPE_Q1_0: return 128;
+        case SPITE_TYPE_Q2_0: return 64;
+        default: return 0;
     }
 }
 
@@ -275,6 +341,116 @@ typedef struct {
     /* Future capability flags live here — add fields, bump ABI_VERSION. */
 } SpiteModelCaps;
 
+/* ── Extended attention (ABI v7) ──────────────────────────────────────── */
+
+/*
+ * Attention variant used by hybrid Qwen3.5-style full-attention layers.
+ *   head_dim  per-head width (no longer derivable from wq when the Q
+ *             projection is gated)
+ *   rope_dim  only the first rope_dim dims of every q/k head are rotated
+ *             (NEOX pairing i <-> i+rope_dim/2, freq_i = base^(-2i/rope_dim));
+ *             rope_dim == head_dim reproduces plain attention
+ *   gated_q   0: wq has n_heads*head_dim rows.
+ *             1: wq has 2*n_heads*head_dim rows laid out per head as
+ *                [q(head_dim) | gate(head_dim)]; after attention each head's
+ *                output is multiplied by sigmoid(gate) before wo.
+ * Everything else is exactly SpiteAttentionFn (norms, KV cache, ctx->pos,
+ * out += wo . attn). Return 0 / -1 (unsupported geometry or type) / -2 (scratch).
+ *
+ * Scratch (ctx->scratchpad, floats): spite_attn_ex_scratch_floats().
+ */
+typedef struct {
+    int32_t head_dim;
+    int32_t rope_dim;
+    int32_t gated_q;
+} SpiteAttnParams;
+
+static inline uint64_t spite_attn_ex_scratch_floats(const SpiteAttnParams* p, int n_heads,
+                                                    int n_kv_heads, int n_ctx) {
+    /* q+gate(2) + att + k + vtmp + per-head score workspace */
+    return (uint64_t)3 * n_heads * p->head_dim + 2ull * n_kv_heads * p->head_dim +
+           (uint64_t)n_heads * n_ctx;
+}
+
+typedef int (*SpiteAttentionExFn)(
+    SpiteTensor*          out,
+    const SpiteTensor*    x,
+    const SpiteTensor*    wq,
+    const SpiteTensor*    wk,
+    const SpiteTensor*    wv,
+    const SpiteTensor*    wo,
+    const SpiteTensor*    q_norm,
+    const SpiteTensor*    k_norm,
+    float                 norm_eps,
+    SpiteKvCache*         kvcache,
+    float                 rope_freq_base,
+    const SpiteAttnParams* params,
+    const SpiteCtx*       ctx
+);
+
+/* ── Linear attention: Gated Delta Net layer (ABI v7) ─────────────────── */
+
+/*
+ *   n_kh      key/query heads;  n_vh value heads (n_vh % n_kh == 0)
+ *   head_dim  S: key, query and value head width (state is S x S per value head)
+ *   d_conv    K: depthwise conv taps (history holds K-1 previous inputs)
+ *   norm_eps  epsilon of the q/k L2 normalisation and of the gated RMS norm
+ */
+typedef struct {
+    int32_t n_kh;
+    int32_t n_vh;
+    int32_t head_dim;
+    int32_t d_conv;
+    float   norm_eps;
+} SpiteGdnParams;
+
+/* Scratch floats the layer op needs in ctx->scratchpad: qkv | z | core | beta | alpha. */
+static inline uint64_t spite_gdn_scratch_floats(const SpiteGdnParams* p) {
+    const uint64_t V = (uint64_t)p->n_vh * p->head_dim;
+    return 2ull * p->n_kh * p->head_dim + V /*qkv*/ + V /*z*/ + V /*core*/ + 2ull * p->n_vh;
+}
+
+/*
+ * One decode token of a complete GDN layer: out += W_out . gated_norm(core(x)).
+ * `x` is the already RMS-normalised layer input [d_model] (F32). Weights w_*
+ * may be any SpiteType (GGUF [cols=d_model, rows] layout); the small vectors
+ * are F32. All state is caller-owned device memory, updated in place.
+ *
+ *   qkv[C]   = w_qkv . x                  C = 2*n_kh*S + n_vh*S   (q | k | v)
+ *   z[V]     = w_gate . x                 V = n_vh*S
+ *   beta[h]  = sigmoid(w_beta . x)        alpha[h] = w_alpha . x      h < n_vh
+ *   g[h]     = softplus(alpha[h] + ssm_dt[h]) * ssm_a[h]
+ *   conv_w   [K, C] ggml layout, ne[0]=K: tap k of channel c at conv_w[c*K + k];
+ *            conv[c] = sum_{k<K-1} hist[k][c]*w[c][k] + qkv[c]*w[c][K-1]
+ *            (hist oldest first), then SiLU.  hist <- shift, append qkv.
+ *   conv_hist storage is private to the kernel, (K-1)*C floats, zero-initialised.
+ *   per value head vh (kh = vh % n_kh):
+ *     q,k = l2norm(conv q[kh]), l2norm(conv k[kh]);  l2norm(x) =
+ *           x / sqrt(mean(x^2) + eps/S) / sqrt(S);  q *= 1/sqrt(S)
+ *     M *= exp(g); d = (v - M^T k) * beta; M += k (x) d; o = M^T q
+ *   y[vh*S + s] = rms_norm(o[vh], ssm_norm[S], eps)[s] * silu(z[vh*S + s])
+ *   out += w_out . y
+ * state: [n_vh, S, S] F32, M[r][s] row-major, zero-initialised by the host.
+ * Return 0 / -1 (unsupported geometry or weight type) / -2 (scratch too small).
+ */
+typedef int (*SpiteGdnFn)(
+    SpiteTensor*          out,
+    const SpiteTensor*    x,
+    const SpiteTensor*    w_qkv,
+    const SpiteTensor*    w_gate,
+    const SpiteTensor*    w_beta,
+    const SpiteTensor*    w_alpha,
+    const SpiteTensor*    w_out,
+    const SpiteTensor*    conv_w,
+    const SpiteTensor*    ssm_dt,
+    const SpiteTensor*    ssm_a,
+    const SpiteTensor*    ssm_norm,
+    SpiteTensor*          conv_hist,
+    SpiteTensor*          state,
+    const SpiteGdnParams* params,
+    const SpiteCtx*       ctx
+);
+
 /* ── Kernel descriptor ────────────────────────────────────────────────── */
 
 /*
@@ -307,6 +483,10 @@ typedef struct {
     SpiteMatmulFn    matmul;
     /* KV-cache tiers this attention op accepts; NULL = F32 only. */
     SpiteKvCacheKindsFn kv_cache_kinds;
+    /* Gated-delta-net layer (hybrid archs). ABI v7 (layer-level; v5/v6 had a core-only op). */
+    SpiteGdnFn       linear_attn;
+    /* Extended attention: partial RoPE + gated Q. ABI v7. */
+    SpiteAttentionExFn attention_ex;
 } SpiteKernelInfo;
 
 /* Every kernel .so must export this symbol. */

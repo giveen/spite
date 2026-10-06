@@ -6,8 +6,9 @@
  *
  * Inputs:
  *   - Activation tensors (x, out) are always F32.
- *   - Weight tensors may be F32, Q8_0, or Q4_K; ops dequantize on-the-fly.
- *   - For other quant types the op returns -1 (dispatcher uses Rust fallback).
+ *   - Weight tensors may be any type spite_dequantize_row() supports (all GGUF
+ *     quant types, F32/F16/BF16); ops dequantize on-the-fly.
+ *   - Unsupported types make the op return -1 (dispatcher uses Rust fallback).
  *
  * Performance: intentionally ignored. One malloc per op call.
  */
@@ -18,10 +19,7 @@
 #include <math.h>
 #include "../../../core/abi.h"
 #include "../../../core/quant.h"
-
-/* forward-declare dequant functions from dequant.c */
-void dequant_q8_0(float *out, const block_q8_0 *blocks, int n);
-void dequant_q4_K(float *out, const block_q4_K *blocks, int n);
+#include "ref_common.h"
 
 /* ── Tensor helpers ───────────────────────────────────────────────────── */
 
@@ -43,27 +41,11 @@ static float *dequant_to_f32(const SpiteTensor *t) {
     float *buf = (float *)malloc((size_t)n * sizeof(float));
     if (!buf) return NULL;
 
-    switch (t->kind) {
-    case SPITE_TYPE_F32:
-        memcpy(buf, t->data, (size_t)n * sizeof(float));
-        return buf;
-
-    case SPITE_TYPE_Q8_0: {
-        int n_blocks = (n + QK8_0 - 1) / QK8_0;
-        dequant_q8_0(buf, (const block_q8_0 *)t->data, n_blocks);
-        return buf;
-    }
-
-    case SPITE_TYPE_Q4_K: {
-        int n_blocks = (n + QK_K - 1) / QK_K;
-        dequant_q4_K(buf, (const block_q4_K *)t->data, n_blocks);
-        return buf;
-    }
-
-    default:
+    if (spite_dequantize_row((SpiteType)t->kind, t->data, buf, n) != 0) {
         free(buf);
-        return NULL; /* unsupported — caller returns -1 */
+        return NULL; /* unsupported type or ragged length — caller returns -1 */
     }
+    return buf;
 }
 
 /* ── RMS Norm ─────────────────────────────────────────────────────────── */
@@ -191,17 +173,24 @@ int spite_generic_ffn(
 /* ── Attention ────────────────────────────────────────────────────────── */
 
 /*
- * Reference implementation of the ABI v4 attention op for one token at
- * ctx->pos. It mirrors kernels/qwen/qwen3/nvidia/kv_attn.inl step for step,
- * which is what makes it usable as the numeric oracle for GPU attention in
- * tools/verify/verify.py:
+ * Reference implementation of the attention ops for one token at ctx->pos.
+ * spite_generic_attention_ex is the general op (ABI v7); the ABI v4
+ * spite_generic_attention is exactly attention_ex with gated_q = 0 and
+ * rope_dim = head_dim.  It mirrors kernels/qwen/qwen3/nvidia/kv_attn.inl step
+ * for step, which is what makes it usable as the numeric oracle for GPU
+ * attention in tools/verify/verify.py:
  *
- *   q = Wq·x                         k = Wk·x      v = Wv·x
- *   q = RoPE(NEOX, pos)( RMSNorm_hd(q) * q_norm )   when q_norm != NULL
- *   k = RoPE(NEOX, pos)( RMSNorm_hd(k) * k_norm )   when k_norm != NULL
+ *   qfull = Wq·x                     k = Wk·x      v = Wv·x
+ *   per head h: q_h = qfull[h*qs .. +hd], gate_h = qfull[h*qs+hd .. +hd]
+ *               (qs = hd, or 2*hd when gated_q: INTERLEAVED per head)
+ *   q_h = RoPE_rd(NEOX, pos)( RMSNorm_hd(q_h) * q_norm )   when q_norm != NULL
+ *   k_h = RoPE_rd(NEOX, pos)( RMSNorm_hd(k_h) * k_norm )   when k_norm != NULL
+ *       RoPE rotates only the first rope_dim dims of a head, pairs (i, i+rope_dim/2),
+ *       theta_i = pos * base^(-2i/rope_dim); the other dims pass through unrotated
  *   K[pos] = k,  V[pos] = v
  *   scores[h,t] = (q_h · K[t][h/group]) / sqrt(hd)   for t in [0, pos]
  *   att[h,:]    = softmax_t scores[h,:] · V[t][h/group]
+ *   att[h,:]   *= sigmoid(gate_h)                    when gated_q
  *   out += Wo·att                                    (residual fused)
  *
  * Deviation from the GPU path, deliberate and load-bearing: the KV cache is
@@ -210,14 +199,20 @@ int spite_generic_ffn(
  * block-quantised tiers belong to the GPU kernels; their layout is pinned
  * separately by crates/spite-kvcache/tests/portable_codec_parity.rs.
  *
- * Also deliberately independent of ctx->scratchpad: this runs on the CPU
- * reference path and under verify.py, where ctx carries no device scratchpad.
+ * Weights are streamed through ref_gemv() (any SpiteType, float accumulation in
+ * column order — the arithmetic of the original attention op, bit for bit).
+ * The work area is ctx->scratchpad when the host provides one, else malloc;
+ * under verify.py the reference runs with none.
  */
 
-/* dst and src may alias. NEOX RoPE: pairs (i, i + hd/2), as in GGUF/llama.cpp. */
-static void qk_norm_rope(float *dst, const float *src, const float *norm_w,
-                         float eps, int hd, int pos, float theta) {
-    const int half = hd / 2;
+/*
+ * dst and src may alias. Per-head RMSNorm over all hd dims, then NEOX RoPE on
+ * the first rope_dim of them (pairs (i, i + rope_dim/2), as in GGUF/llama.cpp);
+ * dims [rope_dim, hd) are normed but not rotated.
+ */
+static void qk_norm_rope(float *dst, const float *src, const float *norm_w, float eps, int hd,
+                         int rope_dim, int pos, float theta) {
+    const int half = rope_dim / 2;
     float scale = 1.0f;
     if (norm_w) {
         float sum_sq = 0.0f;
@@ -231,78 +226,107 @@ static void qk_norm_rope(float *dst, const float *src, const float *norm_w,
             x0 *= norm_w[i];
             x1 *= norm_w[i + half];
         }
-        const float freq = powf(theta, -2.0f * (float)i / (float)hd);
+        const float freq = powf(theta, -2.0f * (float)i / (float)rope_dim);
         const float angle = (float)pos * freq;
         const float sn = sinf(angle);
         const float cs = cosf(angle);
         dst[i]        = x0 * cs - x1 * sn;
         dst[i + half] = x0 * sn + x1 * cs;
     }
+    for (int i = rope_dim; i < hd; i++) {
+        float v = src[i] * scale;
+        if (norm_w) v *= norm_w[i];
+        dst[i] = v;
+    }
 }
 
-int spite_generic_attention(
-    SpiteTensor       *out,
-    const SpiteTensor *x,
-    const SpiteTensor *wq,
-    const SpiteTensor *wk,
-    const SpiteTensor *wv,
-    const SpiteTensor *wo,
-    const SpiteTensor *q_norm,
-    const SpiteTensor *k_norm,
-    float              norm_eps,
-    SpiteKvCache      *kvcache,
-    float              rope_freq_base,
-    const SpiteCtx    *ctx
-) {
-    if (!out || !x || !wq || !wk || !wv || !wo || !kvcache || !ctx) return -1;
-    if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
-    if (ctx->n_heads <= 0 || ctx->n_kv_heads <= 0) return -1;
+/* F32 view of a q/k norm weight: the tensor itself when F32, else decoded into `tmp`. */
+static const float *norm_weights(const SpiteTensor *t, float *tmp, int hd) {
+    if (!t) return NULL;
+    if (t->kind == SPITE_TYPE_F32) return (const float *)t->data;
+    (void)spite_dequantize_row(t->kind, t->data, tmp, hd);
+    return tmp;
+}
 
-    const int nh  = ctx->n_heads;
-    const int nkv = ctx->n_kv_heads;
-    const int hd  = (int)wq->ne[1] / nh;
-    const int pos = ctx->pos;
-    const int kv_stride = nkv * hd;
+int spite_generic_attention_ex(
+    SpiteTensor           *out,
+    const SpiteTensor     *x,
+    const SpiteTensor     *wq,
+    const SpiteTensor     *wk,
+    const SpiteTensor     *wv,
+    const SpiteTensor     *wo,
+    const SpiteTensor     *q_norm,
+    const SpiteTensor     *k_norm,
+    float                  norm_eps,
+    SpiteKvCache          *kvcache,
+    float                  rope_freq_base,
+    const SpiteAttnParams *params,
+    const SpiteCtx        *ctx
+) {
+    if (!out || !x || !wq || !wk || !wv || !wo || !kvcache || !params || !ctx) return -1;
+    if (ctx->n_heads <= 0 || ctx->n_kv_heads <= 0) return -1;
+    if (ctx->n_heads > REF_MAX_DIM || ctx->n_kv_heads > REF_MAX_DIM) return -1;
+
+    const int nh    = ctx->n_heads;
+    const int nkv   = ctx->n_kv_heads;
+    const int hd    = params->head_dim;
+    const int rd    = params->rope_dim;
+    const int gated = params->gated_q;
+    const int pos   = ctx->pos;
 
     /* Same acceptance domain as kvattn_run, so a mismatch shows up as a
      * numeric difference rather than a spurious -1 from the reference. */
-    if (hd <= 0 || (hd & 1) || (nh % nkv)) return -1;
+    if (hd < 1 || hd > REF_MAX_DIM) return -1;
+    if (rd < 2 || rd > hd || (rd & 1)) return -1;
+    if (gated != 0 && gated != 1) return -1;
+    if (nh % nkv) return -1;
+
+    const int kv_stride = nkv * hd;
+    const int q_stride  = gated ? 2 * hd : hd;     /* floats per head in qfull */
+    const int d_model   = (int)x->ne[0];
+    const int d_out     = (int)out->ne[0];
+    if (d_model < 1 || d_out < 1) return -1;
+    if (!ref_f32_vec(x, d_model) || !ref_f32_vec(out, d_out)) return -1;
+    if (!ref_weight_ok(wq, d_model, (int64_t)nh * q_stride) ||
+        !ref_weight_ok(wk, d_model, kv_stride) || !ref_weight_ok(wv, d_model, kv_stride) ||
+        !ref_weight_ok(wo, (int64_t)nh * hd, d_out))
+        return -1;
+    if ((q_norm && !ref_weight_ok(q_norm, hd, 1)) || (k_norm && !ref_weight_ok(k_norm, hd, 1)))
+        return -1;
+
+    if (!kvcache->k.data || !kvcache->v.data) return -1;
     if ((int)kvcache->k.ne[0] != kv_stride) return -1;
     if ((int)kvcache->v.ne[0] != kv_stride) return -1;
     if (kvcache->k.kind != kvcache->v.kind) return -1;
     if (kvcache->k.kind != SPITE_TYPE_F32) return -1; /* see note above */
-    const int n_ctx = (int)kvcache->k.ne[1];
+    const int n_ctx = (int)(kvcache->k.ne[1] < kvcache->v.ne[1] ? kvcache->k.ne[1]
+                                                               : kvcache->v.ne[1]);
     if (pos < 0 || pos >= n_ctx) return -2;
 
-    float *wf_q = dequant_to_f32(wq);
-    float *wf_k = dequant_to_f32(wk);
-    float *wf_v = dequant_to_f32(wv);
-    float *wf_o = dequant_to_f32(wo);
-    float *nw_q = q_norm ? dequant_to_f32(q_norm) : NULL;
-    float *nw_k = k_norm ? dequant_to_f32(k_norm) : NULL;
-    if (!wf_q || !wf_k || !wf_v || !wf_o || (q_norm && !nw_q) || (k_norm && !nw_k)) {
-        free(wf_q); free(wf_k); free(wf_v); free(wf_o); free(nw_q); free(nw_k);
-        return -1;
-    }
+    const int n_tok = pos + 1;
 
-    /* q[nh*hd] k_stage[kv_stride] att[nh*hd] scores[nh*n_ctx] */
-    const size_t n_q      = (size_t)nh * hd;
-    const size_t n_att    = n_q;
-    const size_t n_scores = (size_t)nh * n_ctx;
-    float *buf = (float *)malloc((n_q + (size_t)kv_stride + n_att + n_scores) * sizeof(float));
-    if (!buf) {
-        free(wf_q); free(wf_k); free(wf_v); free(wf_o); free(nw_q); free(nw_k);
-        return -1;
-    }
+    /* qfull[nh*q_stride] k_stage[kv_stride] att[nh*hd] scores[nh*n_tok] + the
+     * decoded q/k norm weights when those are not F32 */
+    const uint64_t n_q      = (uint64_t)nh * q_stride;
+    const uint64_t n_att    = (uint64_t)nh * hd;
+    const uint64_t n_scores = (uint64_t)nh * n_tok;
+    const uint64_t n_norm   = (q_norm && q_norm->kind != SPITE_TYPE_F32 ? (uint64_t)hd : 0) +
+                              (k_norm && k_norm->kind != SPITE_TYPE_F32 ? (uint64_t)hd : 0);
+    int owned = 0, err = -1;
+    float *buf = ref_work_buf(ctx, n_q + kv_stride + n_att + n_scores + n_norm, &owned, &err);
+    if (!buf) return err;
+
     float *q       = buf;
     float *k_stage = q + n_q;
     float *att     = k_stage + kv_stride;
     float *scores  = att + n_att;
+    float *nq_tmp  = scores + n_scores;
+    float *nk_tmp  = nq_tmp + (q_norm && q_norm->kind != SPITE_TYPE_F32 ? hd : 0);
+    const float *nw_q = norm_weights(q_norm, nq_tmp, hd);
+    const float *nw_k = norm_weights(k_norm, nk_tmp, hd);
 
-    const float *xin     = (const float *)x->data;
-    const int    d_model = (int)x->ne[0];
-    const int    group   = nh / nkv;
-    const int    n_tok   = pos + 1;
+    const float *xin  = (const float *)x->data;
+    const int    group = nh / nkv;
 
     /* Row `pos` of the cache, addressed by byte stride exactly as the GPU
      * kernel does — nb[1] is not assumed to be 4 * kv_stride. */
@@ -310,16 +334,17 @@ int spite_generic_attention(
     float *v_row = (float *)((uint8_t *)kvcache->v.data + (size_t)pos * kvcache->v.nb[1]);
 
     /* Projections. V goes straight into its cache row, as on the GPU. */
-    matmul_f32(q, wf_q, xin, (int)n_q, d_model, 1);
-    matmul_f32(k_stage, wf_k, xin, kv_stride, d_model, 1);
-    matmul_f32(v_row, wf_v, xin, kv_stride, d_model, 1);
+    ref_gemv(wq, xin, q, 0, 0);
+    ref_gemv(wk, xin, k_stage, 0, 0);
+    ref_gemv(wv, xin, v_row, 0, 0);
 
-    /* Per-head QK RMSNorm + NEOX RoPE. K lands in the cache row. */
+    /* Per-head QK RMSNorm + NEOX RoPE (q part only; the gate half is untouched).
+     * K lands in the cache row. */
     for (int h = 0; h < nh; h++)
-        qk_norm_rope(q + (size_t)h * hd, q + (size_t)h * hd, nw_q, norm_eps, hd, pos,
-                     rope_freq_base);
+        qk_norm_rope(q + (size_t)h * q_stride, q + (size_t)h * q_stride, nw_q, norm_eps, hd, rd,
+                     pos, rope_freq_base);
     for (int h = 0; h < nkv; h++)
-        qk_norm_rope(k_row + (size_t)h * hd, k_stage + (size_t)h * hd, nw_k, norm_eps, hd, pos,
+        qk_norm_rope(k_row + (size_t)h * hd, k_stage + (size_t)h * hd, nw_k, norm_eps, hd, rd, pos,
                      rope_freq_base);
 
     const float scale = 1.0f / sqrtf((float)hd);
@@ -328,9 +353,9 @@ int spite_generic_attention(
      * passes is a GPU concern; the reference keeps them separate so it reads
      * like the maths. */
     for (int h = 0; h < nh; h++) {
-        const float *qh = q + (size_t)h * hd;
+        const float *qh = q + (size_t)h * q_stride;
         const int    kh = h / group;
-        float       *sc = scores + (size_t)h * n_ctx;
+        float       *sc = scores + (size_t)h * n_tok;
 
         for (int t = 0; t < n_tok; t++) {
             const float *kt = (const float *)((const uint8_t *)kvcache->k.data +
@@ -358,21 +383,40 @@ int spite_generic_attention(
             }
             ah[i] = acc;
         }
+        if (gated) {
+            const float *gh = qh + hd;
+            for (int i = 0; i < hd; i++) ah[i] *= 1.0f / (1.0f + expf(-gh[i]));
+        }
     }
 
     /* out += Wo·att (ABI v4 residual fusion). */
-    const int o_cols = (int)wo->ne[0];
-    const int o_rows = (int)wo->ne[1];
-    float *outp = (float *)out->data;
-    for (int r = 0; r < o_rows; r++) {
-        float acc = 0.0f;
-        for (int c = 0; c < o_cols; c++) acc += wf_o[(size_t)r * o_cols + c] * att[c];
-        outp[r] += acc;
-    }
+    ref_gemv(wo, att, (float *)out->data, 1, 0);
 
-    free(buf);
-    free(wf_q); free(wf_k); free(wf_v); free(wf_o); free(nw_q); free(nw_k);
+    if (owned) free(buf);
     return 0;
+}
+
+/* ABI v4 attention: head_dim comes from wq, every dim is rotated, no gate. */
+int spite_generic_attention(
+    SpiteTensor       *out,
+    const SpiteTensor *x,
+    const SpiteTensor *wq,
+    const SpiteTensor *wk,
+    const SpiteTensor *wv,
+    const SpiteTensor *wo,
+    const SpiteTensor *q_norm,
+    const SpiteTensor *k_norm,
+    float              norm_eps,
+    SpiteKvCache      *kvcache,
+    float              rope_freq_base,
+    const SpiteCtx    *ctx
+) {
+    if (!wq || !ctx || ctx->n_heads <= 0) return -1;
+    const int64_t hd = (int64_t)wq->ne[1] / ctx->n_heads;
+    if (hd < 1 || hd > REF_MAX_DIM) return -1;
+    const SpiteAttnParams p = { .head_dim = (int32_t)hd, .rope_dim = (int32_t)hd, .gated_q = 0 };
+    return spite_generic_attention_ex(out, x, wq, wk, wv, wo, q_norm, k_norm, norm_eps, kvcache,
+                                      rope_freq_base, &p, ctx);
 }
 
 /* ── Matmul ───────────────────────────────────────────────────────────── */

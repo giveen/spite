@@ -20,12 +20,13 @@
  * the shared flash-decoding scaffolding: this card's own tuning stays in the
  * projections, which are 90% of a decode token.
  *
- * Weight types: F32, F16, Q8_0. Activations: F32.
+ * Weight types: any SpiteType (F32/F16/Q8_0 tuned here, the rest via core/gpu/quant_gemv.h). Activations: F32.
  * KV cache: F32, F16, Q8_0, Q5_1 or Q4_0 (see kv_attn.inl).
  * Single-token decode semantics (prefill = repeated decode by the host).
  */
 
 #include "core/abi.h"
+#include "core/gpu/quant_gemv.h"  // also #defines QK8_0 (ggml-common.h)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -33,7 +34,6 @@
 
 namespace {
 
-constexpr int QK8_0 = 32;
 struct BlockQ8_0 {
     __half d;
     int8_t qs[QK8_0];
@@ -341,7 +341,8 @@ int launch_matvec(const SpiteTensor* w, const float* x, float* y, bool accumulat
                                           cols, accumulate);
         break;
     default:
-        return -1;
+        // every other SpiteType: dequantize-in-register GEMV (0, or -1 if undecodable)
+        return sq::gemv(w, x, y, accumulate, s);
     }
     return 0;
 }
@@ -457,6 +458,8 @@ inline int finish() { return cudaGetLastError() == cudaSuccess ? 0 : -2; }
 extern "C" int qwen3_rtx5090_rms_norm(SpiteTensor* out, const SpiteTensor* x,
                                       const SpiteTensor* weight, float eps, const SpiteCtx* ctx) {
     if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32) return -1;
+    // load_w() only decodes F32/F16 norm weights; anything else must be -1, not garbage
+    if (weight->kind != SPITE_TYPE_F32 && weight->kind != SPITE_TYPE_F16) return -1;
     const int cols = static_cast<int>(x->ne[0]);
     const int rows = static_cast<int>(x->ne[1] ? x->ne[1] : 1);
     if (weight->ne[0] != x->ne[0]) return -1;
@@ -522,7 +525,12 @@ static const SpiteKernelInfo KERNEL_INFO = {
     // "generic", which drops the host onto the CPU fallback.
     "sm_120",
     "spite project (RTX 5090: 192-SM grid, 8-warp K-split Q8_0 matvec, smem x-staging)",
-    {SPITE_TYPE_F32, SPITE_TYPE_F16, SPITE_TYPE_Q8_0, 0, 0, 0, 0, 0},
+    /* supported_quants has 8 slots and 0 terminates the list (so F32 == 0 cannot be
+     * listed and is always accepted): at most 7 types are advertised. The shared GEMV
+     * (core/gpu/quant_gemv.h) handles all 28 SpiteTypes; types outside this list still
+     * work in matvec/ffn/matmul, and anything it cannot decode returns -1. */
+    {SPITE_TYPE_F16, SPITE_TYPE_Q8_0, SPITE_TYPE_Q4_K, SPITE_TYPE_Q5_K, SPITE_TYPE_Q6_K,
+     SPITE_TYPE_Q4_0, SPITE_TYPE_Q3_K, 0},
     qwen3_rtx5090_rms_norm,
     qwen3_rtx5090_attention,
     nullptr, /* mla */

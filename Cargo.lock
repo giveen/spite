@@ -1318,6 +1318,7 @@ dependencies = [
 name = "spite-compute"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "spite-abi",
  "thiserror",
 ]

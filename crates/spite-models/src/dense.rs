@@ -83,21 +83,10 @@ impl DenseWeights {
     }
 }
 
-/// Packed byte length of `n_elem` elements, or None if unsupported.
-/// Block sizes from llama.cpp ggml.
+/// Packed byte length of `n_elem` elements of `kind` (any [`SpiteType`]).
 pub(crate) fn packed_bytes(kind: SpiteType, n_elem: usize) -> Option<usize> {
-    let (el_per_block, bytes_per_block): (usize, usize) = match kind {
-        SpiteType::F32 => return n_elem.checked_mul(4),
-        SpiteType::F16 | SpiteType::Bf16 => return n_elem.checked_mul(2),
-        SpiteType::Q8_0 => (32, 34),
-        SpiteType::Q4_0 => (32, 18),
-        SpiteType::Q4K => (256, 144),
-        SpiteType::Q5K => (256, 176),
-        SpiteType::Q6K => (256, 210),
-        _ => return None,
-    };
-    let n_blocks = n_elem.div_ceil(el_per_block);
-    n_blocks.checked_mul(bytes_per_block)
+    let n_blocks = n_elem.div_ceil(kind.block_elements() as usize);
+    n_blocks.checked_mul(kind.block_bytes() as usize)
 }
 
 /// Per-layer K/V cache: post-RoPE keys, raw values, one row per position.

@@ -115,8 +115,9 @@ impl GpuBackend {
 pub struct DeviceBuffer {
     pub backend: GpuBackend,
     pub size: usize,
-    ptr: *mut u8,      // backend-managed; null for Cpu-backed vec
-    cpu_data: Vec<u8>, // used only when backend == Cpu
+    /// Backend-managed device pointer; for `Cpu` a leaked boxed slice owned by this
+    /// buffer (freed in `Drop`), so `as_ptr` is valid for kernels on every backend.
+    ptr: *mut u8,
 }
 
 unsafe impl Send for DeviceBuffer {}
@@ -140,22 +141,15 @@ impl DeviceBuffer {
             GpuBackend::Hexagon => {
                 hexagon::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr))
             }
-            GpuBackend::Cpu => Ok(Self {
-                backend,
-                size,
-                ptr: std::ptr::null_mut(),
-                cpu_data: vec![0u8; size],
-            }),
+            GpuBackend::Cpu => {
+                let ptr = Box::into_raw(vec![0u8; size].into_boxed_slice()).cast::<u8>();
+                Ok(Self::from_ptr(backend, size, ptr))
+            }
         }
     }
 
     fn from_ptr(backend: GpuBackend, size: usize, ptr: *mut u8) -> Self {
-        Self {
-            backend,
-            size,
-            ptr,
-            cpu_data: vec![],
-        }
+        Self { backend, size, ptr }
     }
 
     /// Copy `src` (host) → this buffer (device).
@@ -164,7 +158,7 @@ impl DeviceBuffer {
         assert!(src.len() <= self.size);
         match self.backend {
             GpuBackend::Cpu => {
-                self.cpu_data[..src.len()].copy_from_slice(src);
+                self.as_cpu_slice_mut()[..src.len()].copy_from_slice(src);
                 Ok(())
             }
             GpuBackend::Cuda => cuda::upload(self.ptr, src),
@@ -186,7 +180,7 @@ impl DeviceBuffer {
         assert!(dst.len() <= self.size);
         match self.backend {
             GpuBackend::Cpu => {
-                dst.copy_from_slice(&self.cpu_data[..dst.len()]);
+                dst.copy_from_slice(&self.as_cpu_slice()[..dst.len()]);
                 Ok(())
             }
             GpuBackend::Cuda => cuda::download(self.ptr, dst),
@@ -202,16 +196,25 @@ impl DeviceBuffer {
         }
     }
 
-    /// Raw device pointer (null for Cpu backend — use `as_cpu_slice` instead).
+    /// Raw pointer to the buffer: a device pointer, or host memory for `Cpu`.
     pub fn as_ptr(&self) -> *mut u8 {
         self.ptr
     }
 
+    /// Host view of a `Cpu` buffer (empty for device backends).
     pub fn as_cpu_slice(&self) -> &[u8] {
-        &self.cpu_data
+        if self.backend != GpuBackend::Cpu {
+            return &[];
+        }
+        // SAFETY: `ptr` is the leaked boxed slice of `size` bytes owned by `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
     }
     pub fn as_cpu_slice_mut(&mut self) -> &mut [u8] {
-        &mut self.cpu_data
+        if self.backend != GpuBackend::Cpu {
+            return &mut [];
+        }
+        // SAFETY: as above, and `&mut self` is exclusive.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.size) }
     }
 }
 
@@ -231,7 +234,12 @@ impl Drop for DeviceBuffer {
             GpuBackend::Cann => cann::free(self.ptr),
             GpuBackend::Musa => musa::free(self.ptr),
             GpuBackend::Hexagon => hexagon::free(self.ptr),
-            GpuBackend::Cpu => {}
+            // SAFETY: reconstructs the boxed slice leaked in `alloc`.
+            GpuBackend::Cpu => unsafe {
+                drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                    self.ptr, self.size,
+                )));
+            },
         }
     }
 }

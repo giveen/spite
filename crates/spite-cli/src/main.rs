@@ -576,6 +576,51 @@ fn build_model(
     // never exceed the context the executor will actually allow.
     cfg.max_seq_len = cfg.max_seq_len.min(ctx_len).max(1);
 
+    if spite_models::hybrid::is_hybrid(&cfg) {
+        use spite_models::hybrid::HybridDecoder;
+        // Device kernels first (unless --device cpu), then the generic CPU kernels;
+        // both run the same op-driven forward.
+        let want_gpu = place.device != Device::Cpu;
+        let resolved = if want_gpu {
+            HybridDecoder::resolve_table(&cfg.arch, place.gpu_arch, place.kernels_dir, true)
+        } else {
+            None
+        };
+        if resolved.is_none() && place.device == Device::Cuda {
+            bail!(
+                "--device cuda: no kernel provides every hybrid op (rms_norm, attention_ex, linear_attn, ffn, matmul) \
+                 for arch '{}' on '{}' under {}",
+                cfg.arch,
+                place.gpu_arch,
+                place.kernels_dir.display()
+            );
+        }
+        let resolved = resolved.or_else(|| {
+            HybridDecoder::resolve_table(&cfg.arch, place.gpu_arch, place.kernels_dir, false)
+        });
+        if let Some((table, backend)) = resolved {
+            let (model, r) = HybridDecoder::load(cfg, gguf, table, backend, ctx_len)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
+            println!(
+                "device       : {:?} (hybrid) — weights {:.2} GiB + KV {:.2} GiB ({:?}) + recurrent state {:.2} GiB + scratch {:.2} MiB{}",
+                r.backend,
+                gib(r.weights_bytes),
+                gib(r.kv_bytes),
+                r.kv_kind,
+                gib(r.state_bytes),
+                r.scratch_bytes as f64 / (1u64 << 20) as f64,
+                r.mem.map_or(String::new(), |(free, total)| format!(
+                    "; {:.2}/{:.2} GiB free",
+                    gib(free),
+                    gib(total)
+                )),
+            );
+            return Ok(Box::new(model));
+        }
+        // No op-complete kernel set: fall through to the Rust CPU implementation.
+    }
+
     if place.device != Device::Cpu {
         match GpuDense::resolve_table(&cfg.arch, place.gpu_arch, place.kernels_dir) {
             Some(table) => {

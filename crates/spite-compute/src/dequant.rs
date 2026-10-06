@@ -1,10 +1,15 @@
-//! Block dequantization — GGUF quantized formats → F32.
+//! Block dequantization - any GGUF quantized format to F32.
 //!
-//! Each format stores weights in fixed-size blocks with per-block scales.
-//! Reference: ggml/src/ggml-quants.c in the llama.cpp repository.
+//! The implementation is `core/quant.c`, vendored from ggml and shared with the
+//! C/CUDA kernels, so the host and every kernel decode a given type identically.
 
-use crate::{ComputeError, f16_to_f32};
+use crate::ComputeError;
 use spite_abi::SpiteType;
+use std::ffi::c_void;
+
+unsafe extern "C" {
+    fn spite_dequantize_row(kind: u32, src: *const c_void, dst: *mut f32, n: i64) -> i32;
+}
 
 /// Dequantize `n_elem` elements from `src` (packed blocks) into `dst` (F32).
 pub fn dequant_to_f32(
@@ -16,81 +21,68 @@ pub fn dequant_to_f32(
     if dst.len() < n_elem {
         return Err(ComputeError::ShapeMismatch("dst too small".into()));
     }
-    match kind {
-        SpiteType::F32 => {
-            let src_f32 = bytemuck_cast(src, n_elem)?;
-            dst[..n_elem].copy_from_slice(src_f32);
-            Ok(())
-        }
-        SpiteType::Q8_0 => dequant_q8_0(src, n_elem, dst),
-        SpiteType::Q4_0 => dequant_q4_0(src, n_elem, dst),
-        SpiteType::Q4K => dequant_q4k(src, n_elem, dst),
-        SpiteType::Q5K => dequant_q5k(src, n_elem, dst),
-        SpiteType::Q6K => dequant_q6k(src, n_elem, dst),
-        _ => Err(ComputeError::UnsupportedDtype),
+    let blk = kind.block_elements() as usize;
+    if !n_elem.is_multiple_of(blk) {
+        return Err(ComputeError::ShapeMismatch(format!(
+            "{n_elem} elements is not a multiple of the {kind:?} block size {blk}"
+        )));
+    }
+    let need = n_elem / blk * kind.block_bytes() as usize;
+    if src.len() < need {
+        return Err(ComputeError::ShapeMismatch(format!(
+            "{kind:?} src has {} bytes, need {need}",
+            src.len()
+        )));
+    }
+    // SAFETY: `src` holds at least `need` bytes (= n_elem/blk blocks), `dst` holds
+    // at least `n_elem` floats, and the C side reads/writes exactly those ranges.
+    let rc = unsafe {
+        spite_dequantize_row(
+            kind as u32,
+            src.as_ptr().cast(),
+            dst.as_mut_ptr(),
+            n_elem as i64,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(ComputeError::UnsupportedDtype)
     }
 }
 
-/// Q8_0 block: `{ u16 d; i8 qs[32] }` — 34 bytes per 32 elements.
-fn dequant_q8_0(src: &[u8], n_elem: usize, dst: &mut [f32]) -> Result<(), ComputeError> {
-    const BLOCK: usize = 32;
-    const BLOCK_BYTES: usize = 2 + BLOCK; // d(u16) + 32×i8
-    let n_blocks = n_elem / BLOCK;
-    if src.len() < n_blocks * BLOCK_BYTES {
-        return Err(ComputeError::ShapeMismatch("q8_0 src too small".into()));
-    }
-    for b in 0..n_blocks {
-        let off = b * BLOCK_BYTES;
-        let d = f16_to_f32(u16::from_le_bytes([src[off], src[off + 1]]));
-        for i in 0..BLOCK {
-            dst[b * BLOCK + i] = (src[off + 2 + i] as i8 as f32) * d;
-        }
-    }
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-/// Q4_0 block: `{ u16 d; u8 qs[16] }` — 18 bytes per 32 elements.
-fn dequant_q4_0(src: &[u8], n_elem: usize, dst: &mut [f32]) -> Result<(), ComputeError> {
-    const BLOCK: usize = 32;
-    const BLOCK_BYTES: usize = 2 + BLOCK / 2;
-    let n_blocks = n_elem / BLOCK;
-    if src.len() < n_blocks * BLOCK_BYTES {
-        return Err(ComputeError::ShapeMismatch("q4_0 src too small".into()));
-    }
-    for b in 0..n_blocks {
-        let off = b * BLOCK_BYTES;
-        let d = f16_to_f32(u16::from_le_bytes([src[off], src[off + 1]]));
-        for i in 0..16 {
-            let byte = src[off + 2 + i];
-            dst[b * BLOCK + i * 2] = ((byte & 0x0F) as i32 - 8) as f32 * d;
-            dst[b * BLOCK + i * 2 + 1] = ((byte >> 4) as i32 - 8) as f32 * d;
+    /// Q8_0 block: f16 scale 0.5 (0x3800) + qs = -3..=28 -> exactly qs * 0.5.
+    #[test]
+    fn q8_0_block_decodes() {
+        let mut src = vec![0x00, 0x38];
+        src.extend((0..32).map(|i| (i as i8 - 3) as u8));
+        let mut dst = [0f32; 32];
+        dequant_to_f32(&src, SpiteType::Q8_0, 32, &mut dst).unwrap();
+        for (i, v) in dst.iter().enumerate() {
+            assert_eq!(*v, (i as f32 - 3.0) * 0.5);
         }
     }
-    Ok(())
-}
 
-/// Q4_K block: 256 elements, per-superblock d/dmin, per-group scales.
-fn dequant_q4k(_src: &[u8], _n_elem: usize, _dst: &mut [f32]) -> Result<(), ComputeError> {
-    // TODO: block_q4_K { d: u16, dmin: u16, scales[12]: u8, qs[128]: u8 }
-    //       256 elements per block, 8 groups of 32, each group has its own scale
-    Ok(())
-}
-
-fn dequant_q5k(_src: &[u8], _n_elem: usize, _dst: &mut [f32]) -> Result<(), ComputeError> {
-    // TODO: block_q5_K — like Q4_K with an extra high-bit array for the 5th bit
-    Ok(())
-}
-
-fn dequant_q6k(_src: &[u8], _n_elem: usize, _dst: &mut [f32]) -> Result<(), ComputeError> {
-    // TODO: block_q6_K — 256 elements, ql[128] (4-bit) + qh[64] (2-bit high)
-    Ok(())
-}
-
-fn bytemuck_cast(src: &[u8], n: usize) -> Result<&[f32], ComputeError> {
-    if src.len() < n * 4 {
-        return Err(ComputeError::ShapeMismatch("f32 src too small".into()));
+    #[test]
+    fn rejects_truncated_and_misaligned_input() {
+        let mut dst = [0f32; 256];
+        assert!(dequant_to_f32(&[0; 10], SpiteType::Q4K, 256, &mut dst).is_err());
+        assert!(dequant_to_f32(&[0; 144], SpiteType::Q4K, 100, &mut dst).is_err());
     }
-    // SAFETY: alignment is caller's responsibility; this is a reference path only.
-    let ptr = src.as_ptr() as *const f32;
-    Ok(unsafe { std::slice::from_raw_parts(ptr, n) })
+
+    /// Every type's layout agrees with what the C side consumes: decoding one
+    /// zero-filled block must succeed (zero scales => all zeros).
+    #[test]
+    fn every_type_decodes_a_zero_block() {
+        for kind in SpiteType::ALL {
+            let blk = kind.block_elements() as usize;
+            let src = vec![0u8; kind.block_bytes() as usize];
+            let mut dst = vec![1f32; blk];
+            dequant_to_f32(&src, kind, blk, &mut dst).unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+        }
+    }
 }

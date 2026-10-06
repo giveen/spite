@@ -352,15 +352,5 @@ fn read_tensor_info(buf: &[u8], cur: &mut usize) -> Result<(String, TensorRecord
 }
 
 fn gguf_type(id: u32) -> Result<SpiteType, LoadError> {
-    Ok(match id {
-        0 => SpiteType::F32,
-        1 => SpiteType::F16,
-        2 => SpiteType::Q4_0,
-        8 => SpiteType::Q8_0,
-        10 => SpiteType::Q4K,
-        11 => SpiteType::Q5K,
-        12 => SpiteType::Q6K,
-        30 => SpiteType::Bf16,
-        t => return Err(LoadError::UnknownType(t)),
-    })
+    SpiteType::from_gguf_id(id).ok_or(LoadError::UnknownType(id))
 }

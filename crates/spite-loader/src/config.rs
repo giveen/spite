@@ -176,7 +176,9 @@ impl ModelHyperparams {
         };
         // Recurrent-layer flags: explicit array wins, else derive from the
         // full-attention interval (every Nth layer is full attention).
-        let n_layers = u("block_count");
+        // NextN/MTP blocks are appended after the trunk (llama.cpp: n_layer excludes them);
+        // they are not part of the main forward pass.
+        let n_layers = u("block_count").saturating_sub(u("nextn_predict_layers"));
         let recurrent_layers = {
             let key = format!("{arch}.attention.recurrent_layers");
             match meta.get(&key) {

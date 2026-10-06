@@ -91,55 +91,6 @@ pub fn rope_range(x: &mut [f32], pos: u32, offset: usize, n_dims: usize, theta: 
     }
 }
 
-/// Interleaved RoPE (llama.cpp `IMROPE`, Qwen3.5/Qwen4-style).
-///
-/// Head dim is split into 4 sections; pair `p` uses the position of its
-/// sector, interleaved 3-way across sections. With all four positions equal
-/// (text-only inference) this reduces to standard neox RoPE over `n_dims`.
-///
-/// `x`: flat F32 `[n_heads, head_dim]` for one position; only the first
-/// `n_dims` of each head rotate.
-pub fn apply_irope(
-    x: &mut [f32],
-    pos: [u32; 4],
-    sections: [u32; 4],
-    n_dims: usize,
-    head_dim: usize,
-    theta: f32,
-) {
-    let sect = (sections[0] + sections[1] + sections[2] + sections[3]) as usize;
-    if sect == 0 || n_dims == 0 {
-        return;
-    }
-    let s1 = sections[1] as usize;
-    let s2 = sections[2] as usize;
-    let s0 = sections[0] as usize;
-    let n_heads = x.len() / head_dim;
-    let half = n_dims / 2;
-    for h in 0..n_heads {
-        let base = h * head_dim;
-        for p in 0..half {
-            let sector = p % sect;
-            // Interleaved sector → position mapping (ggml mrope cache init).
-            let position = if sector % 3 == 1 && sector < 3 * s1 {
-                pos[1]
-            } else if sector % 3 == 2 && sector < 3 * s2 {
-                pos[2]
-            } else if sector.is_multiple_of(3) && sector < 3 * s0 {
-                pos[0]
-            } else {
-                pos[3]
-            };
-            let freq = 1.0 / theta.powf(2.0 * p as f32 / n_dims as f32);
-            let (sin, cos) = (position as f32 * freq).sin_cos();
-            let x0 = x[base + p];
-            let x1 = x[base + p + half];
-            x[base + p] = x0 * cos - x1 * sin;
-            x[base + p + half] = x0 * sin + x1 * cos;
-        }
-    }
-}
-
 /// ALiBi: return the slope for head `h` of `n_heads` total.
 ///
 /// This slope is subtracted from attention scores: score -= slope * distance.
