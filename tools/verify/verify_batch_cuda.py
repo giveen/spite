@@ -48,6 +48,11 @@ class AttnParams(ctypes.Structure):
     _fields_ = [("head_dim", ctypes.c_int32), ("rope_dim", ctypes.c_int32),
                 ("gated_q", ctypes.c_int32)]
 
+class GdnParams(ctypes.Structure):
+    _fields_ = [("n_kh", ctypes.c_int32), ("n_vh", ctypes.c_int32),
+                ("head_dim", ctypes.c_int32), ("d_conv", ctypes.c_int32),
+                ("norm_eps", ctypes.c_float)]
+
 def tensor(p, ne):
     ne = list(ne) + [1] * (4 - len(ne))
     nb = [4, 0, 0, 0]
@@ -203,6 +208,68 @@ def main(kernel_path, cudart_path):
         ok = ok and d3 < 1e-5
     else:
         print("attention_ex: SKIP")
+
+    if info.linear_attn:
+        GdnFn = ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(GdnParams),
+            ctypes.POINTER(SpiteCtx))
+        gdn = GdnFn(info.linear_attn)
+        nkh, nvh, S, K, dm, m = 2, 4, 64, 3, 64, 3
+        C = 2 * nkh * S + nvh * S
+        V = nvh * S
+        wqkv = [rng.uniform(-1, 1) for _ in range(dm * C)]
+        wg = [rng.uniform(-1, 1) for _ in range(dm * V)]
+        wb = [rng.uniform(-1, 1) for _ in range(dm * nvh)]
+        wa = [rng.uniform(-1, 1) for _ in range(dm * nvh)]
+        wout = [rng.uniform(-1, 1) for _ in range(V * dm)]
+        cw = [rng.uniform(-1, 1) for _ in range(K * C)]
+        dt = [rng.uniform(-1, 1) for _ in range(nvh)]
+        am = [rng.uniform(-1, 1) for _ in range(nvh)]
+        nw = [rng.uniform(-1, 1) for _ in range(S)]
+        x = [rng.uniform(-1, 1) for _ in range(dm * m)]
+        p = GdnParams(nkh, nvh, S, K, 1e-5)
+        pWqkv, pWg, pWb, pWa, pWout = alloc(dm * C * 4), alloc(dm * V * 4), alloc(dm * nvh * 4), alloc(dm * nvh * 4), alloc(V * dm * 4)
+        h2d(pWqkv, wqkv); h2d(pWg, wg); h2d(pWb, wb); h2d(pWa, wa); h2d(pWout, wout)
+        pCw, pDt, pAm, pNw = alloc(K * C * 4), alloc(nvh * 4), alloc(nvh * 4), alloc(S * 4)
+        h2d(pCw, cw); h2d(pDt, dt); h2d(pAm, am); h2d(pNw, nw)
+        pHist, pState = alloc((K - 1) * C * 4), alloc(nvh * S * S * 4)
+        pHist2, pState2 = alloc((K - 1) * C * 4), alloc(nvh * S * S * 4)
+        h2d(pHist, [0.0] * ((K - 1) * C))
+        h2d(pState, [0.0] * (nvh * S * S))
+        h2d(pHist2, [0.0] * ((K - 1) * C))
+        h2d(pState2, [0.0] * (nvh * S * S))
+        pScr = alloc(1 << 22)
+
+        def run_gdn(pos, mm, hist, state, xslice):
+            pX, pO = alloc(dm * mm * 4), alloc(dm * mm * 4)
+            h2d(pX, xslice)
+            ctx = SpiteCtx(64, mm, 1, pos, 0, 0, None, ctypes.cast(pScr, ctypes.c_void_p), 1 << 22)
+            r = gdn(ctypes.byref(tensor(pO, [dm, mm])), ctypes.byref(tensor(pX, [dm, mm])),
+                    ctypes.byref(tensor(pWqkv, [dm, C])), ctypes.byref(tensor(pWg, [dm, V])),
+                    ctypes.byref(tensor(pWb, [dm, nvh])), ctypes.byref(tensor(pWa, [dm, nvh])),
+                    ctypes.byref(tensor(pWout, [V, dm])), ctypes.byref(tensor(pCw, [K * C, 1])),
+                    ctypes.byref(tensor(pDt, [nvh, 1])), ctypes.byref(tensor(pAm, [nvh, 1])),
+                    ctypes.byref(tensor(pNw, [S, 1])), ctypes.byref(tensor(hist, [(K - 1) * C, 1])),
+                    ctypes.byref(tensor(state, [nvh * S * S, 1])), ctypes.byref(p), ctypes.byref(ctx))
+            assert cudart.cudaDeviceSynchronize() == 0
+            assert r == 0, r
+            return d2h(pO, dm * mm)
+
+        batched = run_gdn(0, m, pHist, pState, x)
+        seq = []
+        for t in range(m):
+            seq += run_gdn(t, 1, pHist2, pState2, x[dm * t:dm * (t + 1)])
+        d4 = max(abs(a - b) for a, b in zip(batched, seq))
+        print(f"linear_attn batch m={m} vs sequential: max_abs_diff={d4:.2e}")
+        ok = ok and d4 < 1e-5
+    else:
+        print("linear_attn: SKIP")
 
     print("BATCH CUDA PASSED" if ok else "BATCH CUDA FAILED")
     return 0 if ok else 1

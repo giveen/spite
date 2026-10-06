@@ -23,6 +23,13 @@
 
 #define SPITE_ABI_VERSION 7
 
+/*
+ * Optional kernel capability bits, exported as `uint32_t spite_kernel_caps(void)`.
+ * A kernel that does not export the symbol reads as 0, so this is additive: no
+ * ABI bump and old kernels keep loading.
+ */
+#define SPITE_CAP_BATCH 1u /* ops accept a batched [cols, m] activation (prefill) */
+
 /* ── Quant type tag ───────────────────────────────────────────────────── */
 
 /*

@@ -266,3 +266,6 @@ static const SpiteKernelInfo KERNEL_INFO = {
 };
 
 extern "C" const SpiteKernelInfo *spite_kernel_info() { return &KERNEL_INFO; }
+
+/* Capability bits: the CUDA ops accept a batched [cols, m] activation. */
+extern "C" uint32_t spite_kernel_caps() { return SPITE_CAP_BATCH; }

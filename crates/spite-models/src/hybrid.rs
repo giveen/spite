@@ -1116,21 +1116,27 @@ impl HybridDecoder {
     /// decoder is on a single stage. The generic reference implements batching;
     /// the per-card CUDA kernels do not yet, so they keep the per-token path.
     fn batch_capable(&self) -> bool {
-        let generic = |s: &spite_dispatch::OpSource| s.gpu_arch == GENERIC;
+        let batch = |s: &spite_dispatch::OpSource| s.caps & spite_dispatch::CAP_BATCH != 0;
         self.layer_stage.iter().all(|&s| s == 0)
-            && generic(&self.table.rms_norm.1)
-            && generic(&self.table.ffn.1)
-            && generic(&self.table.matmul.1)
+            && batch(&self.table.rms_norm.1)
+            && batch(&self.table.ffn.1)
+            && batch(&self.table.matmul.1)
             && self
                 .table
                 .attention_ex
                 .0
-                .is_none_or(|_| generic(&self.table.attention_ex.1))
+                .is_none_or(|_| batch(&self.table.attention_ex.1))
             && self
                 .table
                 .linear_attn
                 .0
-                .is_none_or(|_| generic(&self.table.linear_attn.1))
+                .is_none_or(|_| batch(&self.table.linear_attn.1))
+            && (self.config.n_expert == 0
+                || self
+                    .table
+                    .moe_ffn
+                    .0
+                    .is_none_or(|_| batch(&self.table.moe_ffn.1)))
     }
 
     /// Layer-major batched prefill: one batched op call per layer for `m`
@@ -1169,6 +1175,19 @@ impl HybridDecoder {
 
         let mut h_t = f32_tensor2(&hbuf, d, m);
         let mut n_t = f32_tensor2(&nbuf, d, m);
+        // Batched scratch: the single-token size times m bounds every batched op
+        // (the per-token fixed part scales with m; the workspace is <= its *m).
+        let scratch_floats = [
+            2 * cfg.d_ffn,
+            self.attn
+                .scratch_floats(cfg.n_heads, cfg.n_kv_heads, self.n_ctx),
+            self.gdn.scratch_floats(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        let scratch = DeviceBuffer::alloc_on(self.backend, dev, (scratch_floats * 4 * m).max(1))
+            .map_err(|e| err(format!("alloc scratch: {e}")))?;
         let kctx = SpiteCtx {
             n_ctx: self.n_ctx as c_int,
             n_batch: m as c_int,
@@ -1177,8 +1196,8 @@ impl HybridDecoder {
             n_heads: cfg.n_heads as c_int,
             n_kv_heads: cfg.n_kv_heads as c_int,
             gpu_stream: std::ptr::null_mut(),
-            scratchpad: std::ptr::null_mut(),
-            scratchpad_bytes: 0,
+            scratchpad: scratch.as_ptr().cast(),
+            scratchpad_bytes: scratch.size,
         };
 
         for (li, layer) in self.layers.iter().enumerate() {
