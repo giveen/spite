@@ -1,0 +1,1 @@
+/mnt/storage/models/gemma/gemma-4-12b-it-Q4_K_M.gguf [cuda (cuda, kv f16/f16)]       74.0 tok/s  TTFT    81.6 ms  mem   7641 MiB  (n=3)

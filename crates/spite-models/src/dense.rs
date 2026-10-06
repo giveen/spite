@@ -224,7 +224,13 @@ fn matvec_threads() -> usize {
 pub(crate) fn matvec(w: &Weight, x: &[f32], out: &mut [f32]) -> Result<(), ModelError> {
     let (rows, cols) = (w.rows(), w.cols());
     if x.len() != cols || out.len() != rows || w.data.len() != rows * cols {
-        return Err(ModelError::Forward("matvec shape mismatch".into()));
+        return Err(ModelError::Forward(format!(
+            "matvec shape mismatch: x.len()={} cols={} out.len()={} rows={}",
+            x.len(),
+            cols,
+            out.len(),
+            rows
+        )));
     }
     if rows == 0 {
         return Ok(());
