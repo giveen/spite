@@ -237,6 +237,7 @@ static const SpiteKernelInfo KERNEL_INFO = {
     qwen35_cuda_linear_attn,
     qwen35_cuda_attention_ex,
     qwen35_cuda_mtp_stem,
+    qwen35_cuda_moe_ffn,
 };
 
 extern "C" const SpiteKernelInfo *spite_kernel_info() { return &KERNEL_INFO; }

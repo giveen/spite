@@ -490,6 +490,35 @@ pub type MtpStemFn = unsafe extern "C" fn(
     ctx: *const SpiteCtx,
 ) -> c_int;
 
+// ── MoE feed-forward layer (ABI v7 optional slot) ──────────────────────────
+
+/// Geometry and configuration of one MoE layer.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpiteMoeParams {
+    pub num_experts: i32,
+    pub num_experts_per_tok: i32,
+    pub intermediate_size: i32,
+    pub shared_intermediate_size: i32,
+    pub weights_scale: f32,
+}
+
+/// MoE feed-forward layer: `out += moe_ffn(x)` (fusing residual add).
+/// Supports top-k routed experts with softmax gating and optional shared expert.
+pub type MoeFn = unsafe extern "C" fn(
+    out: *mut SpiteTensor,
+    x: *const SpiteTensor,
+    w_gate_inp: *const SpiteTensor,
+    w_up_exps: *const SpiteTensor,
+    w_gate_exps: *const SpiteTensor,
+    w_down_exps: *const SpiteTensor,
+    w_up_shexp: *const SpiteTensor,
+    w_gate_shexp: *const SpiteTensor,
+    w_down_shexp: *const SpiteTensor,
+    params: *const SpiteMoeParams,
+    ctx: *const SpiteCtx,
+) -> c_int;
+
 // ── Model capability declaration ───────────────────────────────────────────
 
 /// What a model supports — derived from GGUF metadata by the runtime.
@@ -560,6 +589,8 @@ pub struct SpiteKernelInfo {
     pub attention_ex: Option<AttentionExFn>,
     /// Fused MTP stem: normalize embedding, normalize hidden state, pack [2*d, T].
     pub mtp_stem: Option<MtpStemFn>,
+    /// MoE feed-forward layer (routed + shared experts).
+    pub moe_ffn: Option<MoeFn>,
 }
 
 unsafe impl Send for SpiteKernelInfo {}

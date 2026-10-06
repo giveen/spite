@@ -49,6 +49,19 @@ inline bool q35_f32_n(const SpiteTensor *t, int64_t n) {
          (reinterpret_cast<uintptr_t>(t->data) & 3) == 0;
 }
 
+extern "C" int qwen35_cuda_moe_ffn(
+    SpiteTensor*          out,
+    const SpiteTensor*    x,
+    const SpiteTensor*    w_gate_inp,
+    const SpiteTensor*    w_up_exps,
+    const SpiteTensor*    w_gate_exps,
+    const SpiteTensor*    w_down_exps,
+    const SpiteTensor*    w_up_shexp,
+    const SpiteTensor*    w_gate_shexp,
+    const SpiteTensor*    w_down_shexp,
+    const SpiteMoeParams* params,
+    const SpiteCtx*       ctx);
+
 #ifdef __CUDACC__
 __device__ __forceinline__ float q35_warp_sum(float v) {
 #pragma unroll

@@ -231,7 +231,14 @@ impl ModelHyperparams {
             n_heads: u("attention.head_count"),
             n_kv_heads,
             d_model: u("embedding_length"),
-            d_ffn: u("feed_forward_length"),
+            d_ffn: {
+                let ffn = u("feed_forward_length");
+                if ffn > 0 {
+                    ffn
+                } else {
+                    u("expert_feed_forward_length")
+                }
+            },
             vocab_size: vocab,
             max_seq_len: u("context_length"),
             rope_theta,

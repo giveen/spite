@@ -509,3 +509,189 @@ int spite_generic_mtp_stem(
     if (wh) free(wh);
     return 0;
 }
+
+/* ── MoE FFN (ABI v7) ─────────────────────────────────────────────────── */
+
+struct MoeRanked {
+    float score;
+    int id;
+};
+
+static int moe_rank_cmp(const void *a, const void *b) {
+    const struct MoeRanked *ra = (const struct MoeRanked *)a;
+    const struct MoeRanked *rb = (const struct MoeRanked *)b;
+    if (ra->score > rb->score) return -1;
+    if (ra->score < rb->score) return 1;
+    return (ra->id < rb->id) ? -1 : 1;
+}
+
+int spite_generic_moe_ffn(
+    SpiteTensor*          out,
+    const SpiteTensor*    x,
+    const SpiteTensor*    w_gate_inp,
+    const SpiteTensor*    w_up_exps,
+    const SpiteTensor*    w_gate_exps,
+    const SpiteTensor*    w_down_exps,
+    const SpiteTensor*    w_up_shexp,
+    const SpiteTensor*    w_gate_shexp,
+    const SpiteTensor*    w_down_shexp,
+    const SpiteMoeParams* params,
+    const SpiteCtx*       ctx
+) {
+    (void)ctx;
+    if (!out || !x || !w_gate_inp || !w_up_exps || !w_gate_exps || !w_down_exps || !params)
+        return -1;
+    if (x->kind != SPITE_TYPE_F32 || out->kind != SPITE_TYPE_F32)
+        return -1;
+
+    int hidden = (int)x->ne[0];
+    int n_expert = params->num_experts;
+    int n_used = params->num_experts_per_tok;
+    int intermediate = params->intermediate_size;
+    int shared_intermediate = params->shared_intermediate_size;
+    int router_rows = tensor_rows(w_gate_inp);
+    if (router_rows < n_expert || n_used <= 0) return -1;
+
+    float *w_router = dequant_to_f32(w_gate_inp);
+    if (!w_router) return -1;
+
+    /* 1. Router logits */
+    float *scores = (float *)malloc((size_t)router_rows * sizeof(float));
+    if (!scores) { free(w_router); return -1; }
+    for (int r = 0; r < router_rows; ++r) {
+        float acc = 0.0f;
+        const float *rw = w_router + (size_t)r * hidden;
+        const float *xv = (const float *)x->data;
+        for (int c = 0; c < hidden; ++c) {
+            acc += rw[c] * xv[c];
+        }
+        scores[r] = acc;
+    }
+    free(w_router);
+
+    /* 2. Top-k ranking */
+    struct MoeRanked *ranked = (struct MoeRanked *)malloc((size_t)n_expert * sizeof(struct MoeRanked));
+    if (!ranked) { free(scores); return -1; }
+    for (int i = 0; i < n_expert; ++i) {
+        ranked[i].score = scores[i];
+        ranked[i].id = i;
+    }
+    qsort(ranked, (size_t)n_expert, sizeof(struct MoeRanked), moe_rank_cmp);
+
+    int actual_k = (n_used < n_expert) ? n_used : n_expert;
+    float max_s = ranked[0].score;
+    float sum_exp = 0.0f;
+    for (int j = 0; j < actual_k; ++j) {
+        sum_exp += expf(ranked[j].score - max_s);
+    }
+    float *alpha = (float *)malloc((size_t)actual_k * sizeof(float));
+    if (!alpha) { free(scores); free(ranked); return -1; }
+    for (int j = 0; j < actual_k; ++j) {
+        alpha[j] = expf(ranked[j].score - max_s) / (sum_exp > 1e-30f ? sum_exp : 1e-30f);
+    }
+
+    float *w_up = dequant_to_f32(w_up_exps);
+    float *w_gate = dequant_to_f32(w_gate_exps);
+    float *w_down = dequant_to_f32(w_down_exps);
+    if (!w_up || !w_gate || !w_down) {
+        if (w_up) free(w_up);
+        if (w_gate) free(w_gate);
+        if (w_down) free(w_down);
+        free(scores); free(ranked); free(alpha);
+        return -1;
+    }
+
+    float *gate_buf = (float *)malloc((size_t)intermediate * sizeof(float));
+    float *up_buf   = (float *)malloc((size_t)intermediate * sizeof(float));
+    if (!gate_buf || !up_buf) {
+        if (gate_buf) free(gate_buf);
+        if (up_buf) free(up_buf);
+        free(w_up); free(w_gate); free(w_down);
+        free(scores); free(ranked); free(alpha);
+        return -1;
+    }
+
+    const float *xv = (const float *)x->data;
+    float *out_v = (float *)out->data;
+
+    /* 3. Evaluate selected experts */
+    size_t exp_matrix_size = (size_t)intermediate * hidden;
+    for (int j = 0; j < actual_k; ++j) {
+        int e = ranked[j].id;
+        float a = alpha[j];
+        const float *ge = w_gate + (size_t)e * exp_matrix_size;
+        const float *ue = w_up + (size_t)e * exp_matrix_size;
+        const float *de = w_down + (size_t)e * exp_matrix_size;
+
+        for (int r = 0; r < intermediate; ++r) {
+            float g_acc = 0.0f;
+            float u_acc = 0.0f;
+            const float *gr = ge + (size_t)r * hidden;
+            const float *ur = ue + (size_t)r * hidden;
+            for (int c = 0; c < hidden; ++c) {
+                g_acc += gr[c] * xv[c];
+                u_acc += ur[c] * xv[c];
+            }
+            gate_buf[r] = a * (silu(g_acc) * u_acc);
+        }
+
+        /* out += de . gate_buf (de is [hidden, intermediate]) */
+        for (int r = 0; r < hidden; ++r) {
+            float d_acc = 0.0f;
+            const float *dr = de + (size_t)r * intermediate;
+            for (int c = 0; c < intermediate; ++c) {
+                d_acc += dr[c] * gate_buf[c];
+            }
+            out_v[r] += d_acc;
+        }
+    }
+
+    free(gate_buf);
+    free(up_buf);
+    free(w_up);
+    free(w_gate);
+    free(w_down);
+
+    /* 4. Shared expert (if present) */
+    if (w_up_shexp && w_gate_shexp && w_down_shexp && shared_intermediate > 0) {
+        float *w_su = dequant_to_f32(w_up_shexp);
+        float *w_sg = dequant_to_f32(w_gate_shexp);
+        float *w_sd = dequant_to_f32(w_down_shexp);
+        if (w_su && w_sg && w_sd) {
+            float sh_gate_logit = (router_rows > n_expert) ? scores[n_expert] : 0.0f;
+            float sh_scale = 1.0f / (1.0f + expf(-sh_gate_logit));
+
+            float *sh_buf = (float *)malloc((size_t)shared_intermediate * sizeof(float));
+            if (sh_buf) {
+                for (int r = 0; r < shared_intermediate; ++r) {
+                    float g_acc = 0.0f;
+                    float u_acc = 0.0f;
+                    const float *gr = w_sg + (size_t)r * hidden;
+                    const float *ur = w_su + (size_t)r * hidden;
+                    for (int c = 0; c < hidden; ++c) {
+                        g_acc += gr[c] * xv[c];
+                        u_acc += ur[c] * xv[c];
+                    }
+                    sh_buf[r] = sh_scale * (silu(g_acc) * u_acc);
+                }
+                for (int r = 0; r < hidden; ++r) {
+                    float d_acc = 0.0f;
+                    const float *dr = w_sd + (size_t)r * shared_intermediate;
+                    for (int c = 0; c < shared_intermediate; ++c) {
+                        d_acc += dr[c] * sh_buf[c];
+                    }
+                    out_v[r] += d_acc;
+                }
+                free(sh_buf);
+            }
+        }
+        if (w_su) free(w_su);
+        if (w_sg) free(w_sg);
+        if (w_sd) free(w_sd);
+    }
+
+    free(scores);
+    free(ranked);
+    free(alpha);
+    return 0;
+}

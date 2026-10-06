@@ -50,6 +50,12 @@ int spite_generic_mtp_stem(
     SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
     const SpiteTensor*, const SpiteTensor*, float, const SpiteCtx*);
 
+int spite_generic_moe_ffn(
+    SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
+    const SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
+    const SpiteTensor*, const SpiteTensor*, const SpiteTensor*,
+    const SpiteMoeParams*, const SpiteCtx*);
+
 static const SpiteKernelInfo GENERIC_KERNEL_INFO = {
     .abi_version = SPITE_ABI_VERSION,
     .model_arch  = "generic",
@@ -82,6 +88,7 @@ static const SpiteKernelInfo GENERIC_KERNEL_INFO = {
     .linear_attn         = spite_generic_linear_attn,
     .attention_ex        = spite_generic_attention_ex,
     .mtp_stem            = spite_generic_mtp_stem,
+    .moe_ffn             = spite_generic_moe_ffn,
 };
 
 const SpiteKernelInfo *spite_kernel_info(void) {
