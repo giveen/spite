@@ -41,6 +41,13 @@ class SpiteKernelInfo(ctypes.Structure):
                 ("attention_ex", ctypes.c_void_p), ("mtp_stem", ctypes.c_void_p),
                 ("moe_ffn", ctypes.c_void_p)]
 
+class SpiteKvCache(ctypes.Structure):
+    _fields_ = [("k", SpiteTensor), ("v", SpiteTensor), ("layer", ctypes.c_int)]
+
+class AttnParams(ctypes.Structure):
+    _fields_ = [("head_dim", ctypes.c_int32), ("rope_dim", ctypes.c_int32),
+                ("gated_q", ctypes.c_int32)]
+
 def tensor(p, ne):
     ne = list(ne) + [1] * (4 - len(ne))
     nb = [4, 0, 0, 0]
@@ -146,6 +153,56 @@ def main(kernel_path, cudart_path):
         ok = ok and ret2 == 0 and d2 < 1e-5
     else:
         print("matmul: SKIP")
+
+    if info.attention_ex:
+        AttnExFn = ctypes.CFUNCTYPE(
+            ctypes.c_int, ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.POINTER(SpiteTensor), ctypes.POINTER(SpiteTensor),
+            ctypes.c_float, ctypes.POINTER(SpiteKvCache), ctypes.c_float,
+            ctypes.POINTER(AttnParams), ctypes.POINTER(SpiteCtx))
+        attn = AttnExFn(info.attention_ex)
+        nh, nkv, hd, rd, gated = 4, 2, 64, 64, 1
+        dm, nctx, m = 64, 16, 3
+        q_rows = nh * hd * (2 if gated else 1)
+        kv_stride = nkv * hd
+        wq = [rng.uniform(-1, 1) for _ in range(dm * q_rows)]
+        wk = [rng.uniform(-1, 1) for _ in range(dm * kv_stride)]
+        wv = [rng.uniform(-1, 1) for _ in range(dm * kv_stride)]
+        wo = [rng.uniform(-1, 1) for _ in range(nh * hd * dm)]
+        x = [rng.uniform(-1, 1) for _ in range(dm * m)]
+        p = AttnParams(hd, rd, gated)
+        pWq, pWk, pWv, pWo = alloc(dm * q_rows * 4), alloc(dm * kv_stride * 4), alloc(dm * kv_stride * 4), alloc(nh * hd * dm * 4)
+        h2d(pWq, wq); h2d(pWk, wk); h2d(pWv, wv); h2d(pWo, wo)
+        # KV rows must be 16-byte aligned with nb[1] = kv_stride*4.
+        pK, pV = alloc(kv_stride * nctx * 4), alloc(kv_stride * nctx * 4)
+        scratch_bytes = 1 << 21
+        pScr = alloc(scratch_bytes)
+
+        def run_attn(pos, mm, kbuf, vbuf, xslice):
+            kv = SpiteKvCache(tensor(kbuf, [kv_stride, nctx]), tensor(vbuf, [kv_stride, nctx]), 0)
+            pX, pO = alloc(dm * mm * 4), alloc(dm * mm * 4)
+            h2d(pX, xslice)
+            ctx = SpiteCtx(nctx, mm, 1, pos, nh, nkv, None, ctypes.cast(pScr, ctypes.c_void_p), scratch_bytes)
+            r = attn(ctypes.byref(tensor(pO, [dm, mm])), ctypes.byref(tensor(pX, [dm, mm])),
+                     ctypes.byref(tensor(pWq, [dm, q_rows])), ctypes.byref(tensor(pWk, [dm, kv_stride])),
+                     ctypes.byref(tensor(pWv, [dm, kv_stride])), ctypes.byref(tensor(pWo, [nh * hd, dm])),
+                     None, None, ctypes.c_float(1e-5), ctypes.byref(kv), ctypes.c_float(10000.0),
+                     ctypes.byref(p), ctypes.byref(ctx))
+            assert cudart.cudaDeviceSynchronize() == 0
+            assert r == 0, r
+            return d2h(pO, dm * mm)
+
+        batched = run_attn(0, m, pK, pV, x)
+        seq = []
+        for t in range(m):
+            seq += run_attn(t, 1, pK, pV, x[dm * t:dm * (t + 1)])
+        d3 = max(abs(a - b) for a, b in zip(batched, seq))
+        print(f"attention_ex batch m={m} vs sequential: max_abs_diff={d3:.2e}")
+        ok = ok and d3 < 1e-5
+    else:
+        print("attention_ex: SKIP")
 
     print("BATCH CUDA PASSED" if ok else "BATCH CUDA FAILED")
     return 0 if ok else 1
