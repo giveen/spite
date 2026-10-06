@@ -119,6 +119,10 @@ pub struct ModelConfig {
     pub indexer_types: Vec<bool>,
     pub key_length_mla: usize,
     pub value_length_mla: usize,
+    pub key_length_swa: usize,
+    pub value_length_swa: usize,
+    pub rope_freq_base_swa: f32,
+    pub final_logit_softcapping: f32,
 
     // ── RoPE scaling (YaRN / linear / NTK) ───────────────────────────────
     /// Multiplicative rope scale factor. 1.0 = no scaling (default).
@@ -211,6 +215,10 @@ impl Default for ModelConfig {
             indexer_types: Vec::new(),
             key_length_mla: 0,
             value_length_mla: 0,
+            key_length_swa: 0,
+            value_length_swa: 0,
+            rope_freq_base_swa: 10000.0,
+            final_logit_softcapping: 0.0,
             rope_scale_factor: 1.0,
             rope_original_ctx: 0,
             yarn_beta_fast: 32.0,
@@ -277,6 +285,10 @@ impl From<spite_loader::config::ModelHyperparams> for ModelConfig {
             indexer_types: h.indexer_types,
             key_length_mla: h.key_length_mla as usize,
             value_length_mla: h.value_length_mla as usize,
+            key_length_swa: h.key_length_swa as usize,
+            value_length_swa: h.value_length_swa as usize,
+            rope_freq_base_swa: h.rope_freq_base_swa,
+            final_logit_softcapping: h.final_logit_softcapping,
             ..Default::default()
         }
     }

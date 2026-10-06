@@ -105,6 +105,10 @@ pub struct ModelHyperparams {
     pub indexer_types: Vec<bool>,
     pub key_length_mla: u32,
     pub value_length_mla: u32,
+    pub key_length_swa: u32,
+    pub value_length_swa: u32,
+    pub rope_freq_base_swa: f32,
+    pub final_logit_softcapping: f32,
 }
 
 impl ModelHyperparams {
@@ -198,11 +202,32 @@ impl ModelHyperparams {
             }
         };
 
+        let head_count_kv_arr: Vec<u32> = match meta.get(&format!("{arch}.attention.head_count_kv"))
+        {
+            Some(crate::MetaValue::Array(items)) => items
+                .iter()
+                .map(|v| match v {
+                    crate::MetaValue::U32(x) => *x,
+                    crate::MetaValue::I32(x) => *x as u32,
+                    _ => 0,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let n_kv_heads = {
+            let scalar = u("attention.head_count_kv");
+            if scalar > 0 {
+                scalar
+            } else {
+                head_count_kv_arr.first().copied().unwrap_or(0)
+            }
+        };
+
         Self {
             arch: arch.to_owned(),
             n_layers,
             n_heads: u("attention.head_count"),
-            n_kv_heads: u("attention.head_count_kv"),
+            n_kv_heads,
             d_model: u("embedding_length"),
             d_ffn: u("feed_forward_length"),
             vocab_size: vocab,
@@ -265,17 +290,7 @@ impl ModelHyperparams {
             attn_res_block_size: u("attn_res.block_size"),
             situ_beta: f("activation.situ_beta"),
             situ_linear_beta: f("activation.situ_linear_beta"),
-            head_count_kv_arr: match meta.get(&format!("{arch}.attention.head_count_kv")) {
-                Some(crate::MetaValue::Array(items)) => items
-                    .iter()
-                    .map(|v| match v {
-                        crate::MetaValue::U32(x) => *x,
-                        crate::MetaValue::I32(x) => *x as u32,
-                        _ => 0,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            },
+            head_count_kv_arr,
             hc_mult: u("hyper_connection.count"),
             hc_eps: f("hyper_connection.epsilon"),
             hc_sinkhorn_iters: u("hyper_connection.sinkhorn_iterations"),
@@ -311,6 +326,10 @@ impl ModelHyperparams {
             },
             key_length_mla: u("attention.key_length_mla"),
             value_length_mla: u("attention.value_length_mla"),
+            key_length_swa: u("attention.key_length_swa"),
+            value_length_swa: u("attention.value_length_swa"),
+            rope_freq_base_swa: f("rope.freq_base_swa"),
+            final_logit_softcapping: f("final_logit_softcapping"),
         }
     }
 

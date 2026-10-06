@@ -155,12 +155,21 @@ impl GpuDense {
 
         // head_dim from the Q projection (Qwen3 small variants have
         // head_dim != d_model / n_heads).
-        let wq0 = gguf.tensor("blk.0.attn_q.weight");
-        if wq0.is_null() {
-            return Err(ModelError::MissingWeight("blk.0.attn_q.weight".into()));
+        let mut max_head_dim = 0usize;
+        let mut max_kv_row = 0usize;
+        for layer in 0..config.n_layers {
+            let b = format!("blk.{layer}");
+            let wq = gguf.tensor(&format!("{b}.attn_q.weight"));
+            let wk = gguf.tensor(&format!("{b}.attn_k.weight"));
+            if !wq.is_null() && !wk.is_null() {
+                let hd = wq.ne[1] as usize / n_heads.max(1);
+                let kvr = wk.ne[1] as usize;
+                max_head_dim = max_head_dim.max(hd);
+                max_kv_row = max_kv_row.max(kvr);
+            }
         }
-        let head_dim = wq0.ne[1] as usize / n_heads.max(1);
-        let kv_row = n_kv * head_dim;
+        let head_dim = max_head_dim.max(d / n_heads.max(1));
+        let kv_row = max_kv_row.max(n_kv * head_dim);
 
         // ── Size everything first so we fail before allocating. ──────────
         let mut sizes = Vec::new();
@@ -588,10 +597,13 @@ impl ModelArch for GpuDense {
                 let (wq, wk, wv, wo) = (
                     w(&format!("{b}.attn_q.weight"))?,
                     w(&format!("{b}.attn_k.weight"))?,
-                    w(&format!("{b}.attn_v.weight"))?,
+                    w(&format!("{b}.attn_v.weight"))
+                        .or_else(|_| w(&format!("{b}.attn_k.weight")))?,
                     w(&format!("{b}.attn_output.weight"))?,
                 );
-                let (qn, kn) = if self.apply_qk_norm {
+                let (qn, kn) = if self.apply_qk_norm
+                    || st.weights.contains_key(&format!("{b}.attn_q_norm.weight"))
+                {
                     (
                         opt(&format!("{b}.attn_q_norm.weight")),
                         opt(&format!("{b}.attn_k_norm.weight")),
@@ -605,7 +617,19 @@ impl ModelArch for GpuDense {
                     w(&format!("{b}.ffn_up.weight"))?,
                     w(&format!("{b}.ffn_down.weight"))?,
                 );
-                let kv_ne = [kv_row as u32, self.n_ctx as u32, 1, 1];
+                let head_dim = (wq.ne[1] as usize) / cfg.n_heads.max(1);
+                let layer_n_kv = (wk.ne[1] as usize)
+                    .checked_div(head_dim)
+                    .unwrap_or(cfg.n_kv_heads);
+                let kv_stride = wk.ne[1] as usize;
+                let mut layer_kctx = kctx;
+                layer_kctx.n_kv_heads = layer_n_kv as c_int;
+                let rope_theta = if cfg.arch == "gemma4" && (layer + 1) % 6 == 0 {
+                    1_000_000.0
+                } else {
+                    cfg.rope_theta
+                };
+                let kv_ne = [kv_stride as u32, self.n_ctx as u32, 1, 1];
                 let mut kv = SpiteKvCache {
                     k: SpiteTensor {
                         data: st.k_cache[layer].as_ptr().cast(),
@@ -626,7 +650,7 @@ impl ModelArch for GpuDense {
                 // `st`; the kernel ABI is version-checked at load.
                 unsafe {
                     rc(
-                        rms_norm(&mut n_t, &h_t, &attn_norm, cfg.norm_eps, &kctx),
+                        rms_norm(&mut n_t, &h_t, &attn_norm, cfg.norm_eps, &layer_kctx),
                         "rms_norm",
                         layer,
                     )?;
@@ -642,8 +666,8 @@ impl ModelArch for GpuDense {
                             kn.as_ref().map_or(null, |t| t as *const _),
                             cfg.norm_eps,
                             &mut kv,
-                            cfg.rope_theta,
-                            &kctx,
+                            rope_theta,
+                            &layer_kctx,
                         ),
                         "attention",
                         layer,
