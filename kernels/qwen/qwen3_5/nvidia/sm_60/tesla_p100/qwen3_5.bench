@@ -6,11 +6,16 @@
 # unsloth Qwen3.8-27B Q6_K (~20.9 GiB), 64 trunk layers + 1 NextN. These are
 # spite-bench output, not generated on the 6x P100 target.
 #
-# NOTE: these rows predate the batched-prefill change (reviewer note #5), so
-# prefill is still the per-token path. Regenerate on the P100 box after that
-# lands to replace the prefill column.
-#
 # Reference on the same box and file: llama.cpp (-sm layer) decodes at 8.90
 # tok/s and processes a 512-token prompt at 117.5 tok/s.
+#
+# STILL MISSING for the AGENTS.md gate: the "before" row, which must be the
+# generic fallback (kernels/generic/generic) on this same box:
+#   cargo run --release -p spite-bench -- --model <Q6_K>.gguf --device cpu \
+#     --n-prompt 16 --n-tokens 8 --n-runs 1
+# NOTE: rows carrying a head sha were measured on that head. f85a2a2 is the
+# first head where a 2-stage split takes the batched prefill path at all
+# (7.89 vs 7.24 tok/s, 1.09x); the prefill column is still the number to beat.
 Qwen3.8-27B-Q6_K.gguf (unsloth) [cuda (sm_60), 2x P100-PCIE, 2-stage]               6.7 tok/s  prefill   6.9 tok/s  TTFT  1020.7 ms  mem 20969 MiB  (n=5)
-Qwen3.8-27B-Q6_K.gguf (unsloth) [cuda (sm_60), 2x P100-PCIE, 2-stage, n_prompt=512] 6.7 tok/s  prefill   7.2 tok/s  TTFT 70771.5 ms  mem 20969 MiB  (n=3)
+Qwen3.8-27B-Q6_K.gguf (unsloth) [cuda (sm_60), 2x P100-PCIE, 2-stage, n_prompt=512, f1cc494] 6.7 tok/s  prefill   7.2 tok/s  TTFT 70771.5 ms  mem 20969 MiB  (n=3)
+Qwen3.8-27B-Q6_K.gguf (unsloth) [cuda (sm_60), 2x P100-PCIE, 2-stage, n_prompt=512, f85a2a2] 6.7 tok/s  prefill   7.9 tok/s  TTFT 64900.0 ms  mem 20969 MiB  (n=3)

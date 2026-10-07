@@ -127,7 +127,8 @@ host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
   - the CUDA vendor ops batch too: `q35_gemv_batch` (multi-column GEMV) drives
     `ffn`, `matmul`, the `attention_ex` projections and the `linear_attn`
     projections (`a095efe`, `1e4bbff`, `3a61c99`); attention and the GDN
-    recurrence stay per token, the weight stream is amortised over m.
+    recurrence stay per token, so the weight stream is read once per 4-column
+    chunk instead of once per token.
   - an optional `spite_kernel_caps()` bit (`SPITE_CAP_BATCH`, no ABI bump) lets a
     kernel advertise batch support; the dispatcher reads it and
     `batch_capable()` gates on it (`290c102`).
@@ -141,8 +142,19 @@ host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
     float64 oracle, attention_ex/linear_attn bit-identical to sequential m=1 with
     KV/state carried. `verify.py` (m=1) still passes; Qwen3.8-27B runs end to end
     on the host GPU through the sm_60 build.
-  - **still needs the P100s**: a `spite-bench` prefill before/after (the win is
-    expected but unmeasured) and a `.bench` refresh.
+  - **measured on the 2× P100-PCIE (PHB) box, 512-token prompt: 7.24 → 7.89
+    prefill tok/s (`f1cc494` → `f85a2a2`, TTFT 70.7 → 64.9 s, 1.09×).** The
+    kernel `.so` is byte-identical between the two heads, so this is the host
+    path alone. It also says the GEMV's ~4× weight-traffic cut is *not* what
+    bounds prefill: 9% of the time is all it bought, so per-token/per-op cost
+    dominates (profiling plan in the PR). Prefill is still ~15× off
+    llama.cpp's 117.5 tok/s on the same box and file.
+  - **still needs the P100s**: a `spite-bench` before/after posted in the PR
+    description — the `.bench` carries the measured rows, but the
+    generic-fallback "before" row is still missing.
+  - **MTP prompt prefill**: a prefill now fills the draft block's own KV cache
+    over the prompt (one draft pass per prompt token, ~1–2% of prefill) instead
+    of leaving those rows unwritten; see `HybridDecoder::forward`.
 - **PXQ4 = MXFP4: done.** PXQ4 is pxa's repack of MXFP4 (ggml type 39): 32-element
   blocks, E8M0 scale, e2m1 codes, 4.25 bpw — the tier that fits a 27B on one
   16 GB P100. Inference already worked in spite (CPU `dq_mxfp4`, the CUDA

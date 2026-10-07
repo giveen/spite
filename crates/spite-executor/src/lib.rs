@@ -272,7 +272,15 @@ impl Executor {
         self.n_ctx_used
     }
 
-    /// Roll back the context position by `n` steps (e.g. on rejected speculative draft tokens).
+    /// Roll back the context **position** by `n` steps.
+    ///
+    /// This moves the position counter only. KV rows past the new position are
+    /// simply overwritten, but the GDN conv history and delta-rule state are
+    /// *not* restored: they carry across tokens and have no positional index.
+    /// A caller that drops rejected speculative drafts therefore cannot rely on
+    /// this alone — it needs the trunk to re-process the accepted prefix (what
+    /// [`Self::generate_speculative_from_logits`] does) or a real snapshot of
+    /// the recurrent state.
     pub fn rollback(&mut self, n: usize) {
         self.n_ctx_used = self.n_ctx_used.saturating_sub(n);
     }

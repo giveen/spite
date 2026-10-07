@@ -955,6 +955,10 @@ impl ModelArch for HybridDecoder {
 
         // Host bounce buffer: the token embedding, then each stage hand-off.
         let mut host = vec![0f32; d];
+        // The draft block's own logits are discarded while its KV cache is
+        // filled; only the last position is left for the decode loop's first
+        // `mtp_step`, which knows the sampled token that follows it.
+        let mut draft_logits = vec![0f32; if self.mtp.is_some() { vocab } else { 0 }];
         for (ti, &tok) in tokens.iter().enumerate() {
             let pos = ctx.pos as usize + ti;
             if pos >= self.n_ctx {
@@ -1013,6 +1017,12 @@ impl ModelArch for HybridDecoder {
             st.logits
                 .download(f32_bytes_mut(&mut logits_out[ti * vocab..(ti + 1) * vocab]))
                 .map_err(|e| err(e.to_string()))?;
+            // The draft block attends over its own KV cache, so the prompt's
+            // rows have to be written here, where the trunk hidden state and
+            // the following token are both in hand (`h_t` is `st.hid`).
+            if self.mtp.is_some() && ti + 1 < tokens.len() {
+                self.mtp_step_locked(st, tokens[ti + 1], pos, &mut draft_logits)?;
+            }
         }
         Ok(())
     }
@@ -1039,11 +1049,25 @@ impl HybridDecoder {
     /// `pos + 1`.
     ///
     /// The draft block attends over its own KV cache, so every position up to
-    /// `pos` must have been through `mtp_step` (run it after each trunk token,
-    /// prompt included); a rejected draft is undone by re-running the trunk,
-    /// whose `forward` refreshes `h_t`, and the stale rows are overwritten.
+    /// `pos` must have been through `mtp_step`. A prompt prefill fills the rows
+    /// for the prompt itself (see [`Self::forward`]); a rejected draft is undone
+    /// by re-running the trunk, whose `forward` refreshes `h_t`, and the stale
+    /// rows are overwritten.
     pub fn mtp_step(
         &self,
+        token: u32,
+        pos: usize,
+        logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+        self.mtp_step_locked(&mut guard, token, pos, logits_out)
+    }
+
+    /// [`Self::mtp_step`] on state the caller already holds locked, so the
+    /// prompt prefill can fill the draft block's KV cache in token order.
+    fn mtp_step_locked(
+        &self,
+        st: &mut HState,
         token: u32,
         pos: usize,
         logits_out: &mut [f32],
@@ -1069,8 +1093,6 @@ impl HybridDecoder {
         ) else {
             return Err(err("dispatch table incomplete for the MTP head"));
         };
-        let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
-        let st = &mut *guard;
         // The MTP block, its KV and `hid` all live on the last stage.
         let last = st.stages.len() - 1;
         self.enter(st, last)?;
@@ -1273,6 +1295,10 @@ impl HybridDecoder {
         };
         let mut hid = f32_tensor(&st.hid, d);
         let mut logits = f32_tensor(&st.logits, vocab);
+        // Filled by the draft block while it copies the prompt into its own KV
+        // cache; see the per-token path above for why the last column is left
+        // to the decode loop's first `mtp_step`.
+        let mut draft_logits = vec![0f32; if self.mtp.is_some() { vocab } else { 0 }];
         for t in 0..m {
             let ht = f32_tensor_col(&hbufs[last], d, t);
             // SAFETY: every tensor points at live memory owned by `st` / `self`.
@@ -1291,6 +1317,9 @@ impl HybridDecoder {
             st.logits
                 .download(f32_bytes_mut(&mut logits_out[t * vocab..(t + 1) * vocab]))
                 .map_err(|e| err(e.to_string()))?;
+            if self.mtp.is_some() && t + 1 < m {
+                self.mtp_step_locked(st, tokens[t + 1], ctx.pos as usize + t, &mut draft_logits)?;
+            }
         }
         Ok(())
     }

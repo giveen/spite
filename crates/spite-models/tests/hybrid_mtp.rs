@@ -270,6 +270,43 @@ fn batched_prefill_matches_sequential() {
     let _ = std::fs::remove_dir_all(kdir);
 }
 
+/// A prompt prefill must also populate the draft block's own KV cache, exactly
+/// as running `mtp_step` after every prompt token does: the NextN block attends
+/// over that cache, so a draft taken straight after a prefill must equal the
+/// reference draft for the same position. Without it the head drafts against
+/// empty rows and the acceptance rate is meaningless.
+#[test]
+fn prefill_fills_the_mtp_kv() {
+    // Two fresh decoders: `reset_cache` clears the GDN state but not KV rows, so
+    // the reference run must not leave rows for the prefill to reuse.
+    let (reference, vocab, kdir_ref) = load("tiny-qwen35-mtp-full-f16.gguf", "mtpkv-ref");
+    // Reference: the trunk one token at a time, mtp_step after every token.
+    let (_, want) = run(&reference, vocab, 9);
+    drop(reference);
+
+    let (model, _, kdir) = load("tiny-qwen35-mtp-full-f16.gguf", "mtpkv");
+    let mut trunk = vec![0f32; TOKENS.len() * vocab];
+    model
+        .forward(&TOKENS, &mut trunk, &ctx(0))
+        .expect("batched prefill");
+
+    let mut got = vec![0f32; vocab];
+    model
+        .mtp_step(9, TOKENS.len() - 1, &mut got)
+        .expect("mtp_step");
+    let d = got
+        .iter()
+        .zip(&want[TOKENS.len() - 1])
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        d <= TOL,
+        "the draft after a prefill differs from the per-token reference by {d:e}: \
+         the MTP KV rows for the prompt were not written"
+    );
+    let _ = std::fs::remove_dir_all(kdir);
+    let _ = std::fs::remove_dir_all(kdir_ref);
+}
+
 /// Batched prefill must work across a pipeline split too: the whole `[d, m]`
 /// block crosses the stage boundary through host memory, so the split's logits
 /// must be identical to both the unsplit batched run and the per-token run.
