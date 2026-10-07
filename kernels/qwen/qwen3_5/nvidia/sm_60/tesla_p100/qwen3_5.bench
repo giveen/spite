@@ -1,4 +1,16 @@
-# Tesla P100 (sm_60): NOT YET MEASURED — no P100 has run this tree.
-# Every op resolves to kernels/qwen/qwen3_5/nvidia/ (the card .so only exports
-# NVLink helpers). Replace these lines with spite-bench output from a P100,
-# same format as ../../sm_120/rtx_5090/qwen3_5.bench, before opening a kernel PR.
+# Tesla P100 (sm_60). Every op resolves to kernels/qwen/qwen3_5/nvidia/ (the
+# card .so only exports NVLink helpers).
+#
+# Measured by @apollo-mg on a 2x Tesla P100-PCIE-16GB box (PHB, no NVLink),
+# driver 580.178.04, CUDA 12.4, SM clock locked at 1328 MHz, 2-stage pipeline.
+# unsloth Qwen3.8-27B Q6_K (~20.9 GiB), 64 trunk layers + 1 NextN. These are
+# spite-bench output, not generated on the 6x P100 target.
+#
+# NOTE: these rows predate the batched-prefill change (reviewer note #5), so
+# prefill is still the per-token path. Regenerate on the P100 box after that
+# lands to replace the prefill column.
+#
+# Reference on the same box and file: llama.cpp (-sm layer) decodes at 8.90
+# tok/s and processes a 512-token prompt at 117.5 tok/s.
+Qwen3.8-27B-Q6_K.gguf (unsloth) [cuda (sm_60), 2x P100-PCIE, 2-stage]               6.7 tok/s  prefill   6.9 tok/s  TTFT  1020.7 ms  mem 20969 MiB  (n=5)
+Qwen3.8-27B-Q6_K.gguf (unsloth) [cuda (sm_60), 2x P100-PCIE, 2-stage, n_prompt=512] 6.7 tok/s  prefill   7.2 tok/s  TTFT 70771.5 ms  mem 20969 MiB  (n=3)

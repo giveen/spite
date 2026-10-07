@@ -1346,6 +1346,7 @@ dependencies = [
  "spite-dispatch",
  "spite-gpu",
  "spite-kvcache",
+ "spite-loader",
  "spite-models",
  "spite-offload",
  "spite-plugin",

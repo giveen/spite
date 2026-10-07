@@ -131,6 +131,11 @@ host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
   - an optional `spite_kernel_caps()` bit (`SPITE_CAP_BATCH`, no ABI bump) lets a
     kernel advertise batch support; the dispatcher reads it and
     `batch_capable()` gates on it (`290c102`).
+  - a **pipeline split batches too**: `forward_batch` runs one op per layer with
+    a per-stage `[d, m]` activation and hands the whole block between stages
+    through the same host hop as the 1-token path, and `batch_capable()` no
+    longer requires every stage on one device. Without this a 27B that needs
+    two 16 GB P100s (always split) never took the batched path.
   - verified with `tools/verify/verify_batch.py` (CPU) and
     `tools/verify/verify_batch_cuda.py` (device, PTX JIT): ffn/matmul ~8e-8 vs a
     float64 oracle, attention_ex/linear_attn bit-identical to sequential m=1 with

@@ -228,19 +228,6 @@ fn main() -> Result<()> {
         table.print_sources();
     }
 
-    let backend = if args.device == Device::Cpu {
-        spite_gpu::GpuBackend::Cpu
-    } else {
-        spite_gpu::GpuBackend::detect()
-    };
-
-    let mut mtp_runner = if use_mtp {
-        let table = dispatch_table.unwrap_or_else(spite_dispatch::DispatchTable::fallback);
-        Some(MtpBenchRunner::new(&gguf, model.config(), table, backend)?)
-    } else {
-        None
-    };
-
     // Fixed prompt keeps runs comparable; real-model runs use --n-tokens.
     let prompt_text = args
         .prompt
@@ -306,7 +293,7 @@ fn main() -> Result<()> {
         };
         let mut rng = 0u64;
 
-        let mut run_tokens = 0usize;
+        let run_tokens: usize;
         if !use_mtp {
             for _ in 0..args.n_tokens {
                 let tok = spite_sampling::sample(&mut logits, &ids, &cfg, &mut rng)?;
@@ -315,47 +302,23 @@ fn main() -> Result<()> {
             }
             run_tokens = args.n_tokens;
         } else {
-            let mtp = mtp_runner.as_mut().expect("mtp runner initialized");
-            while run_tokens < args.n_tokens {
-                // 1. Sample verified token from trunk logits
-                let tok = spite_sampling::sample(&mut logits, &ids, &cfg, &mut rng)?;
-                ids.push(tok);
-                run_tokens += 1;
-                if run_tokens >= args.n_tokens {
-                    break;
-                }
-
-                // 2. Draft up to K tokens using MTP stem
-                let mut current_tok = tok;
-                for _ in 0..draft_tokens {
-                    mtp.draft_step(current_tok, &ctx)?;
-
-                    let draft_tok = spite_sampling::sample(&mut logits, &ids, &cfg, &mut rng)?;
-                    total_drafts += 1;
-
-                    // 3. Verify candidate token with main model forward
-                    let next_logits = exec.decode_step(draft_tok, &ctx)?;
-                    let expected_tok =
-                        spite_sampling::sample(&mut next_logits.clone(), &ids, &cfg, &mut rng)?;
-
-                    if draft_tok == expected_tok {
-                        ids.push(draft_tok);
-                        run_tokens += 1;
-                        accepted_drafts += 1;
-                        logits = next_logits;
-                        current_tok = draft_tok;
-                        if run_tokens >= args.n_tokens {
-                            break;
-                        }
-                    } else {
-                        exec.rollback(1);
-                        ids.push(expected_tok);
-                        run_tokens += 1;
-                        logits = exec.decode_step(expected_tok, &ctx)?;
-                        break;
-                    }
-                }
-            }
+            // Real MTP self-speculation: the model's NextN head drafts, the
+            // trunk verifies. `logits` is the post-prefill trunk distribution;
+            // the entry point times the decode half of the run.
+            let (pieces, sstats) = exec.generate_speculative_from_logits(
+                &tokenizer,
+                &prompt_ids,
+                logits,
+                args.n_tokens,
+                spite_executor::SpecDecodeConfig {
+                    temperature: 0.0,
+                    seed: 0x1234_5678_9abc_def0,
+                    n_draft: draft_tokens,
+                },
+            )?;
+            run_tokens = pieces.len();
+            total_drafts += sstats.drafted;
+            accepted_drafts += sstats.accepted;
         }
         decode_s += t1.elapsed().as_secs_f64();
         n_tok += run_tokens;
@@ -391,222 +354,6 @@ fn main() -> Result<()> {
         result.print();
     }
     Ok(())
-}
-
-struct MtpBenchRunner {
-    table: spite_dispatch::DispatchTable,
-    buf_out: spite_gpu::DeviceBuffer,
-    buf_embed: spite_gpu::DeviceBuffer,
-    buf_hidden: spite_gpu::DeviceBuffer,
-    buf_enorm: Option<spite_gpu::DeviceBuffer>,
-    buf_hnorm: Option<spite_gpu::DeviceBuffer>,
-    d_model: usize,
-    vocab_size: usize,
-    norm_eps: f32,
-    embd_tensor: spite_abi::SpiteTensor,
-    backend: spite_gpu::GpuBackend,
-    /// Device the runner's buffers live on; `draft_step` makes it current so
-    /// the stem kernel launches there even after a pipeline `forward` left a
-    /// different stage's device current.
-    device: usize,
-}
-
-impl MtpBenchRunner {
-    fn new(
-        gguf: &spite_loader::GgufModel,
-        cfg: &spite_models::ModelConfig,
-        table: spite_dispatch::DispatchTable,
-        backend: spite_gpu::GpuBackend,
-    ) -> Result<Self> {
-        let d = cfg.d_model;
-        // Allocate the runner's scratch on one fixed device and make it current
-        // before every launch: after a multi-GPU `forward` the current device is
-        // the last stage, which is not where these buffers live.
-        let device = if backend == spite_gpu::GpuBackend::Cuda {
-            spite_gpu::cuda::current_device().unwrap_or(0)
-        } else {
-            0
-        };
-        let buf_out = spite_gpu::DeviceBuffer::alloc_on(backend, device, 2 * d * 4)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut buf_embed = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut buf_hidden = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let init_zeros = vec![0.0f32; d];
-        let bytes_zeros =
-            unsafe { std::slice::from_raw_parts(init_zeros.as_ptr() as *const u8, d * 4) };
-        buf_embed
-            .upload(bytes_zeros)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        buf_hidden
-            .upload(bytes_zeros)
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-        let mtp_layer = cfg.n_layers;
-        let t_en = gguf.tensor(&format!("blk.{mtp_layer}.nextn.enorm.weight"));
-        let t_hn = gguf.tensor(&format!("blk.{mtp_layer}.nextn.hnorm.weight"));
-
-        let mut buf_enorm = None;
-        let mut buf_hnorm = None;
-
-        if !t_en.data.is_null() && !t_hn.data.is_null() {
-            let mut b_en = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut b_hn = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            let mut en_f32 = vec![0.0f32; d];
-            let mut hn_f32 = vec![0.0f32; d];
-
-            let en_bytes = unsafe {
-                std::slice::from_raw_parts(t_en.data as *const u8, t_en.nb[0] as usize * d)
-            };
-            let hn_bytes = unsafe {
-                std::slice::from_raw_parts(t_hn.data as *const u8, t_hn.nb[0] as usize * d)
-            };
-            let _ = spite_compute::dequant::dequant_to_f32(en_bytes, t_en.kind, d, &mut en_f32);
-            let _ = spite_compute::dequant::dequant_to_f32(hn_bytes, t_hn.kind, d, &mut hn_f32);
-
-            let en_u8 = unsafe { std::slice::from_raw_parts(en_f32.as_ptr() as *const u8, d * 4) };
-            let hn_u8 = unsafe { std::slice::from_raw_parts(hn_f32.as_ptr() as *const u8, d * 4) };
-            b_en.upload(en_u8).map_err(|e| anyhow::anyhow!("{e}"))?;
-            b_hn.upload(hn_u8).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-            buf_enorm = Some(b_en);
-            buf_hnorm = Some(b_hn);
-        } else if !cfg.arch.contains("gemma") {
-            let mut b_en = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut b_hn = spite_gpu::DeviceBuffer::alloc_on(backend, device, d * 4)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let ones = vec![1.0f32; d];
-            let ones_u8 = unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, d * 4) };
-            b_en.upload(ones_u8).map_err(|e| anyhow::anyhow!("{e}"))?;
-            b_hn.upload(ones_u8).map_err(|e| anyhow::anyhow!("{e}"))?;
-            buf_enorm = Some(b_en);
-            buf_hnorm = Some(b_hn);
-        }
-
-        let embd_tensor = gguf.tensor("token_embd.weight");
-
-        Ok(Self {
-            table,
-            buf_out,
-            buf_embed,
-            buf_hidden,
-            buf_enorm,
-            buf_hnorm,
-            d_model: d,
-            vocab_size: cfg.vocab_size,
-            norm_eps: cfg.norm_eps,
-            embd_tensor,
-            backend,
-            device,
-        })
-    }
-
-    fn draft_step(&mut self, token: u32, ctx: &spite_abi::SpiteCtx) -> Result<()> {
-        let d = self.d_model;
-        // Launch the stem on the device its buffers live on, not whatever a
-        // pipeline `forward` left current.
-        if self.backend == spite_gpu::GpuBackend::Cuda {
-            spite_gpu::cuda::set_device(self.device).map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-        if !self.embd_tensor.data.is_null() {
-            let tok_idx = (token as usize).min(self.vocab_size.saturating_sub(1));
-            let row_offset = tok_idx.saturating_mul(self.embd_tensor.nb[1] as usize);
-            let row_bytes = self.embd_tensor.nb[1] as usize;
-            let src = unsafe {
-                std::slice::from_raw_parts(
-                    (self.embd_tensor.data as *const u8).add(row_offset),
-                    row_bytes,
-                )
-            };
-            let mut embed_f32 = vec![0.0f32; d];
-            let _ = spite_compute::dequant::dequant_to_f32(
-                src,
-                self.embd_tensor.kind,
-                d,
-                &mut embed_f32,
-            );
-            let embed_u8 =
-                unsafe { std::slice::from_raw_parts(embed_f32.as_ptr() as *const u8, d * 4) };
-            self.buf_embed
-                .upload(embed_u8)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-        }
-
-        let mut t_out = spite_abi::SpiteTensor {
-            data: self.buf_out.as_ptr().cast(),
-            ne: [(2 * d) as u32, 1, 1, 1],
-            nb: [
-                4,
-                (2 * d * 4) as u64,
-                (2 * d * 4) as u64,
-                (2 * d * 4) as u64,
-            ],
-            kind: spite_abi::SpiteType::F32,
-        };
-        let t_embed = spite_abi::SpiteTensor {
-            data: self.buf_embed.as_ptr().cast(),
-            ne: [d as u32, 1, 1, 1],
-            nb: [4, (d * 4) as u64, (d * 4) as u64, (d * 4) as u64],
-            kind: spite_abi::SpiteType::F32,
-        };
-        let t_hidden = spite_abi::SpiteTensor {
-            data: self.buf_hidden.as_ptr().cast(),
-            ne: [d as u32, 1, 1, 1],
-            nb: [4, (d * 4) as u64, (d * 4) as u64, (d * 4) as u64],
-            kind: spite_abi::SpiteType::F32,
-        };
-        let t_en = self.buf_enorm.as_ref().map(|b| spite_abi::SpiteTensor {
-            data: b.as_ptr().cast(),
-            ne: [d as u32, 1, 1, 1],
-            nb: [4, (d * 4) as u64, (d * 4) as u64, (d * 4) as u64],
-            kind: spite_abi::SpiteType::F32,
-        });
-        let t_hn = self.buf_hnorm.as_ref().map(|b| spite_abi::SpiteTensor {
-            data: b.as_ptr().cast(),
-            ne: [d as u32, 1, 1, 1],
-            nb: [4, (d * 4) as u64, (d * 4) as u64, (d * 4) as u64],
-            kind: spite_abi::SpiteType::F32,
-        });
-
-        let (func_opt, _) = &self.table.mtp_stem;
-        let status = if let Some(func) = func_opt {
-            unsafe {
-                func(
-                    &mut t_out,
-                    &t_embed,
-                    &t_hidden,
-                    t_en.as_ref().map_or(std::ptr::null(), |t| t as *const _),
-                    t_hn.as_ref().map_or(std::ptr::null(), |t| t as *const _),
-                    self.norm_eps,
-                    ctx,
-                )
-            }
-        } else {
-            unsafe {
-                spite_dispatch::fallback::mtp_stem(
-                    &mut t_out,
-                    &t_embed,
-                    &t_hidden,
-                    t_en.as_ref().map_or(std::ptr::null(), |t| t as *const _),
-                    t_hn.as_ref().map_or(std::ptr::null(), |t| t as *const _),
-                    self.norm_eps,
-                    ctx,
-                )
-            }
-        };
-
-        if status != 0 {
-            anyhow::bail!("mtp_stem failed with error code {status}");
-        }
-
-        Ok(())
-    }
 }
 
 fn result_json(r: &spite_bench::BenchResult) -> serde_json::Value {

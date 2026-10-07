@@ -216,6 +216,10 @@ struct FeatureArgs {
     #[arg(long = "mtp", env = "SPITE_MTP")]
     mtp: bool,
 
+    /// Number of MTP draft tokens proposed per step with --mtp.
+    #[arg(long = "draft-tokens", default_value_t = 3, value_name = "N")]
+    draft_tokens: usize,
+
     /// FlashAttention: fused attention kernel, reduces memory bandwidth.
     /// Supported on most cards.  Use --dflash2 for the faster v2 variant.
     /// Compile with: cargo xtask compile --dflash
@@ -546,12 +550,24 @@ fn cmd_run(
         prompt,
         max_tokens,
         temperature,
-        ctx,
+        GenOptions {
+            ctx_len: ctx,
+            mtp_draft_tokens: feat.mtp.then_some(feat.draft_tokens),
+        },
         &place,
         &kv_cfg,
     )?;
     println!("\n{text}");
     Ok(())
+}
+
+/// Per-run generation options for [`generate`].
+#[derive(Clone, Copy, Default)]
+pub struct GenOptions {
+    /// Context window override; `None` keeps the model's native maximum.
+    pub ctx_len: Option<usize>,
+    /// MTP draft tokens proposed per step. `None` disables speculation.
+    pub mtp_draft_tokens: Option<usize>,
 }
 
 /// Shared generate path for `run` (server reuses the same crates).
@@ -561,11 +577,12 @@ pub fn generate(
     prompt: &str,
     max_tokens: usize,
     temperature: f32,
-    ctx_len: Option<usize>,
+    opts: GenOptions,
     place: &Placement,
     kv_cfg: &KvQuantConfig,
 ) -> Result<String> {
-    use spite_executor::{Executor, ExecutorConfig};
+    use spite_executor::{Executor, ExecutorConfig, SpecDecodeConfig};
+    let ctx_len = opts.ctx_len;
     use spite_tokenizer::Tokenizer;
 
     let mut exec_cfg = ExecutorConfig::default();
@@ -586,13 +603,22 @@ pub fn generate(
     exec.load_model(model);
 
     let t_gen = std::time::Instant::now();
-    let pieces = exec.generate(
-        &tokenizer,
-        &ids,
-        max_tokens,
-        temperature,
-        0x1234_5678_9abc_def0,
-    )?;
+    let seed = 0x1234_5678_9abc_def0;
+    let pieces = match opts.mtp_draft_tokens {
+        // NextN/MTP self-speculation: the model's own draft head proposes, the
+        // trunk verifies (falls back to plain decode when there is no head).
+        Some(k) if k > 0 => exec.generate_speculative(
+            &tokenizer,
+            &ids,
+            max_tokens,
+            SpecDecodeConfig {
+                temperature,
+                seed,
+                n_draft: k,
+            },
+        )?,
+        _ => exec.generate(&tokenizer, &ids, max_tokens, temperature, seed)?,
+    };
     let secs = t_gen.elapsed().as_secs_f64();
     eprintln!(
         "generate     : {} prompt + {} new tokens in {secs:.2} s ({:.2} tok/s)",
@@ -978,7 +1004,7 @@ mod tests {
             "AB",
             4,
             0.0,
-            None,
+            GenOptions::default(),
             &Placement::cpu(),
             &KvQuantConfig::default(),
         )

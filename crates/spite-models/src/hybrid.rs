@@ -913,6 +913,14 @@ impl ModelArch for HybridDecoder {
         }
     }
 
+    fn has_mtp(&self) -> bool {
+        HybridDecoder::has_mtp(self)
+    }
+
+    fn mtp_step(&self, token: u32, pos: usize, logits_out: &mut [f32]) -> Result<(), ModelError> {
+        HybridDecoder::mtp_step(self, token, pos, logits_out)
+    }
+
     fn forward(
         &self,
         tokens: &[u32],
@@ -1112,13 +1120,15 @@ impl HybridDecoder {
             .map_err(|e| err(e.to_string()))
     }
 
-    /// True when the resolved ops can take a batched `[d, m]` activation and the
-    /// decoder is on a single stage. The generic reference implements batching;
-    /// the per-card CUDA kernels do not yet, so they keep the per-token path.
+    /// True when every resolved op can take a batched `[d, m]` activation.
+    ///
+    /// A split is fine: [`Self::forward_batch`] hands the whole `[d, m]` block
+    /// between stages through host memory, the same hop the 1-token path uses.
+    /// The generic reference and the sm_60 kernels advertise `SPITE_CAP_BATCH`;
+    /// ops that do not fall back to the per-token path.
     fn batch_capable(&self) -> bool {
         let batch = |s: &spite_dispatch::OpSource| s.caps & spite_dispatch::CAP_BATCH != 0;
-        self.layer_stage.iter().all(|&s| s == 0)
-            && batch(&self.table.rms_norm.1)
+        batch(&self.table.rms_norm.1)
             && batch(&self.table.ffn.1)
             && batch(&self.table.matmul.1)
             && self
@@ -1157,26 +1167,13 @@ impl HybridDecoder {
         };
         let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
         let st = &mut *guard;
-        let dev = st.stages[0].device;
+        let n_stages = st.stages.len();
+        let last = n_stages - 1;
 
-        // Batched residual stream and norm buffer, one column per token.
-        let mut hbuf = DeviceBuffer::alloc_on(self.backend, dev, d * m * 4)
-            .map_err(|e| err(format!("alloc: {e}")))?;
-        let nbuf = DeviceBuffer::alloc_on(self.backend, dev, d * m * 4)
-            .map_err(|e| err(format!("alloc: {e}")))?;
-
-        // Token embeddings, token-major host buffer [d, m].
-        let mut host = vec![0f32; d * m];
-        for (t, &tok) in tokens.iter().enumerate() {
-            self.embed(tok, &mut host[t * d..(t + 1) * d])?;
-        }
-        hbuf.upload(f32_bytes(&host))
-            .map_err(|e| err(e.to_string()))?;
-
-        let mut h_t = f32_tensor2(&hbuf, d, m);
-        let mut n_t = f32_tensor2(&nbuf, d, m);
-        // Batched scratch: the single-token size times m bounds every batched op
-        // (the per-token fixed part scales with m; the workspace is <= its *m).
+        // Per-stage batched residual stream and norm buffer, one column per
+        // token, plus a scratch sized for m columns. A split hands the whole
+        // [d, m] block across the same host hop as the 1-token path, so batched
+        // prefill works on a multi-GPU pipeline too.
         let scratch_floats = [
             2 * cfg.d_ffn,
             self.attn
@@ -1186,21 +1183,60 @@ impl HybridDecoder {
         .into_iter()
         .max()
         .unwrap_or(0);
-        let scratch = DeviceBuffer::alloc_on(self.backend, dev, (scratch_floats * 4 * m).max(1))
-            .map_err(|e| err(format!("alloc scratch: {e}")))?;
-        let kctx = SpiteCtx {
-            n_ctx: self.n_ctx as c_int,
-            n_batch: m as c_int,
-            n_threads: ctx.n_threads,
-            pos: ctx.pos,
-            n_heads: cfg.n_heads as c_int,
-            n_kv_heads: cfg.n_kv_heads as c_int,
-            gpu_stream: std::ptr::null_mut(),
-            scratchpad: scratch.as_ptr().cast(),
-            scratchpad_bytes: scratch.size,
-        };
+        let mut hbufs = Vec::with_capacity(n_stages);
+        let mut nbufs = Vec::with_capacity(n_stages);
+        let mut scratches = Vec::with_capacity(n_stages);
+        for s in &st.stages {
+            hbufs.push(
+                DeviceBuffer::alloc_on(self.backend, s.device, d * m * 4)
+                    .map_err(|e| err(format!("alloc h: {e}")))?,
+            );
+            nbufs.push(
+                DeviceBuffer::alloc_on(self.backend, s.device, d * m * 4)
+                    .map_err(|e| err(format!("alloc n: {e}")))?,
+            );
+            scratches.push(
+                DeviceBuffer::alloc_on(self.backend, s.device, (scratch_floats * 4 * m).max(1))
+                    .map_err(|e| err(format!("alloc scratch: {e}")))?,
+            );
+        }
 
+        // Token embeddings, token-major host buffer [d, m].
+        let mut host = vec![0f32; d * m];
+        for (t, &tok) in tokens.iter().enumerate() {
+            self.embed(tok, &mut host[t * d..(t + 1) * d])?;
+        }
+        hbufs[0]
+            .upload(f32_bytes(&host))
+            .map_err(|e| err(e.to_string()))?;
+
+        let mut cur = 0usize;
+        self.enter(st, cur)?;
         for (li, layer) in self.layers.iter().enumerate() {
+            let s = self.layer_stage[li];
+            if s != cur {
+                hbufs[cur]
+                    .download(f32_bytes_mut(&mut host))
+                    .map_err(|e| err(e.to_string()))?;
+                hbufs[s]
+                    .upload(f32_bytes(&host))
+                    .map_err(|e| err(e.to_string()))?;
+                cur = s;
+                self.enter(st, cur)?;
+            }
+            let kctx = SpiteCtx {
+                n_ctx: self.n_ctx as c_int,
+                n_batch: m as c_int,
+                n_threads: ctx.n_threads,
+                pos: ctx.pos,
+                n_heads: cfg.n_heads as c_int,
+                n_kv_heads: cfg.n_kv_heads as c_int,
+                gpu_stream: std::ptr::null_mut(),
+                scratchpad: scratches[cur].as_ptr().cast(),
+                scratchpad_bytes: scratches[cur].size,
+            };
+            let mut h_t = f32_tensor2(&hbufs[cur], d, m);
+            let mut n_t = f32_tensor2(&nbufs[cur], d, m);
             let ffn_w = match layer {
                 Layer::Attn(a) => {
                     self.attn_block(st, a, li, &mut h_t, &mut n_t, &kctx)?;
@@ -1213,21 +1249,41 @@ impl HybridDecoder {
             };
             self.ffn_block(ffn_w, li, &mut h_t, &mut n_t, &kctx)?;
         }
+        if cur != last {
+            hbufs[cur]
+                .download(f32_bytes_mut(&mut host))
+                .map_err(|e| err(e.to_string()))?;
+            hbufs[last]
+                .upload(f32_bytes(&host))
+                .map_err(|e| err(e.to_string()))?;
+            self.enter(st, last)?;
+        }
 
         // Final norm + LM head, one column at a time (logits are per token).
+        let head_ctx = SpiteCtx {
+            n_ctx: self.n_ctx as c_int,
+            n_batch: 1,
+            n_threads: ctx.n_threads,
+            pos: ctx.pos,
+            n_heads: cfg.n_heads as c_int,
+            n_kv_heads: cfg.n_kv_heads as c_int,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: scratches[last].as_ptr().cast(),
+            scratchpad_bytes: scratches[last].size,
+        };
         let mut hid = f32_tensor(&st.hid, d);
         let mut logits = f32_tensor(&st.logits, vocab);
         for t in 0..m {
-            let ht = f32_tensor_col(&hbuf, d, t);
+            let ht = f32_tensor_col(&hbufs[last], d, t);
             // SAFETY: every tensor points at live memory owned by `st` / `self`.
             unsafe {
                 rc(
-                    rms_norm(&mut hid, &ht, &self.out_norm, cfg.norm_eps, &kctx),
+                    rms_norm(&mut hid, &ht, &self.out_norm, cfg.norm_eps, &head_ctx),
                     "rms_norm",
                     cfg.n_layers,
                 )?;
                 rc(
-                    matmul(&mut logits, &hid, &self.out_w, &kctx),
+                    matmul(&mut logits, &hid, &self.out_w, &head_ctx),
                     "matmul",
                     cfg.n_layers,
                 )?;

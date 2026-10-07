@@ -269,3 +269,47 @@ fn batched_prefill_matches_sequential() {
     assert!(d < 1e-6, "batched vs sequential logits differ by {d:e}");
     let _ = std::fs::remove_dir_all(kdir);
 }
+
+/// Batched prefill must work across a pipeline split too: the whole `[d, m]`
+/// block crosses the stage boundary through host memory, so the split's logits
+/// must be identical to both the unsplit batched run and the per-token run.
+#[test]
+fn batched_prefill_matches_sequential_on_a_split() {
+    let file = "tiny-qwen35-mtp-full-f16.gguf";
+    let kdir = build_generic_kernel("batchsplit");
+    let split = LayerSplit {
+        devices: vec![0, 0],
+        shares: vec![1, 1],
+    };
+    let (model, vocab, stages) = load_split(file, &kdir, &split);
+    assert_eq!(stages.len(), 2, "fixture needs a 2-stage split");
+    assert!(
+        stages[1].layers.end >= 2,
+        "fixture needs two trunk layers to split"
+    );
+    let tokens = [1u32, 2, 3, 4, 5];
+
+    model.reset_cache();
+    let mut batched = vec![0f32; tokens.len() * vocab];
+    model
+        .forward(&tokens, &mut batched, &ctx(0))
+        .expect("split batched forward");
+
+    model.reset_cache();
+    let mut seq = Vec::with_capacity(tokens.len() * vocab);
+    for (i, &t) in tokens.iter().enumerate() {
+        let mut l = vec![0f32; vocab];
+        model.forward(&[t], &mut l, &ctx(i)).expect("forward");
+        seq.extend_from_slice(&l);
+    }
+
+    let d = batched
+        .iter()
+        .zip(&seq)
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        d < 1e-6,
+        "split batched vs sequential logits differ by {d:e}"
+    );
+    let _ = std::fs::remove_dir_all(kdir);
+}

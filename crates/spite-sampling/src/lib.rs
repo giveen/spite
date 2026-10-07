@@ -266,6 +266,18 @@ pub fn multinomial(logits: &[f32], rng_state: &mut u64) -> Result<u32, SamplingE
 
 // ── Full pipeline ─────────────────────────────────────────────────────────
 
+/// Apply every logit processor in `cfg`, in the same order as [`sample`].
+///
+/// Split out so a speculative sampler can compare the draft and target
+/// distributions through the identical pipeline before softmax.
+pub fn apply_processors(logits: &mut [f32], context: &[u32], cfg: &SamplerConfig) {
+    apply_repetition_penalty_windowed(logits, context, cfg.repetition_penalty, cfg.repeat_last_n);
+    apply_temperature(logits, cfg.temperature);
+    apply_min_p(logits, cfg.min_p);
+    apply_top_k(logits, cfg.top_k);
+    apply_top_p(logits, cfg.top_p);
+}
+
 /// Apply all processors from `cfg` then sample one token.
 /// `context` is the token history used for repetition penalty.
 pub fn sample(
@@ -274,17 +286,56 @@ pub fn sample(
     cfg: &SamplerConfig,
     rng: &mut u64,
 ) -> Result<u32, SamplingError> {
-    apply_repetition_penalty_windowed(logits, context, cfg.repetition_penalty, cfg.repeat_last_n);
-    apply_temperature(logits, cfg.temperature);
-    apply_min_p(logits, cfg.min_p);
-    apply_top_k(logits, cfg.top_k);
-    apply_top_p(logits, cfg.top_p);
+    apply_processors(logits, context, cfg);
 
     if cfg.temperature <= 0.0 {
         greedy(logits)
     } else {
         multinomial(logits, rng)
     }
+}
+
+/// Softmax over logits that already went through [`apply_processors`].
+/// `-inf` entries become 0; the result sums to 1 (all-zero if nothing was
+/// finite).
+pub fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return vec![0.0; logits.len()];
+    }
+    let mut out: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+    let sum: f32 = out.iter().sum();
+    if sum > 0.0 {
+        for v in out.iter_mut() {
+            *v /= sum;
+        }
+    }
+    out
+}
+
+/// Draw a token from (possibly unnormalised) probabilities.
+pub fn sample_probs(probs: &[f32], rng: &mut u64) -> Result<u32, SamplingError> {
+    if probs.is_empty() {
+        return Err(SamplingError::EmptyLogits);
+    }
+    let total: f32 = probs.iter().sum();
+    if !total.is_finite() || total <= 0.0 {
+        return Err(SamplingError::AllFiltered);
+    }
+    let target = lcg_f32(rng) * total;
+    let mut cum = 0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        cum += p;
+        if cum >= target {
+            return Ok(i as u32);
+        }
+    }
+    Ok((probs.len() - 1) as u32)
+}
+
+/// Uniform draw in `[0, 1)` from the shared RNG state (for accept/reject tests).
+pub fn uniform(rng: &mut u64) -> f32 {
+    lcg_f32(rng)
 }
 
 /// LCG fast RNG — shared by multinomial, mirostat, and DRY.

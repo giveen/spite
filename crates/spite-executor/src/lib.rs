@@ -150,6 +150,34 @@ pub fn default_sampler_config(temperature: f32) -> spite_sampling::SamplerConfig
     }
 }
 
+/// Draft/accept counters from a speculative decode, for benchmarks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpecStats {
+    /// MTP draft tokens proposed.
+    pub drafted: usize,
+    /// Draft tokens that the trunk accepted.
+    pub accepted: usize,
+}
+
+/// Sampling parameters for [`Executor::generate_speculative`].
+#[derive(Debug, Clone, Copy)]
+pub struct SpecDecodeConfig {
+    pub temperature: f32,
+    pub seed: u64,
+    /// MTP tokens proposed per step (>= 1).
+    pub n_draft: usize,
+}
+
+impl Default for SpecDecodeConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            seed: 0,
+            n_draft: 3,
+        }
+    }
+}
+
 /// Owns the model, dispatch table, KV cache, and GPU activation buffers.
 ///
 /// One `Executor` per loaded model; share it across requests using
@@ -247,6 +275,216 @@ impl Executor {
     /// Roll back the context position by `n` steps (e.g. on rejected speculative draft tokens).
     pub fn rollback(&mut self, n: usize) {
         self.n_ctx_used = self.n_ctx_used.saturating_sub(n);
+    }
+
+    /// True when the loaded model exposes an in-weights NextN/MTP draft head.
+    pub fn has_mtp(&self) -> bool {
+        self.model.as_ref().is_some_and(|m| m.has_mtp())
+    }
+
+    /// Run one MTP draft step through the loaded model: consume the hidden
+    /// state left by the latest forward, draft from `token` at RoPE position
+    /// `pos`, and write the draft logits. See
+    /// [`spite_models::hybrid::HybridDecoder::mtp_step`].
+    pub fn mtp_step(
+        &self,
+        token: u32,
+        pos: usize,
+        logits_out: &mut [f32],
+    ) -> Result<(), ExecutorError> {
+        let Some(model) = &self.model else {
+            return Err(ExecutorError::NotInitialized);
+        };
+        model
+            .mtp_step(token, pos, logits_out)
+            .map_err(|e| ExecutorError::Model(e.to_string()))
+    }
+
+    /// Speculative decode: prefill `prompt_ids`, then emit up to `max_tokens`
+    /// with the MTP head drafting and the trunk verifying.
+    ///
+    /// Falls back to plain [`Self::generate`] when the model has no MTP head.
+    pub fn generate_speculative(
+        &mut self,
+        tokenizer: &dyn Tokenize,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+        spec: SpecDecodeConfig,
+    ) -> Result<Vec<(u32, String)>, ExecutorError> {
+        Ok(self
+            .generate_speculative_with_stats(tokenizer, prompt_ids, max_tokens, spec)?
+            .0)
+    }
+
+    /// Like [`Self::generate_speculative`], also returning the draft/accept
+    /// counters (used by `spite-bench` and the correctness tests).
+    pub fn generate_speculative_with_stats(
+        &mut self,
+        tokenizer: &dyn Tokenize,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+        spec: SpecDecodeConfig,
+    ) -> Result<(Vec<(u32, String)>, SpecStats), ExecutorError> {
+        if !self.has_mtp() || spec.n_draft == 0 {
+            let out = self.generate(
+                tokenizer,
+                prompt_ids,
+                max_tokens,
+                spec.temperature,
+                spec.seed,
+            )?;
+            return Ok((out, SpecStats::default()));
+        }
+        let ctx = SpiteCtx {
+            n_ctx: self.cfg.ctx_len as c_int,
+            n_batch: self.cfg.batch_size as c_int,
+            n_threads: self.cfg.n_threads as c_int,
+            pos: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: std::ptr::null_mut(),
+            scratchpad_bytes: 0,
+        };
+        let logits = self.prefill(prompt_ids, &ctx)?;
+        self.generate_speculative_from_logits(tokenizer, prompt_ids, logits, max_tokens, spec)
+    }
+
+    /// Speculative decode from an already-prefilled state: `logits` is the
+    /// trunk distribution for the next token. Public so a benchmark can time
+    /// prefill and decode separately from the same entry point.
+    ///
+    /// The MTP head proposes up to `n_draft` tokens per step; the trunk then
+    /// accepts the longest prefix that matches. The result is exact for greedy
+    /// decoding and, through residual sampling, preserves the target
+    /// distribution at `temperature > 0`.
+    ///
+    /// Returns the emitted `(id, piece)` pairs and the draft/accept counts.
+    pub fn generate_speculative_from_logits(
+        &mut self,
+        tokenizer: &dyn Tokenize,
+        prompt_ids: &[u32],
+        mut logits: Vec<f32>,
+        max_tokens: usize,
+        spec: SpecDecodeConfig,
+    ) -> Result<(Vec<(u32, String)>, SpecStats), ExecutorError> {
+        let SpecDecodeConfig {
+            temperature,
+            seed,
+            n_draft,
+        } = spec;
+        use spite_sampling::{apply_processors, sample, sample_probs, softmax, uniform};
+        let ctx = SpiteCtx {
+            n_ctx: self.cfg.ctx_len as c_int,
+            n_batch: self.cfg.batch_size as c_int,
+            n_threads: self.cfg.n_threads as c_int,
+            pos: 0,
+            n_heads: 0,
+            n_kv_heads: 0,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: std::ptr::null_mut(),
+            scratchpad_bytes: 0,
+        };
+        let cfg = default_sampler_config(temperature);
+        let greedy = temperature <= 0.0;
+        let mut rng = seed;
+        let mut ids = prompt_ids.to_vec();
+        let mut out = Vec::new();
+        let mut stats = SpecStats::default();
+        let mut produced = 0usize;
+
+        while produced < max_tokens {
+            // Verified token from the trunk distribution.
+            let tok = sample(&mut logits, &ids, &cfg, &mut rng)
+                .map_err(|e| ExecutorError::Sampling(e.to_string()))?;
+            ids.push(tok);
+            produced += 1;
+            if tokenizer.is_eog(tok) {
+                break;
+            }
+            out.push((tok, tokenizer.decode_one(tok).into_owned()));
+            if produced >= max_tokens {
+                break;
+            }
+
+            // The MTP head consumes the hidden state of the last trunk token,
+            // which sits at `n_ctx_used - 1` (the verified token is not
+            // decoded into the trunk until below).
+            let base_pos = self.n_ctx_used.saturating_sub(1);
+            let base_len = ids.len();
+            let mut drafts: Vec<(u32, Vec<f32>)> = Vec::with_capacity(n_draft);
+            for k in 0..n_draft {
+                let in_tok = if k == 0 { tok } else { drafts[k - 1].0 };
+                let mut q = vec![0f32; logits.len()];
+                if self.mtp_step(in_tok, base_pos + k, &mut q).is_err() {
+                    break;
+                }
+                // Sample the draft under the same context the draft model
+                // would see, including its own earlier proposals.
+                let d = sample(&mut q.clone(), &ids, &cfg, &mut rng)
+                    .map_err(|e| ExecutorError::Sampling(e.to_string()))?;
+                drafts.push((d, q));
+                ids.push(d);
+            }
+            if drafts.is_empty() {
+                logits = self.decode_step(tok, &ctx)?;
+                continue;
+            }
+            stats.drafted += drafts.len();
+
+            // Advance the trunk with the verified token; `logits` now predicts
+            // the position the first draft targets.
+            logits = self.decode_step(tok, &ctx)?;
+            for (k, (d, mut q)) in drafts.into_iter().enumerate() {
+                // Verify d_k against the context of its own position:
+                // [prompt, tok, accepted drafts].
+                ids.truncate(base_len + k);
+                if greedy {
+                    let mut p = logits.clone();
+                    let expected = sample(&mut p, &ids, &cfg, &mut rng)
+                        .map_err(|e| ExecutorError::Sampling(e.to_string()))?;
+                    if expected != d {
+                        break;
+                    }
+                } else {
+                    let mut p = logits.clone();
+                    apply_processors(&mut p, &ids, &cfg);
+                    apply_processors(&mut q, &ids, &cfg);
+                    let pp = softmax(&p);
+                    let qp = softmax(&q);
+                    let qx = qp.get(d as usize).copied().unwrap_or(0.0);
+                    let px = pp.get(d as usize).copied().unwrap_or(0.0);
+                    if qx <= 0.0 || uniform(&mut rng) >= (px / qx).min(1.0) {
+                        // Rejected: draw the correction from (p - q)_+.
+                        let residual: Vec<f32> =
+                            pp.iter().zip(&qp).map(|(a, b)| (a - b).max(0.0)).collect();
+                        let y = sample_probs(&residual, &mut rng)
+                            .map_err(|e| ExecutorError::Sampling(e.to_string()))?;
+                        ids.push(y);
+                        produced += 1;
+                        if tokenizer.is_eog(y) {
+                            return Ok((out, stats));
+                        }
+                        out.push((y, tokenizer.decode_one(y).into_owned()));
+                        logits = self.decode_step(y, &ctx)?;
+                        break;
+                    }
+                }
+                // Accepted.
+                stats.accepted += 1;
+                ids.push(d);
+                produced += 1;
+                if tokenizer.is_eog(d) {
+                    return Ok((out, stats));
+                }
+                out.push((d, tokenizer.decode_one(d).into_owned()));
+                logits = self.decode_step(d, &ctx)?;
+                if produced >= max_tokens {
+                    break;
+                }
+            }
+        }
+        Ok((out, stats))
     }
 
     /// Full generate loop: encode is done by the caller; this runs
