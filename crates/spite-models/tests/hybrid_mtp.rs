@@ -298,6 +298,9 @@ fn prefill_fills_the_mtp_kv() {
         .iter()
         .zip(&want[TOKENS.len() - 1])
         .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    // Measured: exactly 0 with the prompt rows written, 2.6e-2 without them, so
+    // the tolerance is far tighter than the signal but still tolerant of a
+    // future accumulation-order change in the batched ops.
     assert!(
         d <= TOL,
         "the draft after a prefill differs from the per-token reference by {d:e}: \
