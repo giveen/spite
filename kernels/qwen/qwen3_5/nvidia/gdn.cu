@@ -194,38 +194,65 @@ qwen35_cuda_linear_attn(SpiteTensor *out, const SpiteTensor *x,
   if (K > 1 && !q35_f32_n(conv_hist, (K - 1) * C)) // K == 1 keeps no history
     return -1;
 
+  const int m = x->ne[1] ? static_cast<int>(x->ne[1]) : 1;
+  const size_t scratch_floats =
+      static_cast<size_t>(spite_gdn_scratch_floats(p)) * static_cast<size_t>(m);
   if (!ctx->scratchpad ||
-      ctx->scratchpad_bytes < sizeof(float) * spite_gdn_scratch_floats(p) ||
+      ctx->scratchpad_bytes < sizeof(float) * scratch_floats ||
       (reinterpret_cast<uintptr_t>(ctx->scratchpad) & 15))
     return -2;
+  // m token columns: qkv [C,m] | z [V,m] | core [V,m] | beta [n_vh,m] | alpha [n_vh,m]
   float *qkv = static_cast<float *>(ctx->scratchpad);
-  float *z = qkv + C;
-  float *core = z + V;
-  float *beta = core + V;
-  float *alpha = beta + p->n_vh;
+  float *z = qkv + C * m;
+  float *core = z + V * m;
+  float *beta = core + V * m;
+  float *alpha = beta + static_cast<size_t>(p->n_vh) * m;
 
   const cudaStream_t st = q35_stream(ctx);
   const float *xin = static_cast<const float *>(x->data);
-  const Q35GemvJob proj[4] = {{w_qkv, qkv}, {w_gate, z}, {w_beta, beta}, {w_alpha, alpha}};
-  if (q35_gemv_multi(proj, 4, xin, false, st))
-    return -1;
-
-  gdn_conv_kernel<<<static_cast<unsigned>((C + 127) / 128), 128, 0, st>>>(
-      qkv, K > 1 ? static_cast<float *>(conv_hist->data) : nullptr,
-      static_cast<const float *>(conv_w->data), static_cast<int>(C), K);
+  if (m == 1) {
+    const Q35GemvJob proj[4] = {{w_qkv, qkv}, {w_gate, z}, {w_beta, beta}, {w_alpha, alpha}};
+    if (q35_gemv_multi(proj, 4, xin, false, st))
+      return -1;
+  } else {
+    if (q35_gemv_batch(w_qkv, xin, qkv, m, false, st) ||
+        q35_gemv_batch(w_gate, xin, z, m, false, st) ||
+        q35_gemv_batch(w_beta, xin, beta, m, false, st) ||
+        q35_gemv_batch(w_alpha, xin, alpha, m, false, st))
+      return -1;
+  }
 
   const float *dt = static_cast<const float *>(ssm_dt->data);
   const float *a = static_cast<const float *>(ssm_a->data);
   const float *nw = static_cast<const float *>(ssm_norm->data);
-  float *m = static_cast<float *>(state->data);
-  if (S == 128)
-    gdn_core_kernel<128><<<p->n_vh, kRowGroups * 128, 0, st>>>(
-        core, qkv, z, beta, alpha, dt, a, nw, m, p->n_kh, p->norm_eps);
-  else
-    gdn_core_kernel<64><<<p->n_vh, kRowGroups * 64, 0, st>>>(
-        core, qkv, z, beta, alpha, dt, a, nw, m, p->n_kh, p->norm_eps);
+  float *mst = static_cast<float *>(state->data);
+  float *hist = K > 1 ? static_cast<float *>(conv_hist->data) : nullptr;
+  const float *cw = static_cast<const float *>(conv_w->data);
 
-  if (q35_gemv(w_out, core, static_cast<float *>(out->data), true, st))
+  // One token column at a time: the conv history and the delta-rule state carry
+  // across the loop, so the m columns are processed in sequence. Only the
+  // projections above are batched.
+  for (int t = 0; t < m; ++t) {
+    float *qkv_t = qkv + static_cast<size_t>(t) * C;
+    float *z_t = z + static_cast<size_t>(t) * V;
+    float *core_t = core + static_cast<size_t>(t) * V;
+    float *beta_t = beta + static_cast<size_t>(t) * p->n_vh;
+    float *alpha_t = alpha + static_cast<size_t>(t) * p->n_vh;
+    gdn_conv_kernel<<<static_cast<unsigned>((C + 127) / 128), 128, 0, st>>>(
+        qkv_t, hist, cw, static_cast<int>(C), K);
+    if (S == 128)
+      gdn_core_kernel<128><<<p->n_vh, kRowGroups * 128, 0, st>>>(
+          core_t, qkv_t, z_t, beta_t, alpha_t, dt, a, nw, mst, p->n_kh, p->norm_eps);
+    else
+      gdn_core_kernel<64><<<p->n_vh, kRowGroups * 64, 0, st>>>(
+          core_t, qkv_t, z_t, beta_t, alpha_t, dt, a, nw, mst, p->n_kh, p->norm_eps);
+  }
+
+  if (m == 1) {
+    if (q35_gemv(w_out, core, static_cast<float *>(out->data), true, st))
+      return -1;
+  } else if (q35_gemv_batch(w_out, core, static_cast<float *>(out->data), m, true, st)) {
     return -1;
+  }
   return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }

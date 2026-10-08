@@ -333,6 +333,53 @@ pub trait ModelArch: Send + Sync {
         logits_out: &mut [f32],
         ctx: &SpiteCtx,
     ) -> Result<(), ModelError>;
+
+    /// True when this model exposes an in-weights NextN/MTP self-speculative
+    /// draft head usable through [`Self::mtp_step`].
+    fn has_mtp(&self) -> bool {
+        false
+    }
+
+    /// One MTP draft step: consume the hidden state left by the latest
+    /// `forward`, draft from `token` at RoPE position `pos`, and write the
+    /// draft logits. See [`crate::hybrid::HybridDecoder::mtp_step`].
+    ///
+    /// The default reports that the model has no MTP head.
+    fn mtp_step(
+        &self,
+        _token: u32,
+        _pos: usize,
+        _logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        Err(ModelError::Forward("model has no MTP draft head".into()))
+    }
+
+    /// True when [`Self::verify_batch`] can process a trunk token followed by
+    /// speculative drafts in one pass instead of one forward per token.
+    fn can_verify_batch(&self) -> bool {
+        false
+    }
+
+    /// One batched trunk pass over `tokens` (`[trunk, drafts...]`) at positions
+    /// `ctx.pos .. ctx.pos + len`, writing `len * vocab` logits, so a
+    /// speculative verify costs one pass instead of one per draft. Any
+    /// recurrent state advanced past a rejected tail is saved for
+    /// [`Self::rollback_drafts`].
+    fn verify_batch(
+        &self,
+        _tokens: &[u32],
+        _ctx: &SpiteCtx,
+        _logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        Err(ModelError::Forward(
+            "model has no batched speculative verify".into(),
+        ))
+    }
+
+    /// Undo the last `n` trailing columns of the last [`Self::verify_batch`].
+    fn rollback_drafts(&self, _n: usize) -> Result<(), ModelError> {
+        Ok(())
+    }
 }
 
 /// Maps GGUF `general.architecture` strings to constructors.

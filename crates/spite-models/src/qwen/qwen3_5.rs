@@ -21,6 +21,17 @@ struct LayerState {
     v: VbrRows,
 }
 
+/// Per-head width. Qwen3-family GGUFs store it as `attention.key_length`,
+/// which need not equal `d_model / n_heads` (e.g. 64 heads x 128 on a
+/// 5120-wide model); older files without the key fall back to the quotient.
+fn qwen3_head_dim(cfg: &ModelConfig) -> usize {
+    if cfg.key_length > 0 {
+        cfg.key_length
+    } else {
+        cfg.d_model / cfg.n_heads.max(1)
+    }
+}
+
 pub struct Qwen3_5 {
     config: ModelConfig,
     weights: Option<DenseWeights>,
@@ -89,7 +100,7 @@ impl ModelArch for Qwen3_5 {
         let d = cfg.d_model;
         let n_heads = cfg.n_heads;
         let n_kv_heads = cfg.n_kv_heads;
-        let head_dim = d / n_heads;
+        let head_dim = qwen3_head_dim(cfg);
         let d_ffn = cfg.d_ffn;
         let vocab = cfg.vocab_size;
         if logits_out.len() != tokens.len() * vocab {

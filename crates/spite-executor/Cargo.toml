@@ -20,3 +20,7 @@ spite-plugin     = { workspace = true }
 spite-tokenizer  = { workspace = true }
 spite-offload    = { workspace = true }
 thiserror      = { workspace = true }
+
+[dev-dependencies]
+spite-loader   = { workspace = true }
+spite-dispatch = { workspace = true }

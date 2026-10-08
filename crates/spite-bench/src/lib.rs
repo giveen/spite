@@ -15,13 +15,21 @@ pub struct BenchResult {
     pub n_runs: usize,
     /// Speculative acceptance rate (0.0 .. 1.0) when speculative decoding is enabled.
     pub acceptance_rate: Option<f64>,
+    /// Mean draft-vs-trunk total variation distance (0 = the draft reproduces
+    /// the trunk distribution). Present with speculative decoding; it is the
+    /// check that a high acceptance rate is a working head, not a copying one.
+    pub draft_trunk_tv: Option<f64>,
 }
 
 impl BenchResult {
     pub fn print(&self) {
         if let Some(acc) = self.acceptance_rate {
+            let tv = match self.draft_trunk_tv {
+                Some(tv) => format!("  draft-vs-trunk TV {tv:.4}"),
+                None => String::new(),
+            };
             println!(
-                "{:<40}  {:>8.1} tok/s  prefill {:>8.1} tok/s  TTFT {:>7.1} ms  mem {:>6} MiB  acceptance {:>5.1}%  (n={})",
+                "{:<40}  {:>8.1} tok/s  prefill {:>8.1} tok/s  TTFT {:>7.1} ms  mem {:>6} MiB  acceptance {:>5.1}%{tv}  (n={})",
                 self.label,
                 self.tps,
                 self.prefill_tps,

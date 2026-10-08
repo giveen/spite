@@ -358,3 +358,105 @@ impl ModelHyperparams {
         hp
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MetaValue;
+
+    /// Metadata of `Qwen3.8-27B-Q6_K` (unsloth), transcribed from the GGUF
+    /// (`general.architecture = qwen35`). Every field the hybrid decoder reads
+    /// is present, including the ones a hand-written config tends to omit.
+    fn qwen38_27b_meta() -> HashMap<String, MetaValue> {
+        let mut meta: HashMap<String, MetaValue> = [
+            ("block_count", 65u32),
+            ("nextn_predict_layers", 1),
+            ("embedding_length", 5120),
+            ("feed_forward_length", 17408),
+            ("attention.head_count", 24),
+            ("attention.head_count_kv", 4),
+            ("attention.key_length", 256),
+            ("attention.value_length", 256),
+            ("attention.layer_norm_rms_epsilon", 0),
+            ("context_length", 262144),
+            ("full_attention_interval", 4),
+            ("rope.dimension_count", 64),
+            ("ssm.conv_kernel", 4),
+            ("ssm.inner_size", 6144),
+            ("ssm.state_size", 128),
+            ("ssm.time_step_rank", 48),
+            ("ssm.group_count", 16),
+        ]
+        .into_iter()
+        .map(|(k, v)| (format!("qwen35.{k}"), MetaValue::U32(v)))
+        .collect();
+        meta.insert("qwen35.rope.freq_base".into(), MetaValue::F32(1.0e7));
+        meta.insert(
+            "qwen35.rope.dimension_sections".into(),
+            MetaValue::Array(vec![
+                MetaValue::U32(11),
+                MetaValue::U32(11),
+                MetaValue::U32(10),
+                MetaValue::U32(0),
+            ]),
+        );
+        meta.insert(
+            "general.architecture".into(),
+            MetaValue::Str("qwen35".into()),
+        );
+        meta
+    }
+
+    #[test]
+    fn qwen38_27b_metadata_parses() {
+        let hp = ModelHyperparams::from_meta("qwen35", &qwen38_27b_meta());
+
+        // 65 stored blocks = 64 trunk layers + 1 MTP/NextN block.
+        assert_eq!(hp.n_layers, 64);
+        assert_eq!(hp.n_nextn_predict_layers, 1);
+        assert_eq!((hp.d_model, hp.d_ffn), (5120, 17408));
+        assert_eq!((hp.n_heads, hp.n_kv_heads), (24, 4));
+
+        // 256-wide k/v heads, RoPE over the first 64 dims, base 1e7.
+        assert_eq!((hp.key_length, hp.value_length), (256, 256));
+        assert_eq!(hp.rope_dim_count, 64);
+        assert_eq!(hp.rope_theta, 1.0e7);
+        assert_eq!(hp.rope_sections, [11, 11, 10, 0]);
+        assert_eq!(hp.max_seq_len, 262144);
+
+        // Gated Delta Net geometry.
+        assert_eq!(hp.ssm_d_conv, 4);
+        assert_eq!(hp.ssm_d_inner, 6144);
+        assert_eq!(hp.ssm_d_state, 128);
+        assert_eq!(hp.ssm_dt_rank, 48);
+        assert_eq!(hp.ssm_n_group, 16);
+        assert_eq!(hp.full_attention_interval, 4);
+    }
+
+    #[test]
+    fn qwen38_recurrent_layers_follow_the_interval() {
+        let hp = ModelHyperparams::from_meta("qwen35", &qwen38_27b_meta());
+        assert_eq!(hp.recurrent_layers.len(), 64);
+        // Every 4th layer is full attention (interval 4): 16 full, 48 GDN.
+        assert_eq!(hp.recurrent_layers.iter().filter(|&&r| r).count(), 48);
+        assert_eq!(hp.recurrent_layers.iter().filter(|&&r| !r).count(), 16);
+        assert!(hp.recurrent_layers[0]);
+        assert!(!hp.recurrent_layers[3]);
+        assert!(!hp.recurrent_layers[63]);
+    }
+
+    /// The numbers the hybrid decoder validates against at load:
+    /// `n_vh = ssm_dt_rank` (48), `S = ssm_d_state` (128), `n_kh = group_count`
+    /// (16), and `inner == n_vh * S`; plus `head_dim = key_length` and
+    /// `rope_dim = rope_dim_count`.
+    #[test]
+    fn qwen38_hybrid_geometry_is_consistent() {
+        let hp = ModelHyperparams::from_meta("qwen35", &qwen38_27b_meta());
+        let (n_kh, n_vh, s) = (hp.ssm_n_group, hp.ssm_dt_rank, hp.ssm_d_state);
+        assert_eq!(hp.ssm_d_inner, n_vh * s, "inner != dt_rank * state");
+        assert_eq!(n_vh % n_kh, 0, "dt_rank not divisible by group_count");
+        // Head dim comes from key_length, not d_model / n_heads (5120/24 = 213).
+        assert_eq!(hp.key_length, 256);
+        assert!(hp.rope_dim_count <= hp.key_length);
+    }
+}

@@ -1,5 +1,5 @@
 /*
- * kernels/_engine/speculative/speculative_round.cuh
+ * kernels/_engine/speculative/nvidia/speculative_round.cuh
  *
  * Speculative target verification kernel implementation.
  * Ported from NInfer (ops/kernel/speculative_round.cuh).

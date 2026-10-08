@@ -91,8 +91,9 @@ struct HardwareArgs {
     )]
     gpu_arch: Option<String>,
 
-    /// [advanced] Manual layer counts per GPU (comma-separated).
-    /// Default: proportional to each GPU's VRAM.
+    /// [advanced] Manual layer shares per GPU (comma-separated), one per GPU
+    /// in --gpus order. Default: stay on the first GPU when the model fits,
+    /// else spread by free VRAM.
     /// E.g. --layer-split 20,12 assigns ≈20/32 layers to the first GPU.
     #[arg(
         long = "layer-split",
@@ -101,6 +102,18 @@ struct HardwareArgs {
         hide = true
     )]
     layer_split: Vec<u32>,
+
+    /// [advanced] CUDA device ordinals for the pipeline split, in layer order
+    /// (default: every visible GPU). A repeated ordinal puts several stages on
+    /// one GPU, which exercises the split on a single card.
+    #[arg(
+        long = "gpus",
+        env = "SPITE_GPUS",
+        value_name = "ID[,ID…]",
+        value_delimiter = ',',
+        hide = true
+    )]
+    gpus: Vec<usize>,
 
     /// [advanced] Directory containing compiled kernel .so files.
     #[arg(
@@ -149,6 +162,10 @@ pub struct Placement<'a> {
     device: Device,
     kernels_dir: &'a Path,
     gpu_arch: &'a str,
+    /// `--gpus`: CUDA ordinals for a pipeline split (empty: all visible).
+    gpus: &'a [usize],
+    /// `--layer-split`: layer shares per GPU (empty: automatic).
+    layer_split: &'a [u32],
 }
 
 impl Placement<'_> {
@@ -158,6 +175,30 @@ impl Placement<'_> {
             device: Device::Cpu,
             kernels_dir: Path::new("kernels"),
             gpu_arch: "generic",
+            gpus: &[],
+            layer_split: &[],
+        }
+    }
+
+    /// Pipeline split for the hybrid decoder on CUDA.
+    ///
+    /// Without `--gpus`, every visible GPU is a candidate; the decoder only
+    /// spreads when the model does not fit on the first one, or when
+    /// `--layer-split` asks for it.
+    fn hybrid_split(&self) -> spite_models::hybrid::LayerSplit {
+        let devices = if self.gpus.is_empty() {
+            match spite_gpu::cuda::device_count() {
+                Ok(n) if self.layer_split.is_empty() => (0..n).collect(),
+                // Explicit shares without --gpus: the first N visible GPUs.
+                Ok(n) => (0..n.min(self.layer_split.len())).collect(),
+                Err(_) => Vec::new(),
+            }
+        } else {
+            self.gpus.to_vec()
+        };
+        spite_models::hybrid::LayerSplit {
+            devices,
+            shares: self.layer_split.to_vec(),
         }
     }
 }
@@ -174,6 +215,10 @@ struct FeatureArgs {
     /// Compile with: cargo xtask compile --mtp
     #[arg(long = "mtp", env = "SPITE_MTP")]
     mtp: bool,
+
+    /// Number of MTP draft tokens proposed per step with --mtp.
+    #[arg(long = "draft-tokens", default_value_t = 3, value_name = "N")]
+    draft_tokens: usize,
 
     /// FlashAttention: fused attention kernel, reduces memory bandwidth.
     /// Supported on most cards.  Use --dflash2 for the faster v2 variant.
@@ -355,7 +400,7 @@ fn main() -> Result<()> {
 // ── Hardware resolution ────────────────────────────────────────────────────
 
 fn resolve_hardware(hw: &HardwareArgs) -> MultiGpuSpec {
-    if hw.cards.is_empty() {
+    let mut spec = if hw.cards.is_empty() {
         let arch = hw.gpu_arch.clone().unwrap_or_else(detect_gpu_arch);
         let raw = std::env::var("SPITE_CARD").unwrap_or_default();
         let card = if raw.is_empty() {
@@ -367,7 +412,11 @@ fn resolve_hardware(hw: &HardwareArgs) -> MultiGpuSpec {
     } else {
         let refs: Vec<&str> = hw.cards.iter().map(String::as_str).collect();
         MultiGpuSpec::from_cards(&refs)
-    }
+    };
+    // Card names drop the form factor, so same-vendor defaults to PCIe; promote
+    // to NVLink/XGMI only where the runtime probe confirms it.
+    spec.probe_links();
+    spec
 }
 
 // ── Model path resolution ──────────────────────────────────────────────────
@@ -493,18 +542,32 @@ fn cmd_run(
         device: hw.device,
         kernels_dir: &hw.kernels_dir,
         gpu_arch: &gpu_arch,
+        gpus: &hw.gpus,
+        layer_split: &hw.layer_split,
     };
     let text = generate(
         &target_gguf,
         prompt,
         max_tokens,
         temperature,
-        ctx,
+        GenOptions {
+            ctx_len: ctx,
+            mtp_draft_tokens: feat.mtp.then_some(feat.draft_tokens),
+        },
         &place,
         &kv_cfg,
     )?;
     println!("\n{text}");
     Ok(())
+}
+
+/// Per-run generation options for [`generate`].
+#[derive(Clone, Copy, Default)]
+pub struct GenOptions {
+    /// Context window override; `None` keeps the model's native maximum.
+    pub ctx_len: Option<usize>,
+    /// MTP draft tokens proposed per step. `None` disables speculation.
+    pub mtp_draft_tokens: Option<usize>,
 }
 
 /// Shared generate path for `run` (server reuses the same crates).
@@ -514,11 +577,12 @@ pub fn generate(
     prompt: &str,
     max_tokens: usize,
     temperature: f32,
-    ctx_len: Option<usize>,
+    opts: GenOptions,
     place: &Placement,
     kv_cfg: &KvQuantConfig,
 ) -> Result<String> {
-    use spite_executor::{Executor, ExecutorConfig};
+    use spite_executor::{Executor, ExecutorConfig, SpecDecodeConfig};
+    let ctx_len = opts.ctx_len;
     use spite_tokenizer::Tokenizer;
 
     let mut exec_cfg = ExecutorConfig::default();
@@ -539,13 +603,22 @@ pub fn generate(
     exec.load_model(model);
 
     let t_gen = std::time::Instant::now();
-    let pieces = exec.generate(
-        &tokenizer,
-        &ids,
-        max_tokens,
-        temperature,
-        0x1234_5678_9abc_def0,
-    )?;
+    let seed = 0x1234_5678_9abc_def0;
+    let pieces = match opts.mtp_draft_tokens {
+        // NextN/MTP self-speculation: the model's own draft head proposes, the
+        // trunk verifies (falls back to plain decode when there is no head).
+        Some(k) if k > 0 => exec.generate_speculative(
+            &tokenizer,
+            &ids,
+            max_tokens,
+            SpecDecodeConfig {
+                temperature,
+                seed,
+                n_draft: k,
+            },
+        )?,
+        _ => exec.generate(&tokenizer, &ids, max_tokens, temperature, seed)?,
+    };
     let secs = t_gen.elapsed().as_secs_f64();
     eprintln!(
         "generate     : {} prompt + {} new tokens in {secs:.2} s ({:.2} tok/s)",
@@ -599,7 +672,12 @@ fn build_model(
             HybridDecoder::resolve_table(&cfg.arch, place.gpu_arch, place.kernels_dir, false)
         });
         if let Some((table, backend)) = resolved {
-            let (model, r) = HybridDecoder::load(cfg, gguf, table, backend, ctx_len)
+            let split = if backend == spite_gpu::GpuBackend::Cuda {
+                place.hybrid_split()
+            } else {
+                spite_models::hybrid::LayerSplit::default()
+            };
+            let (model, r) = HybridDecoder::load_split(cfg, gguf, table, backend, ctx_len, &split)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let gib = |b: usize| b as f64 / (1u64 << 30) as f64;
             println!(
@@ -616,6 +694,17 @@ fn build_model(
                     gib(total)
                 )),
             );
+            if r.stages.len() > 1 {
+                for s in &r.stages {
+                    println!(
+                        "  stage      : GPU {} — layers {}..{} ({:.2} GiB)",
+                        s.device,
+                        s.layers.start,
+                        s.layers.end,
+                        gib(s.bytes)
+                    );
+                }
+            }
             return Ok(Box::new(model));
         }
         // No op-complete kernel set: fall through to the Rust CPU implementation.
@@ -915,7 +1004,7 @@ mod tests {
             "AB",
             4,
             0.0,
-            None,
+            GenOptions::default(),
             &Placement::cpu(),
             &KvQuantConfig::default(),
         )

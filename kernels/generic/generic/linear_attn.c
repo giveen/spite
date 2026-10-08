@@ -61,8 +61,9 @@ int spite_generic_linear_attn(
     const int64_t d_model = (int64_t)x->ne[0];
     const int64_t d_out = (int64_t)out->ne[0];
 
-    if (d_model < 1 || d_out < 1) return -1;
-    if (!ref_f32_vec(x, d_model) || !ref_f32_vec(out, d_out)) return -1;
+    const int64_t m = x->ne[1] ? (int64_t)x->ne[1] : 1;
+    if (d_model < 1 || d_out < 1 || m < 1) return -1;
+    if (!ref_f32_mat(x, d_model, m) || !ref_f32_mat(out, d_out, m)) return -1;
     if (!ref_weight_ok(w_qkv, d_model, C) || !ref_weight_ok(w_gate, d_model, vd) ||
         !ref_weight_ok(w_beta, d_model, nvh) || !ref_weight_ok(w_alpha, d_model, nvh) ||
         !ref_weight_ok(w_out, vd, d_out))
@@ -90,10 +91,16 @@ int spite_generic_linear_attn(
     float *hist = (float *)conv_hist->data;
     float *M = (float *)state->data;
 
-    ref_gemv(w_qkv, xin, qkv, 0, 1);
-    ref_gemv(w_gate, xin, z, 0, 1);
-    ref_gemv(w_beta, xin, beta, 0, 1);
-    ref_gemv(w_alpha, xin, alpha, 0, 1);
+    /* One column of `x` per token; the conv history and the delta-rule state
+     * carry across the loop, so m tokens are processed in sequence. */
+    float *outd = (float *)out->data;
+    for (int64_t t = 0; t < m; t++) {
+    const float *xt = xin + t * d_model;
+
+    ref_gemv(w_qkv, xt, qkv, 0, 1);
+    ref_gemv(w_gate, xt, z, 0, 1);
+    ref_gemv(w_beta, xt, beta, 0, 1);
+    ref_gemv(w_alpha, xt, alpha, 0, 1);
 
     /* Depthwise causal conv over [hist (K-1, oldest first) | qkv], then SiLU;
      * the history then drops its oldest row and appends this raw input. */
@@ -161,7 +168,8 @@ int spite_generic_linear_attn(
             o[s] = (float)((double)o[s] * inv * (double)nw[s] * silu_d((double)z[vh * S + s]));
     }
 
-    ref_gemv(w_out, core, (float *)out->data, 1, 1);
+    ref_gemv(w_out, core, outd + t * d_out, 1, 1);
+    }  /* for t */
 
     if (owned) free(buf);
     return 0;

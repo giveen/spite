@@ -86,8 +86,11 @@ pub struct SamplerConfig {
     pub top_p: f32,              // 1.0 = disabled
     pub min_p: f32,              // 0.0 = disabled; filters tokens < min_p * max_prob
     pub repetition_penalty: f32, // 1.0 = disabled; > 1.0 penalises repeats
-    pub frequency_penalty: f32,  // 0.0 = disabled
-    pub presence_penalty: f32,   // 0.0 = disabled
+    /// How many trailing context tokens the repetition penalty considers
+    /// (`0` = the whole context). llama.cpp's `repeat_last_n` default is 64.
+    pub repeat_last_n: usize,
+    pub frequency_penalty: f32, // 0.0 = disabled
+    pub presence_penalty: f32,  // 0.0 = disabled
     pub seed: u64,
 }
 
@@ -99,6 +102,7 @@ impl Default for SamplerConfig {
             top_p: 0.95,
             min_p: 0.0,
             repetition_penalty: 1.0,
+            repeat_last_n: 64,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             seed: 0,
@@ -186,11 +190,40 @@ pub fn apply_min_p(logits: &mut [f32], min_p: f32) {
 
 /// Penalise tokens that appear in `context` by dividing their logit by
 /// `penalty` (if logit > 0) or multiplying (if logit < 0).
+///
+/// Applies over the whole context and penalises each **distinct** token id
+/// once. See [`apply_repetition_penalty_windowed`] for the windowed form.
 pub fn apply_repetition_penalty(logits: &mut [f32], context: &[u32], penalty: f32) {
-    if (penalty - 1.0).abs() < f32::EPSILON {
+    apply_repetition_penalty_windowed(logits, context, penalty, 0);
+}
+
+/// Like [`apply_repetition_penalty`], but only over the last `repeat_last_n`
+/// context tokens (`0` = the whole context), and each distinct token id is
+/// penalised **once**.
+///
+/// This matches llama.cpp and HuggingFace. Penalising once per occurrence — the
+/// previous behaviour — compounds as `penalty^k` for a token seen `k` times and
+/// is far too aggressive (it can suppress a token that is merely common in the
+/// prompt, e.g. a leading space).
+pub fn apply_repetition_penalty_windowed(
+    logits: &mut [f32],
+    context: &[u32],
+    penalty: f32,
+    repeat_last_n: usize,
+) {
+    if (penalty - 1.0).abs() < f32::EPSILON || logits.is_empty() {
         return;
     }
-    for &token_id in context {
+    let window = if repeat_last_n == 0 || repeat_last_n >= context.len() {
+        context
+    } else {
+        &context[context.len() - repeat_last_n..]
+    };
+    let mut seen = std::collections::HashSet::with_capacity(window.len());
+    for &token_id in window {
+        if !seen.insert(token_id) {
+            continue;
+        }
         if let Some(l) = logits.get_mut(token_id as usize) {
             *l = if *l > 0.0 { *l / penalty } else { *l * penalty };
         }
@@ -233,6 +266,18 @@ pub fn multinomial(logits: &[f32], rng_state: &mut u64) -> Result<u32, SamplingE
 
 // ── Full pipeline ─────────────────────────────────────────────────────────
 
+/// Apply every logit processor in `cfg`, in the same order as [`sample`].
+///
+/// Split out so a speculative sampler can compare the draft and target
+/// distributions through the identical pipeline before softmax.
+pub fn apply_processors(logits: &mut [f32], context: &[u32], cfg: &SamplerConfig) {
+    apply_repetition_penalty_windowed(logits, context, cfg.repetition_penalty, cfg.repeat_last_n);
+    apply_temperature(logits, cfg.temperature);
+    apply_min_p(logits, cfg.min_p);
+    apply_top_k(logits, cfg.top_k);
+    apply_top_p(logits, cfg.top_p);
+}
+
 /// Apply all processors from `cfg` then sample one token.
 /// `context` is the token history used for repetition penalty.
 pub fn sample(
@@ -241,17 +286,56 @@ pub fn sample(
     cfg: &SamplerConfig,
     rng: &mut u64,
 ) -> Result<u32, SamplingError> {
-    apply_repetition_penalty(logits, context, cfg.repetition_penalty);
-    apply_temperature(logits, cfg.temperature);
-    apply_min_p(logits, cfg.min_p);
-    apply_top_k(logits, cfg.top_k);
-    apply_top_p(logits, cfg.top_p);
+    apply_processors(logits, context, cfg);
 
     if cfg.temperature <= 0.0 {
         greedy(logits)
     } else {
         multinomial(logits, rng)
     }
+}
+
+/// Softmax over logits that already went through [`apply_processors`].
+/// `-inf` entries become 0; the result sums to 1 (all-zero if nothing was
+/// finite).
+pub fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return vec![0.0; logits.len()];
+    }
+    let mut out: Vec<f32> = logits.iter().map(|&l| (l - max).exp()).collect();
+    let sum: f32 = out.iter().sum();
+    if sum > 0.0 {
+        for v in out.iter_mut() {
+            *v /= sum;
+        }
+    }
+    out
+}
+
+/// Draw a token from (possibly unnormalised) probabilities.
+pub fn sample_probs(probs: &[f32], rng: &mut u64) -> Result<u32, SamplingError> {
+    if probs.is_empty() {
+        return Err(SamplingError::EmptyLogits);
+    }
+    let total: f32 = probs.iter().sum();
+    if !total.is_finite() || total <= 0.0 {
+        return Err(SamplingError::AllFiltered);
+    }
+    let target = lcg_f32(rng) * total;
+    let mut cum = 0f32;
+    for (i, &p) in probs.iter().enumerate() {
+        cum += p;
+        if cum >= target {
+            return Ok(i as u32);
+        }
+    }
+    Ok((probs.len() - 1) as u32)
+}
+
+/// Uniform draw in `[0, 1)` from the shared RNG state (for accept/reject tests).
+pub fn uniform(rng: &mut u64) -> f32 {
+    lcg_f32(rng)
 }
 
 /// LCG fast RNG — shared by multinomial, mirostat, and DRY.
@@ -302,5 +386,26 @@ mod tests {
             .filter(|_| multinomial(&logits, &mut rng).unwrap() == 2)
             .count();
         assert!(n3 > 100, "expected token 2 to dominate, got {n3}/200");
+    }
+
+    #[test]
+    fn repetition_penalty_hits_each_distinct_token_once() {
+        // Token 1 appears three times; a per-occurrence penalty would cube it.
+        let mut logits = vec![0.0f32, 3.0, 2.0];
+        apply_repetition_penalty(&mut logits, &[1, 1, 1], 1.1);
+        assert!((logits[1] - 3.0 / 1.1).abs() < 1e-5, "{}", logits[1]);
+        assert_eq!(logits[2], 2.0);
+    }
+
+    #[test]
+    fn repetition_penalty_window_ignores_older_tokens() {
+        // Token 1 sits outside the last 2 positions, so it is untouched.
+        let mut logits = vec![0.0f32, 3.0];
+        apply_repetition_penalty_windowed(&mut logits, &[1, 7, 7], 1.1, 2);
+        assert_eq!(logits[1], 3.0);
+        // Within the window it is penalised once.
+        let mut logits = vec![0.0f32, 3.0];
+        apply_repetition_penalty_windowed(&mut logits, &[1, 1], 1.1, 2);
+        assert!((logits[1] - 3.0 / 1.1).abs() < 1e-5);
     }
 }

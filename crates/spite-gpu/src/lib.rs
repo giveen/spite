@@ -111,6 +111,23 @@ impl GpuBackend {
     }
 }
 
+/// How two CUDA devices can exchange data directly.
+///
+/// The CUDA runtime exposes peer *access* (`cudaDeviceCanAccessPeer`) but not
+/// whether the link is NVLink or PCIe. [`cuda::p2p_kind`] therefore combines
+/// peer access with the card's form factor from its device name (`...SXM...`
+/// ⇒ NVLink); a name that does not identify an SXM/NVLink part is reported as
+/// [`P2pKind::Pcie`], never NVLink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P2pKind {
+    /// No direct peer access — transfers stage through host memory.
+    None,
+    /// Peer copies run over PCIe (add-in cards, PCIe variants of SXM parts).
+    Pcie,
+    /// An SXM/NVLink form factor *and* peer access are present.
+    Nvlink,
+}
+
 /// A device-side memory allocation.
 pub struct DeviceBuffer {
     pub backend: GpuBackend,
@@ -118,16 +135,30 @@ pub struct DeviceBuffer {
     /// Backend-managed device pointer; for `Cpu` a leaked boxed slice owned by this
     /// buffer (freed in `Drop`), so `as_ptr` is valid for kernels on every backend.
     ptr: *mut u8,
+    /// CUDA ordinal the memory lives on; copies and the free switch to it.
+    /// Always 0 on other backends.
+    device: usize,
 }
 
 unsafe impl Send for DeviceBuffer {}
 unsafe impl Sync for DeviceBuffer {}
 
 impl DeviceBuffer {
-    /// Allocate `size` bytes on `backend`.
+    /// Allocate `size` bytes on `backend` (CUDA: on the current device).
     pub fn alloc(backend: GpuBackend, size: usize) -> Result<Self, GpuError> {
         match backend {
-            GpuBackend::Cuda => cuda::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
+            GpuBackend::Cuda => {
+                let device = cuda::current_device()?;
+                let ptr = cuda::alloc(size)?;
+                // Built directly: struct-update syntax from `from_ptr` would drop
+                // (and free) the temporary it copies the pointer out of.
+                Ok(Self {
+                    backend,
+                    size,
+                    ptr,
+                    device,
+                })
+            }
             GpuBackend::Hip => hip::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr)),
             GpuBackend::HipUnified => {
                 hip_unified::alloc(size).map(|ptr| Self::from_ptr(backend, size, ptr))
@@ -148,8 +179,31 @@ impl DeviceBuffer {
         }
     }
 
+    /// Allocate `size` bytes on CUDA device `device`, leaving the current device unchanged.
+    ///
+    /// Every other backend ignores `device` and behaves like [`Self::alloc`].
+    ///
+    /// # Errors
+    /// Allocation failure, or an invalid CUDA ordinal.
+    pub fn alloc_on(backend: GpuBackend, device: usize, size: usize) -> Result<Self, GpuError> {
+        if backend != GpuBackend::Cuda {
+            return Self::alloc(backend, size);
+        }
+        cuda::with_device(device, || Self::alloc(backend, size))
+    }
+
     fn from_ptr(backend: GpuBackend, size: usize, ptr: *mut u8) -> Self {
-        Self { backend, size, ptr }
+        Self {
+            backend,
+            size,
+            ptr,
+            device: 0,
+        }
+    }
+
+    /// CUDA ordinal holding this buffer; 0 on every other backend.
+    pub fn device(&self) -> usize {
+        self.device
     }
 
     /// Copy `src` (host) → this buffer (device).
@@ -161,7 +215,7 @@ impl DeviceBuffer {
                 self.as_cpu_slice_mut()[..src.len()].copy_from_slice(src);
                 Ok(())
             }
-            GpuBackend::Cuda => cuda::upload(self.ptr, src),
+            GpuBackend::Cuda => cuda::with_device(self.device, || cuda::upload(self.ptr, src)),
             GpuBackend::Hip => hip::upload(self.ptr, src),
             GpuBackend::HipUnified => hip_unified::upload(self.ptr, src),
             GpuBackend::Metal => metal::upload(self.ptr, src),
@@ -183,7 +237,7 @@ impl DeviceBuffer {
                 dst.copy_from_slice(&self.as_cpu_slice()[..dst.len()]);
                 Ok(())
             }
-            GpuBackend::Cuda => cuda::download(self.ptr, dst),
+            GpuBackend::Cuda => cuda::with_device(self.device, || cuda::download(self.ptr, dst)),
             GpuBackend::Hip => hip::download(self.ptr, dst),
             GpuBackend::HipUnified => hip_unified::download(self.ptr, dst),
             GpuBackend::Metal => metal::download(self.ptr, dst),
@@ -194,6 +248,37 @@ impl DeviceBuffer {
             GpuBackend::Musa => musa::download(self.ptr, dst),
             GpuBackend::Hexagon => hexagon::download(self.ptr, dst),
         }
+    }
+
+    /// Copy `src` into this buffer (device → device), up to the smaller size.
+    ///
+    /// CUDA copies run on `self`'s device; both buffers must live there. On a
+    /// host-accessible backend (`Cpu` or a unified-memory backend) this is a
+    /// `memcpy`.
+    ///
+    /// # Errors
+    /// A backend pair with no direct copy path (for example CUDA → HIP).
+    pub fn copy_from(&mut self, src: &DeviceBuffer) -> Result<(), GpuError> {
+        let len = src.size.min(self.size);
+        if self.backend == GpuBackend::Cuda && src.backend == GpuBackend::Cuda {
+            return cuda::with_device(self.device, || cuda::copy_device(self.ptr, src.ptr, len));
+        }
+        if self.host_accessible() && src.host_accessible() {
+            // SAFETY: both `ptr`s are host-accessible allocations of at least
+            // `len` bytes, owned by buffers that outlive the copy and never
+            // overlap (each `DeviceBuffer` owns its own allocation).
+            unsafe { std::ptr::copy_nonoverlapping(src.ptr, self.ptr, len) };
+            return Ok(());
+        }
+        Err(GpuError::CopyFailed(format!(
+            "device-to-device copy from {:?} to {:?} is unsupported",
+            src.backend, self.backend
+        )))
+    }
+
+    /// True when the buffer's memory is directly readable by the host.
+    fn host_accessible(&self) -> bool {
+        self.backend == GpuBackend::Cpu || self.backend.is_unified_memory()
     }
 
     /// Raw pointer to the buffer: a device pointer, or host memory for `Cpu`.
@@ -224,7 +309,18 @@ impl Drop for DeviceBuffer {
             return;
         }
         match self.backend {
-            GpuBackend::Cuda => cuda::free(self.ptr),
+            GpuBackend::Cuda => {
+                let ptr = self.ptr;
+                // A failed switch still attempts the free on the current device.
+                if cuda::with_device(self.device, || {
+                    cuda::free(ptr);
+                    Ok(())
+                })
+                .is_err()
+                {
+                    cuda::free(ptr);
+                }
+            }
             GpuBackend::Hip => hip::free(self.ptr),
             GpuBackend::HipUnified => unsafe { hip_unified::free(self.ptr, self.size) },
             GpuBackend::Metal => metal::free(self.ptr),

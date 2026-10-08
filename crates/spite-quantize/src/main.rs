@@ -34,6 +34,7 @@ fn main() -> Result<()> {
         "Q4_K_S" => QuantType::Q4KS,
         "Q5_K_M" => QuantType::Q5KM,
         "Q6_K" => QuantType::Q6K,
+        "MXFP4" => QuantType::MXFP4,
         other => anyhow::bail!("unknown quant type: {other}"),
     };
 

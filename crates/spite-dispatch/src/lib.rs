@@ -59,6 +59,8 @@ struct LoadedKernel {
     info: &'static SpiteKernelInfo,
     /// Candidate directory this kernel was loaded from.
     dir: PathBuf,
+    /// Optional `spite_kernel_caps()` bits; 0 when the kernel does not export it.
+    caps: u32,
 }
 
 impl LoadedKernel {
@@ -73,10 +75,19 @@ impl LoadedKernel {
             });
         }
         let dir = path.parent().map(Path::to_owned).unwrap_or_default();
+        type CapsFn = unsafe extern "C" fn() -> u32;
+        // SAFETY: optional symbol; a kernel without it simply has no caps.
+        let caps = unsafe {
+            lib.get::<CapsFn>(b"spite_kernel_caps\0")
+                .ok()
+                .map(|s| (*s)())
+        }
+        .unwrap_or(0);
         Ok(Self {
             _lib: lib,
             info,
             dir,
+            caps,
         })
     }
 
@@ -89,11 +100,17 @@ impl LoadedKernel {
 
 // ── Dispatch table ─────────────────────────────────────────────────────────
 
+/// Optional kernel capability bits, queried through the `spite_kernel_caps`
+/// symbol. A kernel that does not export it reads as 0.
+pub const CAP_BATCH: u32 = 1;
+
 /// Source label for each resolved op — shown by `spite dispatch`.
 #[derive(Debug, Clone)]
 pub struct OpSource {
     pub gpu_arch: String,
     pub path: PathBuf,
+    /// Capability bits declared by the kernel that won this slot.
+    pub caps: u32,
 }
 
 pub struct DispatchTable {
@@ -150,6 +167,7 @@ impl DispatchTable {
         let src = OpSource {
             gpu_arch: "cpu_fallback".to_string(),
             path: PathBuf::from("fallback"),
+            caps: 0,
         };
         Self {
             rms_norm: (None, src.clone()),
@@ -219,6 +237,7 @@ impl DispatchBuilder {
         let generic_src = OpSource {
             gpu_arch: "generic".into(),
             path: kdir.join("generic").join("generic"),
+            caps: 0,
         };
 
         // Model ops resolved from model candidate chain.
@@ -314,6 +333,7 @@ fn resolve_attention(
             let src = OpSource {
                 gpu_arch: lib.gpu_arch().to_owned(),
                 path: lib.dir.clone(),
+                caps: lib.caps,
             };
             return ((Some(f), src), kinds);
         }
@@ -336,6 +356,7 @@ fn find_op<T: Copy>(
                 OpSource {
                     gpu_arch: lib.gpu_arch().to_owned(),
                     path: lib.dir.clone(),
+                    caps: lib.caps,
                 },
             );
         }

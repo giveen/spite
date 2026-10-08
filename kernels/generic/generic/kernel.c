@@ -94,3 +94,8 @@ static const SpiteKernelInfo GENERIC_KERNEL_INFO = {
 const SpiteKernelInfo *spite_kernel_info(void) {
     return &GENERIC_KERNEL_INFO;
 }
+
+/* Capability bits: the generic ops accept a batched [cols, m] activation. */
+uint32_t spite_kernel_caps(void) {
+    return SPITE_CAP_BATCH;
+}

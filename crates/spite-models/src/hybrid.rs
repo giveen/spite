@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_int;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -95,6 +96,17 @@ enum Layer {
     Gdn(GdnLayer),
 }
 
+/// NextN / MTP draft head: one gated full-attention block stored after the
+/// trunk as `blk.{n_layers}`, fed `[enorm(embed(x_{t+1})) || hnorm(h_t)]`.
+struct MtpHead {
+    enorm: SpiteTensor,
+    hnorm: SpiteTensor,
+    eh_proj: SpiteTensor,
+    layer: AttnLayer,
+    head_norm: SpiteTensor,
+    head: SpiteTensor,
+}
+
 struct KvPair {
     k: DeviceBuffer,
     v: DeviceBuffer,
@@ -103,6 +115,24 @@ struct KvPair {
 struct GdnState {
     conv_hist: DeviceBuffer,
     state: DeviceBuffer,
+    /// CUDA ordinal the buffers live on, for a same-device snapshot copy.
+    device: usize,
+}
+
+/// A saved copy of the GDN recurrent state, taken before a batched speculative
+/// verify so a rejected draft tail can be undone. See
+/// [`HybridDecoder::verify_batch`].
+struct GdnShadow {
+    conv_hist: DeviceBuffer,
+    state: DeviceBuffer,
+}
+
+/// One pipeline stage's residual stream and scratch, on that stage's device.
+struct StageBufs {
+    device: usize,
+    scratch: DeviceBuffer,
+    h: DeviceBuffer,
+    n: DeviceBuffer,
 }
 
 struct HState {
@@ -110,9 +140,22 @@ struct HState {
     _weights: HashMap<String, DeviceWeight>,
     kv: Vec<KvPair>,
     gdn: Vec<GdnState>,
-    scratch: DeviceBuffer,
-    h: DeviceBuffer,
-    n: DeviceBuffer,
+    /// Pipeline stages in layer order; the last one also runs the LM head and
+    /// the MTP block, and owns `hid`, `emb`, `pack` and `logits`.
+    stages: Vec<StageBufs>,
+    /// Final-normed hidden state of the last trunk token or MTP step: the
+    /// `h_t` the next MTP step consumes.
+    hid: DeviceBuffer,
+    /// Final-normed hidden of every column of the last batched forward, so a
+    /// rejected speculative tail can reselect the accepted column without
+    /// re-running the trunk (`batch_cols` is how many columns it holds).
+    hid_batch: Option<DeviceBuffer>,
+    batch_cols: usize,
+    /// GDN recurrent state saved by the last [`HybridDecoder::verify_batch`].
+    gdn_shadow: Option<Vec<GdnShadow>>,
+    /// MTP only: the draft token's embedding and the packed `[2*d]` stem.
+    emb: DeviceBuffer,
+    pack: DeviceBuffer,
     logits: DeviceBuffer,
 }
 
@@ -124,8 +167,43 @@ pub struct HybridReport {
     pub state_bytes: usize,
     pub scratch_bytes: usize,
     pub kv_kind: SpiteType,
-    /// `(free, total)` device memory after load; `None` off CUDA.
+    /// The NextN (MTP) draft head was loaded and `mtp_step` is available.
+    pub mtp: bool,
+    /// `(free, total)` memory of the first stage's device after load; `None` off CUDA.
     pub mem: Option<(usize, usize)>,
+    /// Pipeline stages in layer order (one entry on a single device).
+    pub stages: Vec<StageReport>,
+}
+
+/// One loaded pipeline stage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageReport {
+    /// CUDA ordinal (0 off CUDA).
+    pub device: usize,
+    /// Trunk layers this stage runs.
+    pub layers: Range<usize>,
+    /// Device bytes the stage allocated: weights, KV, recurrent state,
+    /// activations, scratch, plus the LM head and MTP block on the last stage.
+    pub bytes: usize,
+}
+
+/// How the trunk is spread over CUDA devices (pipeline parallelism).
+///
+/// Consecutive layers form a stage on one device; only the `d_model` hidden
+/// state crosses a stage boundary, through host memory, so the devices need
+/// no peer access (PCIe-only boxes work). The last stage also holds the LM
+/// head and the NextN block.
+///
+/// The default is the current device only, exactly the single-GPU path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LayerSplit {
+    /// CUDA ordinals to use, in layer order. Empty: the current device.
+    pub devices: Vec<usize>,
+    /// Relative layer shares, one per device (e.g. `[33, 32]`). Empty: stay
+    /// on the first device when the model fits there, otherwise spread over
+    /// every listed device in proportion to its free memory, balancing bytes
+    /// rather than layer counts.
+    pub shares: Vec<u32>,
 }
 
 /// Hybrid decoder bound to one backend and one dispatch table.
@@ -138,6 +216,9 @@ pub struct HybridDecoder {
     attn: SpiteAttnParams,
     gdn: SpiteGdnParams,
     layers: Vec<Layer>,
+    /// Pipeline stage (index into `HState::stages`) of each layer.
+    layer_stage: Vec<usize>,
+    mtp: Option<MtpHead>,
     out_norm: SpiteTensor,
     out_w: SpiteTensor,
     embd_host: Vec<u8>,
@@ -148,6 +229,135 @@ pub struct HybridDecoder {
 /// True for archs this decoder implements: recurrent GDN layers with dense or MoE FFN.
 pub fn is_hybrid(cfg: &ModelConfig) -> bool {
     cfg.ssm_d_state > 0 && cfg.recurrent_layers.iter().any(|&r| r)
+}
+
+/// Block index of a `blk.N.*` tensor name.
+fn block_of(name: &str) -> Option<usize> {
+    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+}
+
+/// Resolve `split` to `(device per stage, layers per stage)`.
+///
+/// `layer_bytes` is each trunk layer's device footprint, `head_bytes` what
+/// the last stage carries on top, `stage_fixed` every stage's scratch and
+/// activations, and `free_on` a device's free bytes.
+fn plan_split(
+    split: &LayerSplit,
+    layer_bytes: &[usize],
+    head_bytes: usize,
+    stage_fixed: usize,
+    cuda_on: bool,
+    free_on: &dyn Fn(usize) -> Result<usize, ModelError>,
+) -> Result<(Vec<usize>, Vec<usize>), ModelError> {
+    let n_layers = layer_bytes.len();
+    let mut devices = split.devices.clone();
+    if cuda_on {
+        if devices.is_empty() {
+            devices.push(cuda::current_device().map_err(|e| err(e.to_string()))?);
+        }
+        let n = cuda::device_count().map_err(|e| err(e.to_string()))?;
+        if let Some(&bad) = devices.iter().find(|&&dev| dev >= n) {
+            return Err(err(format!("GPU {bad} does not exist ({n} visible)")));
+        }
+    } else if devices.is_empty() {
+        devices.push(0);
+    }
+
+    if !split.shares.is_empty() {
+        if split.shares.len() != devices.len() {
+            return Err(err(format!(
+                "layer split has {} shares for {} GPUs",
+                split.shares.len(),
+                devices.len()
+            )));
+        }
+        let counts = share_counts(&split.shares, n_layers)
+            .ok_or_else(|| err("layer split shares must not all be zero"))?;
+        if counts.contains(&0) {
+            return Err(err(format!(
+                "a layer split share is too small to get any of the {n_layers} layers"
+            )));
+        }
+        return Ok((devices, counts));
+    }
+
+    let mut uniq: Vec<usize> = Vec::with_capacity(devices.len());
+    for dev in devices {
+        if !uniq.contains(&dev) {
+            uniq.push(dev);
+        }
+    }
+    let total = layer_bytes.iter().sum::<usize>() + head_bytes + stage_fixed;
+    if uniq.len() == 1 || total + VRAM_HEADROOM <= free_on(uniq[0])? {
+        return Ok((vec![uniq[0]], vec![n_layers]));
+    }
+    let n_st = uniq.len();
+    let budgets = uniq
+        .iter()
+        .enumerate()
+        .map(|(i, &dev)| {
+            let reserved = VRAM_HEADROOM + stage_fixed + if i + 1 == n_st { head_bytes } else { 0 };
+            Ok(free_on(dev)?.saturating_sub(reserved))
+        })
+        .collect::<Result<Vec<_>, ModelError>>()?;
+    let counts = balance_layers(layer_bytes, &budgets);
+    // A device whose budget earned no layer is dropped; the last stage stays
+    // even when empty because it carries the head.
+    Ok(uniq
+        .into_iter()
+        .zip(counts)
+        .enumerate()
+        .filter(|&(i, (_, c))| c > 0 || i + 1 == n_st)
+        .map(|(_, sc)| sc)
+        .unzip())
+}
+
+/// Split `n` layers in proportion to `shares` (largest remainder, ties to
+/// the earlier stage). `None` when every share is zero.
+fn share_counts(shares: &[u32], n: usize) -> Option<Vec<usize>> {
+    let total: u64 = shares.iter().map(|&s| u64::from(s)).sum();
+    if total == 0 {
+        return None;
+    }
+    let scaled = |s: u32| u64::from(s) * n as u64;
+    let mut counts: Vec<usize> = shares
+        .iter()
+        .map(|&s| (scaled(s) / total) as usize)
+        .collect();
+    let mut rem: Vec<(u64, usize)> = shares
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| (scaled(s) % total, i))
+        .collect();
+    rem.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let short = n - counts.iter().sum::<usize>();
+    for &(_, i) in rem.iter().take(short) {
+        counts[i] += 1;
+    }
+    Some(counts)
+}
+
+/// Contiguous layer counts per stage so each stage's bytes track its share
+/// of `budgets`. A layer joins a stage while at least half of it fits under
+/// the stage's cumulative target; the last stage takes the rest.
+fn balance_layers(layer_bytes: &[usize], budgets: &[usize]) -> Vec<usize> {
+    let total: u128 = layer_bytes.iter().map(|&b| b as u128).sum();
+    let cap: u128 = budgets.iter().map(|&b| b as u128).sum::<u128>().max(1);
+    let mut counts = vec![0usize; budgets.len()];
+    let (mut l, mut acc, mut target) = (0usize, 0u128, 0u128);
+    for (s, &b) in budgets.iter().enumerate() {
+        if s + 1 == budgets.len() {
+            counts[s] = layer_bytes.len() - l;
+            break;
+        }
+        target += total * b as u128 / cap;
+        while l < layer_bytes.len() && acc + layer_bytes[l] as u128 / 2 <= target {
+            acc += layer_bytes[l] as u128;
+            l += 1;
+            counts[s] += 1;
+        }
+    }
+    counts
 }
 
 impl HybridDecoder {
@@ -191,13 +401,37 @@ impl HybridDecoder {
         ok.then_some((table, backend))
     }
 
-    /// Upload every trunk tensor of `gguf`, allocate KV, GDN state and scratch.
+    /// Upload every trunk tensor of `gguf` to the current device, allocate KV,
+    /// GDN state and scratch.
+    ///
+    /// # Errors
+    /// See [`Self::load_split`].
     pub fn load(
         config: ModelConfig,
         gguf: &GgufModel,
         table: DispatchTable,
         backend: GpuBackend,
         n_ctx: usize,
+    ) -> Result<(Self, HybridReport), ModelError> {
+        Self::load_split(config, gguf, table, backend, n_ctx, &LayerSplit::default())
+    }
+
+    /// Like [`Self::load`], spreading the trunk over devices as `split` says.
+    ///
+    /// Off CUDA the device ordinals are ignored but the stages are still
+    /// built, so the stage hand-off can be exercised on the CPU backend.
+    ///
+    /// # Errors
+    /// Malformed GDN geometry, missing or unsupported weights, an invalid
+    /// `split` (unknown ordinal, share count not matching the devices, a share
+    /// too small to get a layer), or a device without room for its stage.
+    pub fn load_split(
+        config: ModelConfig,
+        gguf: &GgufModel,
+        table: DispatchTable,
+        backend: GpuBackend,
+        n_ctx: usize,
+        split: &LayerSplit,
     ) -> Result<(Self, HybridReport), ModelError> {
         if !is_hybrid(&config) {
             return Err(err("not a hybrid (gated delta net) architecture"));
@@ -245,16 +479,28 @@ impl HybridDecoder {
             norm_eps: config.norm_eps,
         };
 
-        // Trunk tensors only: NextN/MTP blocks (index >= n_layers) are not run.
-        let is_trunk = |name: &str| {
-            name.strip_prefix("blk.")
-                .and_then(|r| r.split('.').next())
-                .and_then(|i| i.parse::<usize>().ok())
-                .is_none_or(|i| i < n_layers)
+        // NextN/MTP: only the first block (`blk.{n_layers}`) is used, and only
+        // when it is a full-attention block and an mtp_stem op runs on this
+        // backend; otherwise its tensors are not uploaded at all.
+        let mtp_b = format!("blk.{n_layers}");
+        let mtp_stem_ok = table.mtp_stem.0.is_some()
+            && (table.mtp_stem.1.gpu_arch == GENERIC) == (backend == GpuBackend::Cpu);
+        let has_tensor = |name: String| gguf.tensor_names().any(|n| n == name);
+        let has_mtp = config.n_nextn_predict_layers > 0
+            && mtp_stem_ok
+            && has_tensor(format!("{mtp_b}.nextn.eh_proj.weight"))
+            && has_tensor(format!("{mtp_b}.attn_q.weight"));
+        let n_blocks = n_layers + usize::from(has_mtp);
+        // Embedding lookups run on the host copy, so `token_embd` only goes to
+        // the device when it doubles as the LM head (tied embeddings).
+        let tied = !has_tensor("output.weight".into());
+        let is_loaded = |name: &str| match block_of(name) {
+            Some(i) => i < n_blocks,
+            None => tied || name != "token_embd.weight",
         };
         let mut sizes = Vec::new();
         let mut weights_bytes = 0usize;
-        for name in gguf.tensor_names().filter(|n| is_trunk(n)) {
+        for name in gguf.tensor_names().filter(|n| is_loaded(n)) {
             let t = gguf.tensor(name);
             let n_elem: usize = t.ne.iter().map(|&x| x.max(1) as usize).product();
             let bytes = packed_bytes(t.kind, n_elem)
@@ -274,8 +520,9 @@ impl HybridDecoder {
             .filter(|&i| !config.recurrent_layers[i])
             .count();
         let n_gdn = n_layers - n_attn;
+        let n_kv_layers = n_attn + usize::from(has_mtp);
         let kv_side = n_ctx * kv_row * kv_elem;
-        let kv_bytes = n_attn * 2 * kv_side;
+        let kv_bytes = n_kv_layers * 2 * kv_side;
         let state_bytes = n_gdn * (gdn.conv_hist_floats() + gdn.state_floats()) * 4;
         let scratch_floats = [
             2 * config.d_ffn,
@@ -286,29 +533,113 @@ impl HybridDecoder {
         .max()
         .unwrap_or(0);
         let scratch_bytes = scratch_floats * 4;
-        let act_bytes = (2 * d + config.vocab_size) * 4;
-        let need = weights_bytes + kv_bytes + state_bytes + scratch_bytes + act_bytes;
-        if backend == GpuBackend::Cuda {
-            let (free, _) = cuda::mem_info().map_err(|e| err(e.to_string()))?;
-            if need + VRAM_HEADROOM > free {
-                return Err(err(format!(
-                    "model needs {:.2} GiB VRAM (weights {:.2} + KV {:.2} @ {n_ctx} ctx + state {:.2}), \
-                     only {:.2} GiB free — reduce --ctx",
-                    gib(need),
-                    gib(weights_bytes),
-                    gib(kv_bytes),
-                    gib(state_bytes),
-                    gib(free)
-                )));
+
+        // Device bytes per trunk layer, of the head (everything outside the
+        // trunk: LM head, final norm, MTP block and its KV, hid/logits/emb/pack)
+        // and of each stage's own scratch + h + n.
+        let mut layer_bytes: Vec<usize> = (0..n_layers)
+            .map(|l| {
+                if config.recurrent_layers[l] {
+                    (gdn.conv_hist_floats() + gdn.state_floats()) * 4
+                } else {
+                    2 * kv_side
+                }
+            })
+            .collect();
+        let mut head_bytes = (d + config.vocab_size + if has_mtp { 3 * d } else { 0 }) * 4
+            + if has_mtp { 2 * kv_side } else { 0 };
+        for (name, _, bytes) in &sizes {
+            match block_of(name) {
+                Some(i) if i < n_layers => layer_bytes[i] += bytes,
+                _ => head_bytes += bytes,
             }
         }
+        let stage_fixed = scratch_bytes + 2 * d * 4;
+        let cuda_on = backend == GpuBackend::Cuda;
+        let free_on = |dev: usize| -> Result<usize, ModelError> {
+            if !cuda_on {
+                return Ok(usize::MAX);
+            }
+            cuda::with_device(dev, cuda::mem_info)
+                .map(|(free, _)| free)
+                .map_err(|e| err(e.to_string()))
+        };
 
-        let alloc = |n: usize| {
-            DeviceBuffer::alloc(backend, n.max(1)).map_err(|e| err(format!("alloc: {e}")))
+        let (devices, counts) = plan_split(
+            split,
+            &layer_bytes,
+            head_bytes,
+            stage_fixed,
+            cuda_on,
+            &free_on,
+        )?;
+        let n_stages = devices.len();
+        let layer_stage: Vec<usize> = counts
+            .iter()
+            .enumerate()
+            .flat_map(|(s, &c)| std::iter::repeat_n(s, c))
+            .collect();
+        let mut stage_reports = Vec::with_capacity(n_stages);
+        let mut first = 0;
+        for (s, (&device, &c)) in devices.iter().zip(&counts).enumerate() {
+            let bytes = layer_bytes[first..first + c].iter().sum::<usize>()
+                + stage_fixed
+                + if s + 1 == n_stages { head_bytes } else { 0 };
+            stage_reports.push(StageReport {
+                device,
+                layers: first..first + c,
+                bytes,
+            });
+            first += c;
+        }
+
+        // Stages that share a device (e.g. a split test on one GPU) add up.
+        if cuda_on {
+            let mut per_dev: Vec<(usize, usize)> = Vec::new();
+            for r in &stage_reports {
+                match per_dev.iter_mut().find(|(dev, _)| *dev == r.device) {
+                    Some((_, b)) => *b += r.bytes,
+                    None => per_dev.push((r.device, r.bytes)),
+                }
+            }
+            for &(dev, need) in &per_dev {
+                let free = free_on(dev)?;
+                if need + VRAM_HEADROOM <= free {
+                    continue;
+                }
+                return Err(err(if per_dev.len() == 1 {
+                    format!(
+                        "model needs {:.2} GiB VRAM on GPU {dev} (weights {:.2} + KV {:.2} @ {n_ctx} ctx \
+                         + state {:.2}), only {:.2} GiB free — reduce --ctx or spread the layers over \
+                         more GPUs (--gpus)",
+                        gib(need),
+                        gib(weights_bytes),
+                        gib(kv_bytes),
+                        gib(state_bytes),
+                        gib(free)
+                    )
+                } else {
+                    format!(
+                        "GPU {dev} needs {:.2} GiB for its pipeline stages, only {:.2} GiB free \
+                         — reduce --ctx, add GPUs (--gpus) or rebalance (--layer-split)",
+                        gib(need),
+                        gib(free)
+                    )
+                }));
+            }
+        }
+        let head_dev = devices[n_stages - 1];
+
+        let alloc = |dev: usize, n: usize| {
+            DeviceBuffer::alloc_on(backend, dev, n.max(1)).map_err(|e| err(format!("alloc: {e}")))
         };
         let mut weights = HashMap::with_capacity(sizes.len());
         for (name, t, bytes) in sizes {
-            let mut buf = alloc(bytes)?;
+            let dev = match block_of(&name) {
+                Some(i) if i < n_layers => devices[layer_stage[i]],
+                _ => head_dev,
+            };
+            let mut buf = alloc(dev, bytes)?;
             // SAFETY: `t.data` points at `bytes` bytes of the GGUF mmap.
             let src = unsafe { std::slice::from_raw_parts(t.data as *const u8, bytes) };
             buf.upload(src)
@@ -329,12 +660,9 @@ impl HybridDecoder {
                 .map(DeviceWeight::tensor)
                 .ok_or_else(|| ModelError::MissingWeight(name.into()))
         };
-        let mut layers = Vec::with_capacity(n_layers);
-        let (mut kv_i, mut gdn_i) = (0usize, 0usize);
-        for l in 0..n_layers {
-            let b = format!("blk.{l}");
+        let load_ffn = |b: &str| -> Result<LayerFfn, ModelError> {
             let post_norm = get(&format!("{b}.post_attention_norm.weight"))?;
-            let ffn = if config.n_expert > 0 {
+            Ok(if config.n_expert > 0 {
                 let w_gate_inp = get(&format!("{b}.ffn_gate_inp.weight"))?;
                 let w_up_exps = get(&format!("{b}.ffn_up_exps.weight"))?;
                 let w_gate_exps = get(&format!("{b}.ffn_gate_exps.weight"))?;
@@ -369,11 +697,36 @@ impl HybridDecoder {
                     up: get(&format!("{b}.ffn_up.weight"))?,
                     down: get(&format!("{b}.ffn_down.weight"))?,
                 }))
-            };
-            let norm = get(&format!("{b}.attn_norm.weight"))?;
+            })
+        };
+        let load_attn = |b: &str, kv: usize| -> Result<AttnLayer, ModelError> {
+            let wq = get(&format!("{b}.attn_q.weight"))?;
+            if wq.ne[1] as usize != 2 * n_heads * head_dim {
+                return Err(ModelError::ShapeMismatch {
+                    name: format!("{b}.attn_q.weight"),
+                    expected: vec![wq.ne[0], (2 * n_heads * head_dim) as u32],
+                    actual: wq.ne.to_vec(),
+                });
+            }
+            Ok(AttnLayer {
+                norm: get(&format!("{b}.attn_norm.weight"))?,
+                wq,
+                wk: get(&format!("{b}.attn_k.weight"))?,
+                wv: get(&format!("{b}.attn_v.weight"))?,
+                wo: get(&format!("{b}.attn_output.weight"))?,
+                q_norm: get(&format!("{b}.attn_q_norm.weight"))?,
+                k_norm: get(&format!("{b}.attn_k_norm.weight"))?,
+                kv,
+                ffn: load_ffn(b)?,
+            })
+        };
+        let mut layers = Vec::with_capacity(n_layers);
+        let (mut kv_i, mut gdn_i) = (0usize, 0usize);
+        for l in 0..n_layers {
+            let b = format!("blk.{l}");
             if config.recurrent_layers[l] {
                 layers.push(Layer::Gdn(GdnLayer {
-                    norm,
+                    norm: get(&format!("{b}.attn_norm.weight"))?,
                     w_qkv: get(&format!("{b}.attn_qkv.weight"))?,
                     w_gate: get(&format!("{b}.attn_gate.weight"))?,
                     w_beta: get(&format!("{b}.ssm_beta.weight"))?,
@@ -384,65 +737,87 @@ impl HybridDecoder {
                     ssm_a: get(&format!("{b}.ssm_a"))?,
                     ssm_norm: get(&format!("{b}.ssm_norm.weight"))?,
                     st: gdn_i,
-                    ffn,
+                    ffn: load_ffn(&b)?,
                 }));
                 gdn_i += 1;
             } else {
-                let wq = get(&format!("{b}.attn_q.weight"))?;
-                if wq.ne[1] as usize != 2 * n_heads * head_dim {
-                    return Err(ModelError::ShapeMismatch {
-                        name: format!("{b}.attn_q.weight"),
-                        expected: vec![wq.ne[0], (2 * n_heads * head_dim) as u32],
-                        actual: wq.ne.to_vec(),
-                    });
-                }
-                layers.push(Layer::Attn(AttnLayer {
-                    norm,
-                    wq,
-                    wk: get(&format!("{b}.attn_k.weight"))?,
-                    wv: get(&format!("{b}.attn_v.weight"))?,
-                    wo: get(&format!("{b}.attn_output.weight"))?,
-                    q_norm: get(&format!("{b}.attn_q_norm.weight"))?,
-                    k_norm: get(&format!("{b}.attn_k_norm.weight"))?,
-                    kv: kv_i,
-                    ffn,
-                }));
+                layers.push(Layer::Attn(load_attn(&b, kv_i)?));
                 kv_i += 1;
             }
         }
         let out_norm = get("output_norm.weight")?;
         // Tied embeddings: token_embd doubles as the LM head.
         let out_w = get("output.weight").or_else(|_| get("token_embd.weight"))?;
+        let mtp = if has_mtp {
+            let b = &mtp_b;
+            Some(MtpHead {
+                enorm: get(&format!("{b}.nextn.enorm.weight"))?,
+                hnorm: get(&format!("{b}.nextn.hnorm.weight"))?,
+                eh_proj: get(&format!("{b}.nextn.eh_proj.weight"))?,
+                layer: load_attn(b, n_attn)?,
+                head_norm: get(&format!("{b}.nextn.shared_head_norm.weight"))
+                    .or_else(|_| get("output_norm.weight"))?,
+                head: get(&format!("{b}.nextn.shared_head_head.weight"))
+                    .or_else(|_| get("output.weight"))
+                    .or_else(|_| get("token_embd.weight"))?,
+            })
+        } else {
+            None
+        };
 
         let zero = |buf: &mut DeviceBuffer| {
             buf.upload(&vec![0u8; buf.size])
                 .map_err(|e| err(format!("zero: {e}")))
         };
-        let mut kv = Vec::with_capacity(n_attn);
-        for _ in 0..n_attn {
+        // KV pairs and GDN states in layer order, matching `AttnLayer::kv` and
+        // `GdnLayer::st`, each on its layer's device; the MTP KV comes last.
+        let mut kv = Vec::with_capacity(n_kv_layers);
+        let mut gdn_st = Vec::with_capacity(n_gdn);
+        for l in 0..n_layers {
+            let dev = devices[layer_stage[l]];
+            if config.recurrent_layers[l] {
+                let mut g = GdnState {
+                    conv_hist: alloc(dev, gdn.conv_hist_floats() * 4)?,
+                    state: alloc(dev, gdn.state_floats() * 4)?,
+                    device: dev,
+                };
+                zero(&mut g.conv_hist)?;
+                zero(&mut g.state)?;
+                gdn_st.push(g);
+            } else {
+                kv.push(KvPair {
+                    k: alloc(dev, kv_side)?,
+                    v: alloc(dev, kv_side)?,
+                });
+            }
+        }
+        if has_mtp {
             kv.push(KvPair {
-                k: alloc(kv_side)?,
-                v: alloc(kv_side)?,
+                k: alloc(head_dev, kv_side)?,
+                v: alloc(head_dev, kv_side)?,
             });
         }
-        let mut gdn_st = Vec::with_capacity(n_gdn);
-        for _ in 0..n_gdn {
-            let mut g = GdnState {
-                conv_hist: alloc(gdn.conv_hist_floats() * 4)?,
-                state: alloc(gdn.state_floats() * 4)?,
-            };
-            zero(&mut g.conv_hist)?;
-            zero(&mut g.state)?;
-            gdn_st.push(g);
+        let mut stages = Vec::with_capacity(n_stages);
+        for &device in &devices {
+            stages.push(StageBufs {
+                device,
+                scratch: alloc(device, scratch_bytes)?,
+                h: alloc(device, d * 4)?,
+                n: alloc(device, d * 4)?,
+            });
         }
         let st = HState {
             _weights: weights,
             kv,
             gdn: gdn_st,
-            scratch: alloc(scratch_bytes)?,
-            h: alloc(d * 4)?,
-            n: alloc(d * 4)?,
-            logits: alloc(config.vocab_size * 4)?,
+            stages,
+            hid: alloc(head_dev, d * 4)?,
+            hid_batch: None,
+            batch_cols: 0,
+            gdn_shadow: None,
+            emb: alloc(head_dev, if has_mtp { d * 4 } else { 0 })?,
+            pack: alloc(head_dev, if has_mtp { 2 * d * 4 } else { 0 })?,
+            logits: alloc(head_dev, config.vocab_size * 4)?,
         };
 
         let embd = gguf.tensor("token_embd.weight");
@@ -463,9 +838,11 @@ impl HybridDecoder {
             state_bytes,
             scratch_bytes,
             kv_kind,
-            mem: (backend == GpuBackend::Cuda)
-                .then(|| cuda::mem_info().ok())
+            mtp: has_mtp,
+            mem: cuda_on
+                .then(|| cuda::with_device(devices[0], cuda::mem_info).ok())
                 .flatten(),
+            stages: stage_reports,
         };
         Ok((
             Self {
@@ -477,6 +854,8 @@ impl HybridDecoder {
                 attn,
                 gdn,
                 layers,
+                layer_stage,
+                mtp,
                 out_norm,
                 out_w,
                 embd_host,
@@ -512,6 +891,31 @@ fn kv_tensor(buf: &DeviceBuffer, kind: SpiteType, row: usize, n_ctx: usize) -> S
     }
 }
 
+/// `[cols, rows]` F32 view of a device buffer (one column per token) — the
+/// batched-prefill activation shape.
+fn f32_tensor2(buf: &DeviceBuffer, cols: usize, rows: usize) -> SpiteTensor {
+    let ne = [cols as u32, rows as u32, 1, 1];
+    SpiteTensor {
+        data: buf.as_ptr().cast(),
+        ne,
+        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &ne),
+        kind: SpiteType::F32,
+    }
+}
+
+/// `[cols, 1]` F32 view of column `t` of a `[cols, m]` buffer.
+fn f32_tensor_col(buf: &DeviceBuffer, cols: usize, t: usize) -> SpiteTensor {
+    // SAFETY: the buffer holds cols*m floats and t < m.
+    let data = unsafe { buf.as_ptr().add(t * cols * 4) };
+    let ne = [cols as u32, 1, 1, 1];
+    SpiteTensor {
+        data: data.cast(),
+        ne,
+        nb: SpiteTensor::contiguous_strides(SpiteType::F32, &ne),
+        kind: SpiteType::F32,
+    }
+}
+
 impl ModelArch for HybridDecoder {
     fn config(&self) -> &ModelConfig {
         &self.config
@@ -530,6 +934,31 @@ impl ModelArch for HybridDecoder {
         }
     }
 
+    fn has_mtp(&self) -> bool {
+        HybridDecoder::has_mtp(self)
+    }
+
+    fn mtp_step(&self, token: u32, pos: usize, logits_out: &mut [f32]) -> Result<(), ModelError> {
+        HybridDecoder::mtp_step(self, token, pos, logits_out)
+    }
+
+    fn can_verify_batch(&self) -> bool {
+        self.batch_capable()
+    }
+
+    fn verify_batch(
+        &self,
+        tokens: &[u32],
+        ctx: &SpiteCtx,
+        logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        HybridDecoder::verify_batch(self, tokens, ctx, logits_out)
+    }
+
+    fn rollback_drafts(&self, n: usize) -> Result<(), ModelError> {
+        HybridDecoder::rollback_drafts(self, n)
+    }
+
     fn forward(
         &self,
         tokens: &[u32],
@@ -541,7 +970,13 @@ impl ModelArch for HybridDecoder {
         if logits_out.len() != tokens.len() * vocab {
             return Err(err("logits_out shape mismatch"));
         }
-        let (Some(rms_norm), Some(attention_ex), Some(linear_attn), Some(matmul)) = (
+        // A multi-token prompt on a batch-capable (generic) kernel goes through
+        // the layer-major batched path; decode (one token) and GPU kernels
+        // without batch support keep the per-token path.
+        if tokens.len() > 1 && self.batch_capable() {
+            return self.forward_batch(tokens, logits_out, ctx);
+        }
+        let (Some(rms_norm), Some(_), Some(_), Some(matmul)) = (
             self.table.rms_norm.0,
             self.table.attention_ex.0,
             self.table.linear_attn.0,
@@ -551,13 +986,17 @@ impl ModelArch for HybridDecoder {
         };
         let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
         let st = &mut *guard;
+        let last = st.stages.len() - 1;
 
-        let mut h_t = f32_tensor(&st.h, d);
-        let mut n_t = f32_tensor(&st.n, d);
+        let mut hid_t = f32_tensor(&st.hid, d);
         let mut logits_t = f32_tensor(&st.logits, vocab);
-        let kv_row = cfg.n_kv_heads * self.attn.head_dim as usize;
 
-        let mut emb = vec![0f32; d];
+        // Host bounce buffer: the token embedding, then each stage hand-off.
+        let mut host = vec![0f32; d];
+        // The draft block's own logits are discarded while its KV cache is
+        // filled; only the last position is left for the decode loop's first
+        // `mtp_step`, which knows the sampled token that follows it.
+        let mut draft_logits = vec![0f32; if self.mtp.is_some() { vocab } else { 0 }];
         for (ti, &tok) in tokens.iter().enumerate() {
             let pos = ctx.pos as usize + ti;
             if pos >= self.n_ctx {
@@ -566,175 +1005,48 @@ impl ModelArch for HybridDecoder {
                     self.n_ctx
                 )));
             }
-            let kctx = SpiteCtx {
-                n_ctx: self.n_ctx as c_int,
-                n_batch: 1,
-                n_threads: ctx.n_threads,
-                pos: pos as c_int,
-                n_heads: cfg.n_heads as c_int,
-                n_kv_heads: cfg.n_kv_heads as c_int,
-                gpu_stream: std::ptr::null_mut(),
-                scratchpad: st.scratch.as_ptr().cast(),
-                scratchpad_bytes: st.scratch.size,
-            };
-            self.embed(tok, &mut emb)?;
-            st.h.upload(f32_bytes(&emb))
+            self.embed(tok, &mut host)?;
+            st.stages[0]
+                .h
+                .upload(f32_bytes(&host))
                 .map_err(|e| err(e.to_string()))?;
+            let mut cur = 0;
+            self.enter(st, cur)?;
+            let (mut h_t, mut n_t, mut kctx) = self.stage_view(st, cur, pos, ctx.n_threads);
 
             for (li, layer) in self.layers.iter().enumerate() {
+                let s = self.layer_stage[li];
+                if s != cur {
+                    self.hand_off(st, cur, s, &mut host)?;
+                    cur = s;
+                    (h_t, n_t, kctx) = self.stage_view(st, cur, pos, ctx.n_threads);
+                }
                 let ffn_w = match layer {
                     Layer::Attn(a) => {
-                        let kvp = &st.kv[a.kv];
-                        let mut kv = SpiteKvCache {
-                            k: kv_tensor(&kvp.k, self.kv_kind, kv_row, self.n_ctx),
-                            v: kv_tensor(&kvp.v, self.kv_kind, kv_row, self.n_ctx),
-                            layer: li as c_int,
-                        };
-                        // SAFETY: every tensor points at live memory owned by `st` / `self`;
-                        // the kernel ABI version is checked at load.
-                        unsafe {
-                            rc(
-                                rms_norm(&mut n_t, &h_t, &a.norm, cfg.norm_eps, &kctx),
-                                "rms_norm",
-                                li,
-                            )?;
-                            rc(
-                                attention_ex(
-                                    &mut h_t,
-                                    &n_t,
-                                    &a.wq,
-                                    &a.wk,
-                                    &a.wv,
-                                    &a.wo,
-                                    &a.q_norm,
-                                    &a.k_norm,
-                                    cfg.norm_eps,
-                                    &mut kv,
-                                    cfg.rope_theta,
-                                    &self.attn,
-                                    &kctx,
-                                ),
-                                "attention_ex",
-                                li,
-                            )?;
-                        }
+                        self.attn_block(st, a, li, &mut h_t, &mut n_t, &kctx)?;
                         &a.ffn
                     }
                     Layer::Gdn(g) => {
-                        let gs = &st.gdn[g.st];
-                        let mut conv_hist = f32_tensor(&gs.conv_hist, self.gdn.conv_hist_floats());
-                        let mut state = f32_tensor(&gs.state, self.gdn.state_floats());
-                        // SAFETY: as above.
-                        unsafe {
-                            rc(
-                                rms_norm(&mut n_t, &h_t, &g.norm, cfg.norm_eps, &kctx),
-                                "rms_norm",
-                                li,
-                            )?;
-                            rc(
-                                linear_attn(
-                                    &mut h_t,
-                                    &n_t,
-                                    &g.w_qkv,
-                                    &g.w_gate,
-                                    &g.w_beta,
-                                    &g.w_alpha,
-                                    &g.w_out,
-                                    &g.conv_w,
-                                    &g.ssm_dt,
-                                    &g.ssm_a,
-                                    &g.ssm_norm,
-                                    &mut conv_hist,
-                                    &mut state,
-                                    &self.gdn,
-                                    &kctx,
-                                ),
-                                "linear_attn",
-                                li,
-                            )?;
-                        }
+                        self.gdn_block(st, g, li, &mut h_t, &mut n_t, &kctx)?;
                         &g.ffn
                     }
                 };
-                match ffn_w {
-                    LayerFfn::Dense(d) => {
-                        let Some(ffn) = self.table.ffn.0 else {
-                            return Err(err("ffn op missing"));
-                        };
-                        unsafe {
-                            rc(
-                                rms_norm(&mut n_t, &h_t, &d.norm, cfg.norm_eps, &kctx),
-                                "rms_norm",
-                                li,
-                            )?;
-                            rc(
-                                ffn(
-                                    &mut h_t,
-                                    &n_t,
-                                    &d.gate,
-                                    &d.up,
-                                    &d.down,
-                                    FfnActivation::SiluGate,
-                                    &kctx,
-                                ),
-                                "ffn",
-                                li,
-                            )?;
-                        }
-                    }
-                    LayerFfn::Moe(m) => {
-                        let Some(moe_ffn) = self.table.moe_ffn.0 else {
-                            return Err(err("moe_ffn op missing"));
-                        };
-                        let p_up_sh = m
-                            .w_up_shexp
-                            .as_ref()
-                            .map_or(std::ptr::null(), |t| t as *const _);
-                        let p_gate_sh = m
-                            .w_gate_shexp
-                            .as_ref()
-                            .map_or(std::ptr::null(), |t| t as *const _);
-                        let p_down_sh = m
-                            .w_down_shexp
-                            .as_ref()
-                            .map_or(std::ptr::null(), |t| t as *const _);
-                        unsafe {
-                            rc(
-                                rms_norm(&mut n_t, &h_t, &m.norm, cfg.norm_eps, &kctx),
-                                "rms_norm",
-                                li,
-                            )?;
-                            rc(
-                                moe_ffn(
-                                    &mut h_t,
-                                    &n_t,
-                                    &m.w_gate_inp,
-                                    &m.w_up_exps,
-                                    &m.w_gate_exps,
-                                    &m.w_down_exps,
-                                    p_up_sh,
-                                    p_gate_sh,
-                                    p_down_sh,
-                                    &m.params,
-                                    &kctx,
-                                ),
-                                "moe_ffn",
-                                li,
-                            )?;
-                        }
-                    }
-                }
+                self.ffn_block(ffn_w, li, &mut h_t, &mut n_t, &kctx)?;
+            }
+            if cur != last {
+                self.hand_off(st, cur, last, &mut host)?;
+                (h_t, _, kctx) = self.stage_view(st, last, pos, ctx.n_threads);
             }
 
             // SAFETY: as above.
             unsafe {
                 rc(
-                    rms_norm(&mut n_t, &h_t, &self.out_norm, cfg.norm_eps, &kctx),
+                    rms_norm(&mut hid_t, &h_t, &self.out_norm, cfg.norm_eps, &kctx),
                     "rms_norm",
                     cfg.n_layers,
                 )?;
                 rc(
-                    matmul(&mut logits_t, &n_t, &self.out_w, &kctx),
+                    matmul(&mut logits_t, &hid_t, &self.out_w, &kctx),
                     "matmul",
                     cfg.n_layers,
                 )?;
@@ -743,6 +1055,12 @@ impl ModelArch for HybridDecoder {
             st.logits
                 .download(f32_bytes_mut(&mut logits_out[ti * vocab..(ti + 1) * vocab]))
                 .map_err(|e| err(e.to_string()))?;
+            // The draft block attends over its own KV cache, so the prompt's
+            // rows have to be written here, where the trunk hidden state and
+            // the following token are both in hand (`h_t` is `st.hid`).
+            if self.mtp.is_some() && ti + 1 < tokens.len() {
+                self.mtp_step_locked(st, tokens[ti + 1], pos, &mut draft_logits)?;
+            }
         }
         Ok(())
     }
@@ -752,5 +1070,902 @@ impl HybridDecoder {
     /// Backend this decoder's buffers live on.
     pub fn backend(&self) -> GpuBackend {
         self.backend
+    }
+
+    /// True when the NextN (MTP) draft head is loaded; see [`Self::mtp_step`].
+    pub fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    /// One NextN (MTP) draft step, on the same backend and ops as the trunk.
+    ///
+    /// Consumes the final-normed hidden state `h_t` left by the latest
+    /// [`ModelArch::forward`] token (or the previous `mtp_step`, when chaining)
+    /// together with `token` = x_{t+1}, runs the draft block at RoPE position
+    /// `pos` = t, and writes the logits for x_{t+2}. Its own normed output
+    /// replaces `h_t`, so the next chained call takes the drafted token and
+    /// `pos + 1`.
+    ///
+    /// The final-normed input is what the checkpoint expects: llama.cpp's
+    /// qwen35 graph stores the `output_norm`'d hidden as `t_h_nextn` and feeds
+    /// it through `hnorm` (`src/models/qwen35.cpp`, `build_arch_graph`), so
+    /// passing the pre-norm residual here would double-normalize differently
+    /// and draft against a distribution the reference never produces.
+    ///
+    /// The draft block attends over its own KV cache, so every position up to
+    /// `pos` must have been through `mtp_step`. A prompt prefill fills the rows
+    /// for the prompt itself (see [`Self::forward`]); a rejected draft is undone
+    /// by re-running the trunk, whose `forward` refreshes `h_t`, and the stale
+    /// rows are overwritten.
+    pub fn mtp_step(
+        &self,
+        token: u32,
+        pos: usize,
+        logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+        self.mtp_step_locked(&mut guard, token, pos, logits_out)
+    }
+
+    /// [`Self::mtp_step`] on state the caller already holds locked, so the
+    /// prompt prefill can fill the draft block's KV cache in token order.
+    fn mtp_step_locked(
+        &self,
+        st: &mut HState,
+        token: u32,
+        pos: usize,
+        logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        let Some(m) = &self.mtp else {
+            return Err(err("model has no usable NextN (MTP) head"));
+        };
+        let cfg = &self.config;
+        let (d, vocab) = (cfg.d_model, cfg.vocab_size);
+        if logits_out.len() != vocab {
+            return Err(err("logits_out shape mismatch"));
+        }
+        if pos >= self.n_ctx {
+            return Err(err(format!(
+                "position {pos} exceeds allocated context {}",
+                self.n_ctx
+            )));
+        }
+        let (Some(rms_norm), Some(matmul), Some(mtp_stem)) = (
+            self.table.rms_norm.0,
+            self.table.matmul.0,
+            self.table.mtp_stem.0,
+        ) else {
+            return Err(err("dispatch table incomplete for the MTP head"));
+        };
+        // The MTP block, its KV and `hid` all live on the last stage.
+        let last = st.stages.len() - 1;
+        self.enter(st, last)?;
+        let (mut h_t, mut n_t, kctx) = self.stage_view(st, last, pos, 1);
+        let li = cfg.n_layers;
+
+        let mut emb = vec![0f32; d];
+        self.embed(token, &mut emb)?;
+        st.emb
+            .upload(f32_bytes(&emb))
+            .map_err(|e| err(e.to_string()))?;
+        let emb_t = f32_tensor(&st.emb, d);
+        let mut pack_t = f32_tensor(&st.pack, 2 * d);
+        let mut hid_t = f32_tensor(&st.hid, d);
+        let mut logits_t = f32_tensor(&st.logits, vocab);
+
+        // SAFETY: every tensor points at live memory owned by `st` / `self`.
+        unsafe {
+            rc(
+                mtp_stem(
+                    &mut pack_t,
+                    &emb_t,
+                    &hid_t,
+                    &m.enorm,
+                    &m.hnorm,
+                    cfg.norm_eps,
+                    &kctx,
+                ),
+                "mtp_stem",
+                li,
+            )?;
+            rc(matmul(&mut h_t, &pack_t, &m.eh_proj, &kctx), "matmul", li)?;
+        }
+        self.attn_block(st, &m.layer, li, &mut h_t, &mut n_t, &kctx)?;
+        self.ffn_block(&m.layer.ffn, li, &mut h_t, &mut n_t, &kctx)?;
+        // SAFETY: as above.
+        unsafe {
+            rc(
+                rms_norm(&mut hid_t, &h_t, &m.head_norm, cfg.norm_eps, &kctx),
+                "rms_norm",
+                li,
+            )?;
+            rc(matmul(&mut logits_t, &hid_t, &m.head, &kctx), "matmul", li)?;
+        }
+        st.logits
+            .download(f32_bytes_mut(logits_out))
+            .map_err(|e| err(e.to_string()))
+    }
+
+    /// Run one batched trunk pass for speculative verification.
+    ///
+    /// Processes `tokens` (`[trunk, drafts...]`) at positions
+    /// `ctx.pos .. ctx.pos + len`, writing `len * vocab` logits. The GDN
+    /// recurrent state advanced past any rejected tail is saved first, so
+    /// [`Self::rollback_drafts`] can undo it; the KV cache needs no snapshot
+    /// because rows are position-indexed and overwritten. A non-batch kernel
+    /// keeps the per-token fallback, so this is always correct, just not
+    /// always faster.
+    pub fn verify_batch(
+        &self,
+        tokens: &[u32],
+        ctx: &SpiteCtx,
+        logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        let vocab = self.config.vocab_size;
+        if logits_out.len() != tokens.len() * vocab {
+            return Err(err("logits_out shape mismatch"));
+        }
+        {
+            let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+            self.save_recurrent(&mut guard)?;
+        }
+        self.forward_batch(tokens, logits_out, ctx)
+    }
+
+    /// Undo the last `n` trailing columns of the last [`Self::verify_batch`].
+    ///
+    /// Restores the GDN recurrent state saved there and makes the hidden state
+    /// of the last kept column (position `len - 1 - n`) current, so the next
+    /// [`Self::mtp_step`] drafts from the accepted prefix rather than the
+    /// rejected tail. `n == 0` only reselects the hidden state.
+    pub fn rollback_drafts(&self, n: usize) -> Result<(), ModelError> {
+        let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+        let st = &mut *guard;
+        if n > 0 {
+            self.restore_recurrent(st)?;
+        }
+        let keep = st.batch_cols.saturating_sub(1 + n);
+        self.select_hidden(st, keep)
+    }
+
+    /// Snapshot the GDN recurrent state into `gdn_shadow`, allocating it on
+    /// first use. A no-op for a model whose layers are all full attention.
+    fn save_recurrent(&self, st: &mut HState) -> Result<(), ModelError> {
+        if st.gdn_shadow.is_none() {
+            let mut shadow = Vec::with_capacity(st.gdn.len());
+            for g in &st.gdn {
+                shadow.push(GdnShadow {
+                    conv_hist: DeviceBuffer::alloc_on(self.backend, g.device, g.conv_hist.size)
+                        .map_err(|e| err(format!("alloc gdn shadow: {e}")))?,
+                    state: DeviceBuffer::alloc_on(self.backend, g.device, g.state.size)
+                        .map_err(|e| err(format!("alloc gdn shadow: {e}")))?,
+                });
+            }
+            st.gdn_shadow = Some(shadow);
+        }
+        let mut shadow = st.gdn_shadow.take().expect("allocated above");
+        for (g, s) in st.gdn.iter().zip(shadow.iter_mut()) {
+            s.conv_hist
+                .copy_from(&g.conv_hist)
+                .map_err(|e| err(format!("gdn snapshot: {e}")))?;
+            s.state
+                .copy_from(&g.state)
+                .map_err(|e| err(format!("gdn snapshot: {e}")))?;
+        }
+        st.gdn_shadow = Some(shadow);
+        Ok(())
+    }
+
+    /// Restore the GDN recurrent state from `gdn_shadow`. A no-op when nothing
+    /// was snapshotted.
+    fn restore_recurrent(&self, st: &mut HState) -> Result<(), ModelError> {
+        let Some(shadow) = st.gdn_shadow.take() else {
+            return Ok(());
+        };
+        for (g, s) in st.gdn.iter_mut().zip(shadow.iter()) {
+            g.conv_hist
+                .copy_from(&s.conv_hist)
+                .map_err(|e| err(format!("gdn restore: {e}")))?;
+            g.state
+                .copy_from(&s.state)
+                .map_err(|e| err(format!("gdn restore: {e}")))?;
+        }
+        st.gdn_shadow = Some(shadow);
+        Ok(())
+    }
+
+    /// Make column `col` of the stashed batched hidden the current `h_t`.
+    fn select_hidden(&self, st: &mut HState, col: usize) -> Result<(), ModelError> {
+        let Some(batch) = st.hid_batch.as_ref() else {
+            return Ok(());
+        };
+        if col >= st.batch_cols {
+            return Err(err("hidden column out of range"));
+        }
+        let d = self.config.d_model;
+        let mut host = vec![0f32; d * st.batch_cols];
+        batch
+            .download(f32_bytes_mut(&mut host))
+            .map_err(|e| err(e.to_string()))?;
+        st.hid
+            .upload(f32_bytes(&host[col * d..(col + 1) * d]))
+            .map_err(|e| err(e.to_string()))
+    }
+
+    /// True when every resolved op can take a batched `[d, m]` activation.
+    ///
+    /// A split is fine: [`Self::forward_batch`] hands the whole `[d, m]` block
+    /// between stages through host memory, the same hop the 1-token path uses.
+    /// The generic reference and the sm_60 kernels advertise `SPITE_CAP_BATCH`;
+    /// ops that do not fall back to the per-token path.
+    fn batch_capable(&self) -> bool {
+        let batch = |s: &spite_dispatch::OpSource| s.caps & spite_dispatch::CAP_BATCH != 0;
+        batch(&self.table.rms_norm.1)
+            && batch(&self.table.ffn.1)
+            && batch(&self.table.matmul.1)
+            && self
+                .table
+                .attention_ex
+                .0
+                .is_none_or(|_| batch(&self.table.attention_ex.1))
+            && self
+                .table
+                .linear_attn
+                .0
+                .is_none_or(|_| batch(&self.table.linear_attn.1))
+            && (self.config.n_expert == 0
+                || self
+                    .table
+                    .moe_ffn
+                    .0
+                    .is_none_or(|_| batch(&self.table.moe_ffn.1)))
+    }
+
+    /// Layer-major batched prefill: one batched op call per layer for `m`
+    /// tokens (columns), instead of m sequential passes. The KV cache and the
+    /// GDN conv/state advance in token order, so the result matches the
+    /// per-token path. Requires [`Self::batch_capable`].
+    fn forward_batch(
+        &self,
+        tokens: &[u32],
+        logits_out: &mut [f32],
+        ctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let cfg = &self.config;
+        let (d, vocab) = (cfg.d_model, cfg.vocab_size);
+        let m = tokens.len();
+        let (Some(rms_norm), Some(matmul)) = (self.table.rms_norm.0, self.table.matmul.0) else {
+            return Err(err("dispatch table incomplete for batched prefill"));
+        };
+        let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+        let st = &mut *guard;
+        let n_stages = st.stages.len();
+        let last = n_stages - 1;
+
+        // Per-stage batched residual stream and norm buffer, one column per
+        // token, plus a scratch sized for m columns. A split hands the whole
+        // [d, m] block across the same host hop as the 1-token path, so batched
+        // prefill works on a multi-GPU pipeline too.
+        let scratch_floats = [
+            2 * cfg.d_ffn,
+            self.attn
+                .scratch_floats(cfg.n_heads, cfg.n_kv_heads, self.n_ctx),
+            self.gdn.scratch_floats(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+        let mut hbufs = Vec::with_capacity(n_stages);
+        let mut nbufs = Vec::with_capacity(n_stages);
+        let mut scratches = Vec::with_capacity(n_stages);
+        for s in &st.stages {
+            hbufs.push(
+                DeviceBuffer::alloc_on(self.backend, s.device, d * m * 4)
+                    .map_err(|e| err(format!("alloc h: {e}")))?,
+            );
+            nbufs.push(
+                DeviceBuffer::alloc_on(self.backend, s.device, d * m * 4)
+                    .map_err(|e| err(format!("alloc n: {e}")))?,
+            );
+            scratches.push(
+                DeviceBuffer::alloc_on(self.backend, s.device, (scratch_floats * 4 * m).max(1))
+                    .map_err(|e| err(format!("alloc scratch: {e}")))?,
+            );
+        }
+
+        // Token embeddings, token-major host buffer [d, m].
+        let mut host = vec![0f32; d * m];
+        for (t, &tok) in tokens.iter().enumerate() {
+            self.embed(tok, &mut host[t * d..(t + 1) * d])?;
+        }
+        hbufs[0]
+            .upload(f32_bytes(&host))
+            .map_err(|e| err(e.to_string()))?;
+
+        let mut cur = 0usize;
+        self.enter(st, cur)?;
+        for (li, layer) in self.layers.iter().enumerate() {
+            let s = self.layer_stage[li];
+            if s != cur {
+                hbufs[cur]
+                    .download(f32_bytes_mut(&mut host))
+                    .map_err(|e| err(e.to_string()))?;
+                hbufs[s]
+                    .upload(f32_bytes(&host))
+                    .map_err(|e| err(e.to_string()))?;
+                cur = s;
+                self.enter(st, cur)?;
+            }
+            let kctx = SpiteCtx {
+                n_ctx: self.n_ctx as c_int,
+                n_batch: m as c_int,
+                n_threads: ctx.n_threads,
+                pos: ctx.pos,
+                n_heads: cfg.n_heads as c_int,
+                n_kv_heads: cfg.n_kv_heads as c_int,
+                gpu_stream: std::ptr::null_mut(),
+                scratchpad: scratches[cur].as_ptr().cast(),
+                scratchpad_bytes: scratches[cur].size,
+            };
+            let mut h_t = f32_tensor2(&hbufs[cur], d, m);
+            let mut n_t = f32_tensor2(&nbufs[cur], d, m);
+            let ffn_w = match layer {
+                Layer::Attn(a) => {
+                    self.attn_block(st, a, li, &mut h_t, &mut n_t, &kctx)?;
+                    &a.ffn
+                }
+                Layer::Gdn(g) => {
+                    self.gdn_block(st, g, li, &mut h_t, &mut n_t, &kctx)?;
+                    &g.ffn
+                }
+            };
+            self.ffn_block(ffn_w, li, &mut h_t, &mut n_t, &kctx)?;
+        }
+        if cur != last {
+            hbufs[cur]
+                .download(f32_bytes_mut(&mut host))
+                .map_err(|e| err(e.to_string()))?;
+            hbufs[last]
+                .upload(f32_bytes(&host))
+                .map_err(|e| err(e.to_string()))?;
+            self.enter(st, last)?;
+        }
+
+        // Final norm + LM head, one column at a time (logits are per token).
+        let head_ctx = SpiteCtx {
+            n_ctx: self.n_ctx as c_int,
+            n_batch: 1,
+            n_threads: ctx.n_threads,
+            pos: ctx.pos,
+            n_heads: cfg.n_heads as c_int,
+            n_kv_heads: cfg.n_kv_heads as c_int,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: scratches[last].as_ptr().cast(),
+            scratchpad_bytes: scratches[last].size,
+        };
+        let mut hid = f32_tensor(&st.hid, d);
+        let mut logits = f32_tensor(&st.logits, vocab);
+        for t in 0..m {
+            let ht = f32_tensor_col(&hbufs[last], d, t);
+            // SAFETY: every tensor points at live memory owned by `st` / `self`.
+            unsafe {
+                rc(
+                    rms_norm(&mut hid, &ht, &self.out_norm, cfg.norm_eps, &head_ctx),
+                    "rms_norm",
+                    cfg.n_layers,
+                )?;
+                rc(
+                    matmul(&mut logits, &hid, &self.out_w, &head_ctx),
+                    "matmul",
+                    cfg.n_layers,
+                )?;
+            }
+            st.logits
+                .download(f32_bytes_mut(&mut logits_out[t * vocab..(t + 1) * vocab]))
+                .map_err(|e| err(e.to_string()))?;
+        }
+        // MTP only: keep every column's final-normed hidden so a batched
+        // speculative verify can reselect the accepted column on rollback
+        // without re-running the trunk; see `select_hidden`.
+        if self.mtp.is_some() {
+            if st.hid_batch.as_ref().is_none_or(|b| b.size < d * m * 4) {
+                st.hid_batch = Some(
+                    DeviceBuffer::alloc_on(self.backend, st.stages[last].device, d * m * 4)
+                        .map_err(|e| err(format!("alloc hid_batch: {e}")))?,
+                );
+            }
+            let batch = st.hid_batch.as_ref().expect("allocated above");
+            for t in 0..m {
+                let ht = f32_tensor_col(&hbufs[last], d, t);
+                let mut hidc = f32_tensor_col(batch, d, t);
+                // SAFETY: every tensor points at live memory owned by `st` /
+                // `self`; the kernel ABI version is checked at load.
+                unsafe {
+                    rc(
+                        rms_norm(&mut hidc, &ht, &self.out_norm, cfg.norm_eps, &head_ctx),
+                        "rms_norm",
+                        cfg.n_layers,
+                    )?;
+                }
+            }
+            st.batch_cols = m;
+        }
+        // The draft block's own KV cache is filled for every prompt column but
+        // the last, in one batched pass. Doing it per token (one NextN block
+        // forward each) cost ~6% of prefill; see the per-token path above for
+        // why the last column is left to the decode loop's first `mtp_step`.
+        self.mtp_prefill_batch(st, tokens, &hbufs[last], &scratches[last], ctx)?;
+        Ok(())
+    }
+
+    /// Fill the draft block's own KV cache for a whole prompt in one batched pass.
+    ///
+    /// Runs the NextN block over the first `m - 1` prompt columns (positions
+    /// `ctx.pos .. ctx.pos + m - 2`), the same rows the per-token path writes by
+    /// calling [`Self::mtp_step`] after every prompt token. `trunk_h` is the
+    /// last stage's pre-final-norm residual `[d, m]`; the final norm is applied
+    /// here, exactly as the trunk graph does before handing `h_nextn` to the
+    /// head. The last column is left to the decode loop's first `mtp_step`, the
+    /// only call that knows the token that follows it. The block's logits are
+    /// discarded while its KV is filled, so the shared head is skipped.
+    fn mtp_prefill_batch(
+        &self,
+        st: &mut HState,
+        tokens: &[u32],
+        trunk_h: &DeviceBuffer,
+        scratch: &DeviceBuffer,
+        ctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let m = tokens.len();
+        let Some(mtp) = self.mtp.as_ref() else {
+            return Ok(());
+        };
+        if m < 2 {
+            return Ok(());
+        }
+        let cfg = &self.config;
+        let d = cfg.d_model;
+        // Draft columns: one per prompt position but the last.
+        let t = m - 1;
+        let (Some(rms_norm), Some(matmul), Some(mtp_stem)) = (
+            self.table.rms_norm.0,
+            self.table.matmul.0,
+            self.table.mtp_stem.0,
+        ) else {
+            return Err(err("dispatch table incomplete for the MTP head"));
+        };
+        let last = st.stages.len() - 1;
+        self.enter(st, last)?;
+        let dev = st.stages[last].device;
+        let alloc = |floats: usize| {
+            DeviceBuffer::alloc_on(self.backend, dev, floats * 4)
+                .map_err(|e| err(format!("alloc MTP prefill: {e}")))
+        };
+        // `norm` is the final-normed trunk hidden the stem feeds through
+        // `hnorm`; `pack` is its `[2*d, t]` stem output; `h`/`n` are the draft
+        // block's residual stream and norm buffer.
+        let norm = alloc(d * t)?;
+        let mut emb = alloc(d * t)?;
+        let pack = alloc(2 * d * t)?;
+        let h = alloc(d * t)?;
+        let n = alloc(d * t)?;
+
+        // Embeddings of the tokens that follow each prompt column, token-major.
+        let mut host = vec![0f32; d * t];
+        for (col, &tok) in tokens[1..].iter().enumerate() {
+            self.embed(tok, &mut host[col * d..(col + 1) * d])?;
+        }
+        emb.upload(f32_bytes(&host))
+            .map_err(|e| err(e.to_string()))?;
+
+        let kctx = SpiteCtx {
+            n_ctx: self.n_ctx as c_int,
+            n_batch: t as c_int,
+            n_threads: ctx.n_threads,
+            pos: ctx.pos,
+            n_heads: cfg.n_heads as c_int,
+            n_kv_heads: cfg.n_kv_heads as c_int,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: scratch.as_ptr().cast(),
+            scratchpad_bytes: scratch.size,
+        };
+        let mut norm_t = f32_tensor2(&norm, d, t);
+        let emb_t = f32_tensor2(&emb, d, t);
+        let trunk_cols = f32_tensor2(trunk_h, d, t);
+        let mut pack_t = f32_tensor2(&pack, 2 * d, t);
+        let mut h_t = f32_tensor2(&h, d, t);
+        let mut n_t = f32_tensor2(&n, d, t);
+        let li = cfg.n_layers;
+        // SAFETY: every tensor points at live memory owned by `st` / `self`.
+        unsafe {
+            rc(
+                rms_norm(
+                    &mut norm_t,
+                    &trunk_cols,
+                    &self.out_norm,
+                    cfg.norm_eps,
+                    &kctx,
+                ),
+                "rms_norm",
+                li,
+            )?;
+            rc(
+                mtp_stem(
+                    &mut pack_t,
+                    &emb_t,
+                    &norm_t,
+                    &mtp.enorm,
+                    &mtp.hnorm,
+                    cfg.norm_eps,
+                    &kctx,
+                ),
+                "mtp_stem",
+                li,
+            )?;
+            rc(matmul(&mut h_t, &pack_t, &mtp.eh_proj, &kctx), "matmul", li)?;
+        }
+        self.attn_block(st, &mtp.layer, li, &mut h_t, &mut n_t, &kctx)?;
+        self.ffn_block(&mtp.layer.ffn, li, &mut h_t, &mut n_t, &kctx)?;
+        Ok(())
+    }
+
+    /// Stage `s`'s residual stream, norm buffer and kernel context.
+    fn stage_view(
+        &self,
+        st: &HState,
+        s: usize,
+        pos: usize,
+        n_threads: c_int,
+    ) -> (SpiteTensor, SpiteTensor, SpiteCtx) {
+        let d = self.config.d_model;
+        let sb = &st.stages[s];
+        let kctx = SpiteCtx {
+            n_ctx: self.n_ctx as c_int,
+            n_batch: 1,
+            n_threads,
+            pos: pos as c_int,
+            n_heads: self.config.n_heads as c_int,
+            n_kv_heads: self.config.n_kv_heads as c_int,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: sb.scratch.as_ptr().cast(),
+            scratchpad_bytes: sb.scratch.size,
+        };
+        (f32_tensor(&sb.h, d), f32_tensor(&sb.n, d), kctx)
+    }
+
+    /// Make stage `s`'s device current, so its kernels launch there.
+    fn enter(&self, st: &HState, s: usize) -> Result<(), ModelError> {
+        if self.backend == GpuBackend::Cuda {
+            cuda::set_device(st.stages[s].device).map_err(|e| err(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Move the residual stream from stage `from` to stage `to` through
+    /// `host`, then make `to` current.
+    ///
+    /// The blocking download waits for `from`'s kernels; the upload is
+    /// ordered before `to`'s kernels on its legacy default stream. No peer
+    /// access is needed.
+    fn hand_off(
+        &self,
+        st: &mut HState,
+        from: usize,
+        to: usize,
+        host: &mut [f32],
+    ) -> Result<(), ModelError> {
+        st.stages[from]
+            .h
+            .download(f32_bytes_mut(host))
+            .map_err(|e| err(e.to_string()))?;
+        st.stages[to]
+            .h
+            .upload(f32_bytes(host))
+            .map_err(|e| err(e.to_string()))?;
+        self.enter(st, to)
+    }
+
+    /// `h += attention_ex(rms_norm(h))` for one gated full-attention block.
+    fn attn_block(
+        &self,
+        st: &HState,
+        a: &AttnLayer,
+        li: usize,
+        h_t: &mut SpiteTensor,
+        n_t: &mut SpiteTensor,
+        kctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let (Some(rms_norm), Some(attention_ex)) =
+            (self.table.rms_norm.0, self.table.attention_ex.0)
+        else {
+            return Err(err("dispatch table incomplete for hybrid decoder"));
+        };
+        let cfg = &self.config;
+        let kv_row = cfg.n_kv_heads * self.attn.head_dim as usize;
+        let kvp = &st.kv[a.kv];
+        let mut kv = SpiteKvCache {
+            k: kv_tensor(&kvp.k, self.kv_kind, kv_row, self.n_ctx),
+            v: kv_tensor(&kvp.v, self.kv_kind, kv_row, self.n_ctx),
+            layer: li as c_int,
+        };
+        // SAFETY: every tensor points at live memory owned by `st` / `self`;
+        // the kernel ABI version is checked at load.
+        unsafe {
+            rc(
+                rms_norm(n_t, h_t, &a.norm, cfg.norm_eps, kctx),
+                "rms_norm",
+                li,
+            )?;
+            rc(
+                attention_ex(
+                    h_t,
+                    n_t,
+                    &a.wq,
+                    &a.wk,
+                    &a.wv,
+                    &a.wo,
+                    &a.q_norm,
+                    &a.k_norm,
+                    cfg.norm_eps,
+                    &mut kv,
+                    cfg.rope_theta,
+                    &self.attn,
+                    kctx,
+                ),
+                "attention_ex",
+                li,
+            )
+        }
+    }
+
+    /// `h += linear_attn(rms_norm(h))` for one Gated Delta Net block.
+    ///
+    /// `h`/`n` are `[d, 1]` for one token or `[d, m]` for a batch of columns;
+    /// the conv history and delta-rule state carry across the columns in order.
+    fn gdn_block(
+        &self,
+        st: &HState,
+        g: &GdnLayer,
+        li: usize,
+        h_t: &mut SpiteTensor,
+        n_t: &mut SpiteTensor,
+        kctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let (Some(rms_norm), Some(linear_attn)) = (self.table.rms_norm.0, self.table.linear_attn.0)
+        else {
+            return Err(err("dispatch table incomplete for hybrid decoder"));
+        };
+        let gs = &st.gdn[g.st];
+        let mut conv_hist = f32_tensor(&gs.conv_hist, self.gdn.conv_hist_floats());
+        let mut state = f32_tensor(&gs.state, self.gdn.state_floats());
+        // SAFETY: every tensor points at live memory owned by `st` / `self`;
+        // the kernel ABI version is checked at load.
+        unsafe {
+            rc(
+                rms_norm(n_t, h_t, &g.norm, self.config.norm_eps, kctx),
+                "rms_norm",
+                li,
+            )?;
+            rc(
+                linear_attn(
+                    h_t,
+                    n_t,
+                    &g.w_qkv,
+                    &g.w_gate,
+                    &g.w_beta,
+                    &g.w_alpha,
+                    &g.w_out,
+                    &g.conv_w,
+                    &g.ssm_dt,
+                    &g.ssm_a,
+                    &g.ssm_norm,
+                    &mut conv_hist,
+                    &mut state,
+                    &self.gdn,
+                    kctx,
+                ),
+                "linear_attn",
+                li,
+            )
+        }
+    }
+
+    /// `h += ffn(rms_norm(h))`, dense SwiGLU or MoE.
+    fn ffn_block(
+        &self,
+        ffn_w: &LayerFfn,
+        li: usize,
+        h_t: &mut SpiteTensor,
+        n_t: &mut SpiteTensor,
+        kctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let Some(rms_norm) = self.table.rms_norm.0 else {
+            return Err(err("rms_norm op missing"));
+        };
+        let eps = self.config.norm_eps;
+        match ffn_w {
+            LayerFfn::Dense(d) => {
+                let Some(ffn) = self.table.ffn.0 else {
+                    return Err(err("ffn op missing"));
+                };
+                // SAFETY: as in `attn_block`.
+                unsafe {
+                    rc(rms_norm(n_t, h_t, &d.norm, eps, kctx), "rms_norm", li)?;
+                    rc(
+                        ffn(
+                            h_t,
+                            n_t,
+                            &d.gate,
+                            &d.up,
+                            &d.down,
+                            FfnActivation::SiluGate,
+                            kctx,
+                        ),
+                        "ffn",
+                        li,
+                    )
+                }
+            }
+            LayerFfn::Moe(m) => {
+                let Some(moe_ffn) = self.table.moe_ffn.0 else {
+                    return Err(err("moe_ffn op missing"));
+                };
+                let opt = |t: &Option<SpiteTensor>| {
+                    t.as_ref().map_or(std::ptr::null(), |t| t as *const _)
+                };
+                // SAFETY: as in `attn_block`.
+                unsafe {
+                    rc(rms_norm(n_t, h_t, &m.norm, eps, kctx), "rms_norm", li)?;
+                    rc(
+                        moe_ffn(
+                            h_t,
+                            n_t,
+                            &m.w_gate_inp,
+                            &m.w_up_exps,
+                            &m.w_gate_exps,
+                            &m.w_down_exps,
+                            opt(&m.w_up_shexp),
+                            opt(&m.w_gate_shexp),
+                            opt(&m.w_down_shexp),
+                            &m.params,
+                            kctx,
+                        ),
+                        "moe_ffn",
+                        li,
+                    )
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn share_counts_largest_remainder() {
+        assert_eq!(share_counts(&[33, 32], 65), Some(vec![33, 32]));
+        assert_eq!(
+            share_counts(&[1, 1, 1, 1, 1, 1], 65),
+            Some(vec![11, 11, 11, 11, 11, 10])
+        );
+        assert_eq!(share_counts(&[20, 12], 64), Some(vec![40, 24]));
+        assert_eq!(share_counts(&[1, 0], 4), Some(vec![4, 0]));
+        assert_eq!(share_counts(&[0, 0], 4), None);
+    }
+
+    #[test]
+    fn balance_tracks_bytes_not_counts() {
+        // Every 4th layer is 3x heavier (KV); equal budgets must split bytes
+        // evenly, not layer counts.
+        let bytes: Vec<usize> = (0..64)
+            .map(|l| if l % 4 == 3 { 300 } else { 100 })
+            .collect();
+        let counts = balance_layers(&bytes, &[1, 1]);
+        assert_eq!(counts.iter().sum::<usize>(), 64);
+        let first: usize = bytes[..counts[0]].iter().sum();
+        let total: usize = bytes.iter().sum();
+        assert!(first.abs_diff(total - first) <= 300, "{counts:?}");
+    }
+
+    #[test]
+    fn balance_follows_budgets_and_keeps_all_layers() {
+        let bytes = vec![10usize; 65];
+        assert_eq!(balance_layers(&bytes, &[3, 1]), vec![49, 16]);
+        assert_eq!(balance_layers(&bytes, &[1; 6]).iter().sum::<usize>(), 65);
+        // No room anywhere: everything lands on the last stage, and the
+        // per-device check reports it.
+        assert_eq!(balance_layers(&bytes, &[0, 0]), vec![0, 65]);
+    }
+
+    #[test]
+    fn auto_split_stays_on_one_device_when_it_fits() {
+        let bytes = vec![1usize << 20; 8];
+        let split = LayerSplit {
+            devices: vec![0, 1],
+            shares: Vec::new(),
+        };
+        let roomy = |_: usize| Ok(usize::MAX / 2);
+        let (devs, counts) = plan_split(&split, &bytes, 0, 0, false, &roomy).unwrap();
+        assert_eq!((devs, counts), (vec![0], vec![8]));
+
+        // 8 MiB of layers plus a 3 MiB head; 6 MiB per device after headroom.
+        // The head leaves the last device 3 MiB of layer budget: 8 * 6/9 -> 5/3.
+        let tight = |_: usize| Ok(VRAM_HEADROOM + (6 << 20));
+        let (devs, counts) = plan_split(&split, &bytes, 3 << 20, 0, false, &tight).unwrap();
+        assert_eq!(devs, vec![0, 1]);
+        assert_eq!(counts, vec![5, 3]);
+    }
+
+    /// Qwen3.8-27B Q6_K trunk (~18.6 GiB of weights): 48 GDN layers at
+    /// ~293 MiB and 16 full-attention layers at ~284 MiB. Sizes are the real
+    /// per-block tensor footprint from the GGUF, projected to 6.5625 bits/weight.
+    fn qwen38_q6k_trunk() -> Vec<usize> {
+        const MIB: usize = 1 << 20;
+        (0..64)
+            .map(|l| {
+                if (l + 1) % 4 == 0 {
+                    284 * MIB
+                } else {
+                    293 * MIB
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_p100_pcie_hold_qwen38_q6k() {
+        // 2× P100-PCIE-16GB (PHB): the model does not fit one card, so it must
+        // pipeline across both, every layer placed, nothing left on the floor.
+        let layers = qwen38_q6k_trunk();
+        let head = 324 * (1 << 20); // NextN/MTP block
+        let split = LayerSplit {
+            devices: vec![0, 1],
+            shares: Vec::new(),
+        };
+        let free = VRAM_HEADROOM + 15 * (1 << 30);
+        let free_on = |_: usize| Ok(free);
+        let (devs, counts) = plan_split(&split, &layers, head, 0, false, &free_on).unwrap();
+        assert_eq!(devs, vec![0, 1]);
+        assert_eq!(counts.iter().sum::<usize>(), 64);
+        assert!(counts.iter().all(|&c| c > 0));
+    }
+
+    #[test]
+    fn four_p100_pcie_hold_qwen38_q6k_with_the_mtp_head() {
+        // 4× P100-PCIE-16GB (2× PHB pairs, SYS between): same splitter, four
+        // stages; the last stage carries the LM head and the MTP block.
+        let layers = qwen38_q6k_trunk();
+        let head = 324 * (1 << 20);
+        let fixed = 2 * 5120 * 4; // per-stage h + n residual buffers
+        let split = LayerSplit {
+            devices: vec![0, 1, 2, 3],
+            shares: Vec::new(),
+        };
+        let free = VRAM_HEADROOM + 15 * (1 << 30);
+        let free_on = |_: usize| Ok(free);
+        let (devs, counts) = plan_split(&split, &layers, head, fixed, false, &free_on).unwrap();
+        assert_eq!(devs, vec![0, 1, 2, 3]);
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            64,
+            "every layer must be placed"
+        );
+
+        // Recompute each stage's footprint exactly as `load_split` does and
+        // confirm it fits 16 GiB minus headroom.
+        let mut first = 0;
+        for (s, &c) in counts.iter().enumerate() {
+            let bytes = layers[first..first + c].iter().sum::<usize>()
+                + fixed
+                + if s + 1 == counts.len() { head } else { 0 };
+            assert!(
+                bytes + VRAM_HEADROOM <= free,
+                "stage {s} overflows: {} MiB",
+                bytes >> 20
+            );
+            first += c;
+        }
     }
 }

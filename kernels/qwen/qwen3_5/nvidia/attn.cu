@@ -520,33 +520,40 @@ qwen35_cuda_attention_ex(SpiteTensor *out, const SpiteTensor *x,
       (reinterpret_cast<uintptr_t>(kv->v.data) & 15))
     return -1; // vector loads need 16-byte aligned rows
   const int pos = ctx->pos;
-  if (pos < 0 || pos >= n_ctx || static_cast<int>(kv->v.ne[1]) != n_ctx)
+  const int m = x->ne[1] ? static_cast<int>(x->ne[1]) : 1;
+  if (pos < 0 || pos + m > n_ctx || static_cast<int>(kv->v.ne[1]) != n_ctx)
     return -2;
 
-  // scratch: q|gate | att | k | v | workspace
+  // scratch, m token columns: q|gate [q_rows,m] | att [nh*hd,m] | k | v | workspace
   const size_t q_floats = static_cast<size_t>(nh) * hd * (gated ? 2 : 1);
   const size_t att_floats = static_cast<size_t>(nh) * hd;
   const size_t fixed =
-      q_floats + att_floats + 2 * static_cast<size_t>(kv_stride);
+      (q_floats + att_floats + 2 * static_cast<size_t>(kv_stride)) * m;
   if (!ctx->scratchpad || ctx->scratchpad_bytes < sizeof(float) * fixed ||
       (reinterpret_cast<uintptr_t>(ctx->scratchpad) & 15))
     return -2;
   float *qg = static_cast<float *>(ctx->scratchpad);
-  float *att = qg + q_floats;
-  float *kbuf = att + att_floats;
-  float *vbuf = kbuf + kv_stride;
-  float *ws = vbuf + kv_stride;
+  float *att = qg + q_floats * m;
+  float *kbuf = att + att_floats * m;
+  float *vbuf = kbuf + static_cast<size_t>(kv_stride) * m;
+  float *ws = vbuf + static_cast<size_t>(kv_stride) * m;
   const size_t ws_floats = ctx->scratchpad_bytes / sizeof(float) - fixed;
 
   const cudaStream_t st = q35_stream(ctx);
   const float *xin = static_cast<const float *>(x->data);
   const int qstride = gated ? 2 * hd : hd;
-  const Q35GemvJob proj[3] = {{wq, qg}, {wk, kbuf}, {wv, vbuf}};
-  if (q35_gemv_multi(proj, 3, xin, false, st))
-    return -1;
+  if (m == 1) {
+    const Q35GemvJob proj[3] = {{wq, qg}, {wk, kbuf}, {wv, vbuf}};
+    if (q35_gemv_multi(proj, 3, xin, false, st))
+      return -1;
+  } else {
+    if (q35_gemv_batch(wq, xin, qg, m, false, st) ||
+        q35_gemv_batch(wk, xin, kbuf, m, false, st) ||
+        q35_gemv_batch(wv, xin, vbuf, m, false, st))
+      return -1;
+  }
 
   // query-head subgroups (<= kMaxGroupSub heads per block) and KV chunking
-  const int n_tok = pos + 1;
   const int nsub = (G + kMaxGroupSub - 1) / kMaxGroupSub;
   const int GS = (G + nsub - 1) / nsub;
   const int ncnt = nkv * nsub; // split-K arrival counters live behind the partials
@@ -558,52 +565,73 @@ qwen35_cuda_attention_ex(SpiteTensor *out, const SpiteTensor *x,
   // per SM is already latency-limited by its own merge/ticket tail, and finer splits
   // pay that fixed cost more often.
   const int want_blocks = std::max(1, sm_count() * 7 / 10);
-  int chunks = (n_tok + kMinChunk - 1) / kMinChunk;
-  chunks = std::min(chunks, std::max(1, (want_blocks + ncnt - 1) / ncnt));
-  chunks = static_cast<int>(std::min<int64_t>(chunks, std::max<int64_t>(1, cmax_ws)));
-  const int per = (n_tok + chunks - 1) / chunks;
-  chunks = (n_tok + per - 1) / per; // chunks actually populated
+  // workspace sized for the widest token (the last position)
+  int chunks_max = (pos + m + kMinChunk - 1) / kMinChunk;
+  chunks_max = std::min(chunks_max, std::max(1, (want_blocks + ncnt - 1) / ncnt));
+  chunks_max = static_cast<int>(std::min<int64_t>(chunks_max, std::max<int64_t>(1, cmax_ws)));
   // workspace: m[chunks*nh] l[chunks*nh] acc[chunks*nh*hd] | counters[ncnt]
   float *wm = ws;
-  float *wl = wm + static_cast<size_t>(chunks) * nh;
-  float *wacc = wl + static_cast<size_t>(chunks) * nh;
-  unsigned *cnt = reinterpret_cast<unsigned *>(wacc + static_cast<size_t>(chunks) * nh * hd);
-  if (chunks > 1 && static_cast<size_t>(chunks) * nh * (hd + 2) + ncnt > ws_floats)
+  float *wl = wm + static_cast<size_t>(chunks_max) * nh;
+  float *wacc = wl + static_cast<size_t>(chunks_max) * nh;
+  unsigned *cnt = reinterpret_cast<unsigned *>(wacc + static_cast<size_t>(chunks_max) * nh * hd);
+  if (chunks_max > 1 && static_cast<size_t>(chunks_max) * nh * (hd + 2) + ncnt > ws_floats)
     return -2; // cannot happen (cmax_ws), kept as a guard against future edits
 
-  uint8_t *k_row = static_cast<uint8_t *>(kv->k.data) +
-                   static_cast<size_t>(pos) * kv->k.nb[1];
-  uint8_t *v_row = static_cast<uint8_t *>(kv->v.data) +
-                   static_cast<size_t>(pos) * kv->v.nb[1];
   const void *qn = q_norm ? q_norm->data : nullptr,
              *kn = k_norm ? k_norm->data : nullptr;
   const int qnk = q_norm ? q_norm->kind : 0, knk = k_norm ? k_norm->kind : 0;
-  const int n_zero = chunks > 1 ? ncnt : 0;
-  if (kind == SPITE_TYPE_F32)
-    attn_prep_kernel<float><<<nh + nkv, 32, 0, st>>>(
-        qg, kbuf, vbuf, reinterpret_cast<float *>(k_row),
-        reinterpret_cast<float *>(v_row), qn, qnk, kn, knk, norm_eps, hd, rd,
-        qstride, pos, log2(static_cast<double>(rope_freq_base)), nh, cnt, n_zero);
-  else
-    attn_prep_kernel<__half><<<nh + nkv, 32, 0, st>>>(
-        qg, kbuf, vbuf, reinterpret_cast<__half *>(k_row),
-        reinterpret_cast<__half *>(v_row), qn, qnk, kn, knk, norm_eps, hd, rd,
-        qstride, pos, log2(static_cast<double>(rope_freq_base)), nh, cnt, n_zero);
-
-  const dim3 grid(chunks, ncnt);
   const float scale = rsqrtf(static_cast<float>(hd));
   const uint8_t *kc = static_cast<const uint8_t *>(kv->k.data);
   const uint8_t *vc = static_cast<const uint8_t *>(kv->v.data);
-  if (kind == SPITE_TYPE_F32)
-    launch_split_hd<float>(hd, GS, grid, qg, qstride, gated, kc, vc,
-                           kv->k.nb[1], kv->v.nb[1], nh, G, nsub, n_tok, per,
-                           scale, wm, wl, wacc, att, cnt, st);
-  else
-    launch_split_hd<__half>(hd, GS, grid, qg, qstride, gated, kc, vc,
-                            kv->k.nb[1], kv->v.nb[1], nh, G, nsub, n_tok, per,
-                            scale, wm, wl, wacc, att, cnt, st);
+  const double log2base = log2(static_cast<double>(rope_freq_base));
 
-  if (q35_gemv(wo, att, static_cast<float *>(out->data), true, st))
+  // One token column at a time: its KV row at `p`, attending causally over
+  // every row up to `p`. Only the projections above are batched.
+  for (int t = 0; t < m; ++t) {
+    const int p = pos + t;
+    const int n_tok = p + 1;
+    int chunks = (n_tok + kMinChunk - 1) / kMinChunk;
+    chunks = std::min(chunks, std::max(1, (want_blocks + ncnt - 1) / ncnt));
+    chunks = static_cast<int>(std::min<int64_t>(chunks, std::max<int64_t>(1, cmax_ws)));
+    const int per = (n_tok + chunks - 1) / chunks;
+    chunks = (n_tok + per - 1) / per; // chunks actually populated
+
+    uint8_t *k_row = static_cast<uint8_t *>(kv->k.data) +
+                     static_cast<size_t>(p) * kv->k.nb[1];
+    uint8_t *v_row = static_cast<uint8_t *>(kv->v.data) +
+                     static_cast<size_t>(p) * kv->v.nb[1];
+    float *qg_t = qg + static_cast<size_t>(t) * q_floats;
+    float *kb_t = kbuf + static_cast<size_t>(t) * kv_stride;
+    float *vb_t = vbuf + static_cast<size_t>(t) * kv_stride;
+    const int n_zero = chunks > 1 ? ncnt : 0;
+    if (kind == SPITE_TYPE_F32)
+      attn_prep_kernel<float><<<nh + nkv, 32, 0, st>>>(
+          qg_t, kb_t, vb_t, reinterpret_cast<float *>(k_row),
+          reinterpret_cast<float *>(v_row), qn, qnk, kn, knk, norm_eps, hd, rd,
+          qstride, p, log2base, nh, cnt, n_zero);
+    else
+      attn_prep_kernel<__half><<<nh + nkv, 32, 0, st>>>(
+          qg_t, kb_t, vb_t, reinterpret_cast<__half *>(k_row),
+          reinterpret_cast<__half *>(v_row), qn, qnk, kn, knk, norm_eps, hd, rd,
+          qstride, p, log2base, nh, cnt, n_zero);
+
+    const dim3 grid(chunks, ncnt);
+    float *att_t = att + static_cast<size_t>(t) * att_floats;
+    if (kind == SPITE_TYPE_F32)
+      launch_split_hd<float>(hd, GS, grid, qg_t, qstride, gated, kc, vc,
+                             kv->k.nb[1], kv->v.nb[1], nh, G, nsub, n_tok, per,
+                             scale, wm, wl, wacc, att_t, cnt, st);
+    else
+      launch_split_hd<__half>(hd, GS, grid, qg_t, qstride, gated, kc, vc,
+                              kv->k.nb[1], kv->v.nb[1], nh, G, nsub, n_tok, per,
+                              scale, wm, wl, wacc, att_t, cnt, st);
+  }
+
+  if (m == 1) {
+    if (q35_gemv(wo, att, static_cast<float *>(out->data), true, st))
+      return -1;
+  } else if (q35_gemv_batch(wo, att, static_cast<float *>(out->data), m, true, st)) {
     return -1;
+  }
   return cudaGetLastError() == cudaSuccess ? 0 : -2;
 }

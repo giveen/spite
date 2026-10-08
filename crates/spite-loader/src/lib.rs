@@ -50,6 +50,8 @@ struct TensorRecord {
     offset: u64,
     ne: [u32; 4],
     kind: SpiteType,
+    /// Original GGUF rank (`n_dims`), so a rewrite preserves [n,1] vs [n].
+    ndim: u32,
 }
 
 // ── Public model handle ────────────────────────────────────────────────────
@@ -57,7 +59,7 @@ struct TensorRecord {
 pub struct GgufModel {
     _file: File,
     mmap: Mmap,
-    pub(crate) meta: HashMap<String, MetaValue>,
+    pub meta: HashMap<String, MetaValue>,
     tensors: HashMap<String, TensorRecord>,
     data_offset: u64,
 }
@@ -172,6 +174,11 @@ impl GgufModel {
 
     pub fn n_tensors(&self) -> usize {
         self.tensors.len()
+    }
+
+    /// Original GGUF rank (`n_dims`) of a tensor; 0 when absent.
+    pub fn tensor_rank(&self, name: &str) -> u32 {
+        self.tensors.get(name).map_or(0, |r| r.ndim)
     }
 
     /// Root vocabulary size in tokens.
@@ -348,7 +355,15 @@ fn read_tensor_info(buf: &[u8], cur: &mut usize) -> Result<(String, TensorRecord
     let type_id = read_u32(buf, cur)?;
     let offset = read_u64(buf, cur)?;
     let kind = gguf_type(type_id)?;
-    Ok((name, TensorRecord { offset, ne, kind }))
+    Ok((
+        name,
+        TensorRecord {
+            offset,
+            ne,
+            kind,
+            ndim: ndim as u32,
+        },
+    ))
 }
 
 fn gguf_type(id: u32) -> Result<SpiteType, LoadError> {
