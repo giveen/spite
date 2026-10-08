@@ -115,6 +115,16 @@ struct KvPair {
 struct GdnState {
     conv_hist: DeviceBuffer,
     state: DeviceBuffer,
+    /// CUDA ordinal the buffers live on, for a same-device snapshot copy.
+    device: usize,
+}
+
+/// A saved copy of the GDN recurrent state, taken before a batched speculative
+/// verify so a rejected draft tail can be undone. See
+/// [`HybridDecoder::verify_batch`].
+struct GdnShadow {
+    conv_hist: DeviceBuffer,
+    state: DeviceBuffer,
 }
 
 /// One pipeline stage's residual stream and scratch, on that stage's device.
@@ -136,6 +146,13 @@ struct HState {
     /// Final-normed hidden state of the last trunk token or MTP step: the
     /// `h_t` the next MTP step consumes.
     hid: DeviceBuffer,
+    /// Final-normed hidden of every column of the last batched forward, so a
+    /// rejected speculative tail can reselect the accepted column without
+    /// re-running the trunk (`batch_cols` is how many columns it holds).
+    hid_batch: Option<DeviceBuffer>,
+    batch_cols: usize,
+    /// GDN recurrent state saved by the last [`HybridDecoder::verify_batch`].
+    gdn_shadow: Option<Vec<GdnShadow>>,
     /// MTP only: the draft token's embedding and the packed `[2*d]` stem.
     emb: DeviceBuffer,
     pack: DeviceBuffer,
@@ -762,6 +779,7 @@ impl HybridDecoder {
                 let mut g = GdnState {
                     conv_hist: alloc(dev, gdn.conv_hist_floats() * 4)?,
                     state: alloc(dev, gdn.state_floats() * 4)?,
+                    device: dev,
                 };
                 zero(&mut g.conv_hist)?;
                 zero(&mut g.state)?;
@@ -794,6 +812,9 @@ impl HybridDecoder {
             gdn: gdn_st,
             stages,
             hid: alloc(head_dev, d * 4)?,
+            hid_batch: None,
+            batch_cols: 0,
+            gdn_shadow: None,
             emb: alloc(head_dev, if has_mtp { d * 4 } else { 0 })?,
             pack: alloc(head_dev, if has_mtp { 2 * d * 4 } else { 0 })?,
             logits: alloc(head_dev, config.vocab_size * 4)?,
@@ -919,6 +940,23 @@ impl ModelArch for HybridDecoder {
 
     fn mtp_step(&self, token: u32, pos: usize, logits_out: &mut [f32]) -> Result<(), ModelError> {
         HybridDecoder::mtp_step(self, token, pos, logits_out)
+    }
+
+    fn can_verify_batch(&self) -> bool {
+        self.batch_capable()
+    }
+
+    fn verify_batch(
+        &self,
+        tokens: &[u32],
+        ctx: &SpiteCtx,
+        logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        HybridDecoder::verify_batch(self, tokens, ctx, logits_out)
+    }
+
+    fn rollback_drafts(&self, n: usize) -> Result<(), ModelError> {
+        HybridDecoder::rollback_drafts(self, n)
     }
 
     fn forward(
@@ -1048,6 +1086,12 @@ impl HybridDecoder {
     /// replaces `h_t`, so the next chained call takes the drafted token and
     /// `pos + 1`.
     ///
+    /// The final-normed input is what the checkpoint expects: llama.cpp's
+    /// qwen35 graph stores the `output_norm`'d hidden as `t_h_nextn` and feeds
+    /// it through `hnorm` (`src/models/qwen35.cpp`, `build_arch_graph`), so
+    /// passing the pre-norm residual here would double-normalize differently
+    /// and draft against a distribution the reference never produces.
+    ///
     /// The draft block attends over its own KV cache, so every position up to
     /// `pos` must have been through `mtp_step`. A prompt prefill fills the rows
     /// for the prompt itself (see [`Self::forward`]); a rejected draft is undone
@@ -1139,6 +1183,112 @@ impl HybridDecoder {
         }
         st.logits
             .download(f32_bytes_mut(logits_out))
+            .map_err(|e| err(e.to_string()))
+    }
+
+    /// Run one batched trunk pass for speculative verification.
+    ///
+    /// Processes `tokens` (`[trunk, drafts...]`) at positions
+    /// `ctx.pos .. ctx.pos + len`, writing `len * vocab` logits. The GDN
+    /// recurrent state advanced past any rejected tail is saved first, so
+    /// [`Self::rollback_drafts`] can undo it; the KV cache needs no snapshot
+    /// because rows are position-indexed and overwritten. A non-batch kernel
+    /// keeps the per-token fallback, so this is always correct, just not
+    /// always faster.
+    pub fn verify_batch(
+        &self,
+        tokens: &[u32],
+        ctx: &SpiteCtx,
+        logits_out: &mut [f32],
+    ) -> Result<(), ModelError> {
+        let vocab = self.config.vocab_size;
+        if logits_out.len() != tokens.len() * vocab {
+            return Err(err("logits_out shape mismatch"));
+        }
+        {
+            let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+            self.save_recurrent(&mut guard)?;
+        }
+        self.forward_batch(tokens, logits_out, ctx)
+    }
+
+    /// Undo the last `n` trailing columns of the last [`Self::verify_batch`].
+    ///
+    /// Restores the GDN recurrent state saved there and makes the hidden state
+    /// of the last kept column (position `len - 1 - n`) current, so the next
+    /// [`Self::mtp_step`] drafts from the accepted prefix rather than the
+    /// rejected tail. `n == 0` only reselects the hidden state.
+    pub fn rollback_drafts(&self, n: usize) -> Result<(), ModelError> {
+        let mut guard = self.state.lock().map_err(|_| err("state lock"))?;
+        let st = &mut *guard;
+        if n > 0 {
+            self.restore_recurrent(st)?;
+        }
+        let keep = st.batch_cols.saturating_sub(1 + n);
+        self.select_hidden(st, keep)
+    }
+
+    /// Snapshot the GDN recurrent state into `gdn_shadow`, allocating it on
+    /// first use. A no-op for a model whose layers are all full attention.
+    fn save_recurrent(&self, st: &mut HState) -> Result<(), ModelError> {
+        if st.gdn_shadow.is_none() {
+            let mut shadow = Vec::with_capacity(st.gdn.len());
+            for g in &st.gdn {
+                shadow.push(GdnShadow {
+                    conv_hist: DeviceBuffer::alloc_on(self.backend, g.device, g.conv_hist.size)
+                        .map_err(|e| err(format!("alloc gdn shadow: {e}")))?,
+                    state: DeviceBuffer::alloc_on(self.backend, g.device, g.state.size)
+                        .map_err(|e| err(format!("alloc gdn shadow: {e}")))?,
+                });
+            }
+            st.gdn_shadow = Some(shadow);
+        }
+        let mut shadow = st.gdn_shadow.take().expect("allocated above");
+        for (g, s) in st.gdn.iter().zip(shadow.iter_mut()) {
+            s.conv_hist
+                .copy_from(&g.conv_hist)
+                .map_err(|e| err(format!("gdn snapshot: {e}")))?;
+            s.state
+                .copy_from(&g.state)
+                .map_err(|e| err(format!("gdn snapshot: {e}")))?;
+        }
+        st.gdn_shadow = Some(shadow);
+        Ok(())
+    }
+
+    /// Restore the GDN recurrent state from `gdn_shadow`. A no-op when nothing
+    /// was snapshotted.
+    fn restore_recurrent(&self, st: &mut HState) -> Result<(), ModelError> {
+        let Some(shadow) = st.gdn_shadow.take() else {
+            return Ok(());
+        };
+        for (g, s) in st.gdn.iter_mut().zip(shadow.iter()) {
+            g.conv_hist
+                .copy_from(&s.conv_hist)
+                .map_err(|e| err(format!("gdn restore: {e}")))?;
+            g.state
+                .copy_from(&s.state)
+                .map_err(|e| err(format!("gdn restore: {e}")))?;
+        }
+        st.gdn_shadow = Some(shadow);
+        Ok(())
+    }
+
+    /// Make column `col` of the stashed batched hidden the current `h_t`.
+    fn select_hidden(&self, st: &mut HState, col: usize) -> Result<(), ModelError> {
+        let Some(batch) = st.hid_batch.as_ref() else {
+            return Ok(());
+        };
+        if col >= st.batch_cols {
+            return Err(err("hidden column out of range"));
+        }
+        let d = self.config.d_model;
+        let mut host = vec![0f32; d * st.batch_cols];
+        batch
+            .download(f32_bytes_mut(&mut host))
+            .map_err(|e| err(e.to_string()))?;
+        st.hid
+            .upload(f32_bytes(&host[col * d..(col + 1) * d]))
             .map_err(|e| err(e.to_string()))
     }
 
@@ -1295,10 +1445,6 @@ impl HybridDecoder {
         };
         let mut hid = f32_tensor(&st.hid, d);
         let mut logits = f32_tensor(&st.logits, vocab);
-        // Filled by the draft block while it copies the prompt into its own KV
-        // cache; see the per-token path above for why the last column is left
-        // to the decode loop's first `mtp_step`.
-        let mut draft_logits = vec![0f32; if self.mtp.is_some() { vocab } else { 0 }];
         for t in 0..m {
             let ht = f32_tensor_col(&hbufs[last], d, t);
             // SAFETY: every tensor points at live memory owned by `st` / `self`.
@@ -1317,10 +1463,149 @@ impl HybridDecoder {
             st.logits
                 .download(f32_bytes_mut(&mut logits_out[t * vocab..(t + 1) * vocab]))
                 .map_err(|e| err(e.to_string()))?;
-            if self.mtp.is_some() && t + 1 < m {
-                self.mtp_step_locked(st, tokens[t + 1], ctx.pos as usize + t, &mut draft_logits)?;
-            }
         }
+        // MTP only: keep every column's final-normed hidden so a batched
+        // speculative verify can reselect the accepted column on rollback
+        // without re-running the trunk; see `select_hidden`.
+        if self.mtp.is_some() {
+            if st.hid_batch.as_ref().is_none_or(|b| b.size < d * m * 4) {
+                st.hid_batch = Some(
+                    DeviceBuffer::alloc_on(self.backend, st.stages[last].device, d * m * 4)
+                        .map_err(|e| err(format!("alloc hid_batch: {e}")))?,
+                );
+            }
+            let batch = st.hid_batch.as_ref().expect("allocated above");
+            for t in 0..m {
+                let ht = f32_tensor_col(&hbufs[last], d, t);
+                let mut hidc = f32_tensor_col(batch, d, t);
+                // SAFETY: every tensor points at live memory owned by `st` /
+                // `self`; the kernel ABI version is checked at load.
+                unsafe {
+                    rc(
+                        rms_norm(&mut hidc, &ht, &self.out_norm, cfg.norm_eps, &head_ctx),
+                        "rms_norm",
+                        cfg.n_layers,
+                    )?;
+                }
+            }
+            st.batch_cols = m;
+        }
+        // The draft block's own KV cache is filled for every prompt column but
+        // the last, in one batched pass. Doing it per token (one NextN block
+        // forward each) cost ~6% of prefill; see the per-token path above for
+        // why the last column is left to the decode loop's first `mtp_step`.
+        self.mtp_prefill_batch(st, tokens, &hbufs[last], &scratches[last], ctx)?;
+        Ok(())
+    }
+
+    /// Fill the draft block's own KV cache for a whole prompt in one batched pass.
+    ///
+    /// Runs the NextN block over the first `m - 1` prompt columns (positions
+    /// `ctx.pos .. ctx.pos + m - 2`), the same rows the per-token path writes by
+    /// calling [`Self::mtp_step`] after every prompt token. `trunk_h` is the
+    /// last stage's pre-final-norm residual `[d, m]`; the final norm is applied
+    /// here, exactly as the trunk graph does before handing `h_nextn` to the
+    /// head. The last column is left to the decode loop's first `mtp_step`, the
+    /// only call that knows the token that follows it. The block's logits are
+    /// discarded while its KV is filled, so the shared head is skipped.
+    fn mtp_prefill_batch(
+        &self,
+        st: &mut HState,
+        tokens: &[u32],
+        trunk_h: &DeviceBuffer,
+        scratch: &DeviceBuffer,
+        ctx: &SpiteCtx,
+    ) -> Result<(), ModelError> {
+        let m = tokens.len();
+        let Some(mtp) = self.mtp.as_ref() else {
+            return Ok(());
+        };
+        if m < 2 {
+            return Ok(());
+        }
+        let cfg = &self.config;
+        let d = cfg.d_model;
+        // Draft columns: one per prompt position but the last.
+        let t = m - 1;
+        let (Some(rms_norm), Some(matmul), Some(mtp_stem)) = (
+            self.table.rms_norm.0,
+            self.table.matmul.0,
+            self.table.mtp_stem.0,
+        ) else {
+            return Err(err("dispatch table incomplete for the MTP head"));
+        };
+        let last = st.stages.len() - 1;
+        self.enter(st, last)?;
+        let dev = st.stages[last].device;
+        let alloc = |floats: usize| {
+            DeviceBuffer::alloc_on(self.backend, dev, floats * 4)
+                .map_err(|e| err(format!("alloc MTP prefill: {e}")))
+        };
+        // `norm` is the final-normed trunk hidden the stem feeds through
+        // `hnorm`; `pack` is its `[2*d, t]` stem output; `h`/`n` are the draft
+        // block's residual stream and norm buffer.
+        let norm = alloc(d * t)?;
+        let mut emb = alloc(d * t)?;
+        let pack = alloc(2 * d * t)?;
+        let h = alloc(d * t)?;
+        let n = alloc(d * t)?;
+
+        // Embeddings of the tokens that follow each prompt column, token-major.
+        let mut host = vec![0f32; d * t];
+        for (col, &tok) in tokens[1..].iter().enumerate() {
+            self.embed(tok, &mut host[col * d..(col + 1) * d])?;
+        }
+        emb.upload(f32_bytes(&host))
+            .map_err(|e| err(e.to_string()))?;
+
+        let kctx = SpiteCtx {
+            n_ctx: self.n_ctx as c_int,
+            n_batch: t as c_int,
+            n_threads: ctx.n_threads,
+            pos: ctx.pos,
+            n_heads: cfg.n_heads as c_int,
+            n_kv_heads: cfg.n_kv_heads as c_int,
+            gpu_stream: std::ptr::null_mut(),
+            scratchpad: scratch.as_ptr().cast(),
+            scratchpad_bytes: scratch.size,
+        };
+        let mut norm_t = f32_tensor2(&norm, d, t);
+        let emb_t = f32_tensor2(&emb, d, t);
+        let trunk_cols = f32_tensor2(trunk_h, d, t);
+        let mut pack_t = f32_tensor2(&pack, 2 * d, t);
+        let mut h_t = f32_tensor2(&h, d, t);
+        let mut n_t = f32_tensor2(&n, d, t);
+        let li = cfg.n_layers;
+        // SAFETY: every tensor points at live memory owned by `st` / `self`.
+        unsafe {
+            rc(
+                rms_norm(
+                    &mut norm_t,
+                    &trunk_cols,
+                    &self.out_norm,
+                    cfg.norm_eps,
+                    &kctx,
+                ),
+                "rms_norm",
+                li,
+            )?;
+            rc(
+                mtp_stem(
+                    &mut pack_t,
+                    &emb_t,
+                    &norm_t,
+                    &mtp.enorm,
+                    &mtp.hnorm,
+                    cfg.norm_eps,
+                    &kctx,
+                ),
+                "mtp_stem",
+                li,
+            )?;
+            rc(matmul(&mut h_t, &pack_t, &mtp.eh_proj, &kctx), "matmul", li)?;
+        }
+        self.attn_block(st, &mtp.layer, li, &mut h_t, &mut n_t, &kctx)?;
+        self.ffn_block(&mtp.layer.ffn, li, &mut h_t, &mut n_t, &kctx)?;
         Ok(())
     }
 

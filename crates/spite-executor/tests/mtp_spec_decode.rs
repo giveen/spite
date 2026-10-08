@@ -90,6 +90,17 @@ fn speculative_greedy_matches_plain_greedy() {
         stats.drafted > 0,
         "the MTP head never ran: {stats:?} (bench acceptance would be a false zero)"
     );
+    assert!(
+        stats.compared > 0,
+        "the draft-vs-trunk discriminator never sampled: {stats:?}"
+    );
+    // Report the divergence so a run log shows whether the head is doing work
+    // or merely tracking the trunk distribution.
+    let tv = stats.draft_trunk_tv_sum / stats.compared as f64;
+    println!(
+        "draft-vs-trunk TV = {tv:.4} over {} positions",
+        stats.compared
+    );
     assert_eq!(
         ids(&spec),
         ids(&plain),

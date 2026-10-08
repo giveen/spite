@@ -263,6 +263,8 @@ fn main() -> Result<()> {
     let mut n_tok = 0usize;
     let mut total_drafts = 0usize;
     let mut accepted_drafts = 0usize;
+    let mut tv_sum = 0f64;
+    let mut tv_n = 0usize;
 
     for _ in 0..args.n_runs {
         let t0 = std::time::Instant::now();
@@ -319,6 +321,8 @@ fn main() -> Result<()> {
             run_tokens = pieces.len();
             total_drafts += sstats.drafted;
             accepted_drafts += sstats.accepted;
+            tv_sum += sstats.draft_trunk_tv_sum;
+            tv_n += sstats.compared;
         }
         decode_s += t1.elapsed().as_secs_f64();
         n_tok += run_tokens;
@@ -339,6 +343,7 @@ fn main() -> Result<()> {
     } else {
         None
     };
+    let draft_trunk_tv = (tv_n > 0).then(|| tv_sum / tv_n as f64);
     let result = spite_bench::BenchResult {
         label: full_label,
         tps: decode_tps,
@@ -347,6 +352,7 @@ fn main() -> Result<()> {
         peak_mem_mib,
         n_runs: args.n_runs,
         acceptance_rate,
+        draft_trunk_tv,
     };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result_json(&result))?);
@@ -378,6 +384,11 @@ fn result_json(r: &spite_bench::BenchResult) -> serde_json::Value {
             "acceptance_pct".into(),
             serde_json::json!(format!("{:.1}%", acc * 100.0)),
         );
+    }
+    if let Some(tv) = r.draft_trunk_tv {
+        v.as_object_mut()
+            .unwrap()
+            .insert("draft_trunk_tv".into(), serde_json::json!(tv));
     }
     v
 }

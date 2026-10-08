@@ -16,6 +16,7 @@ use crate::{GpuBackend, GpuError, P2pKind};
 type CudaErr = c_int;
 const H2D: c_int = 1;
 const D2H: c_int = 2;
+const D2D: c_int = 3;
 
 struct Api {
     _lib: Library,
@@ -294,6 +295,16 @@ pub fn download(src: *mut u8, dst: &mut [u8]) -> Result<(), GpuError> {
     let a = api()?;
     let rc = unsafe { (a.memcpy)(dst.as_mut_ptr().cast(), src.cast(), dst.len(), D2H) };
     check(a, rc, "cudaMemcpy D2H").map_err(|e| GpuError::CopyFailed(e.to_string()))
+}
+
+/// Copy `len` bytes between two allocations on the current device.
+///
+/// Both pointers must belong to the current device; cross-device copies need
+/// peer access and go through [`with_device`] at the caller.
+pub fn copy_device(dst: *mut u8, src: *const u8, len: usize) -> Result<(), GpuError> {
+    let a = api()?;
+    let rc = unsafe { (a.memcpy)(dst.cast(), src.cast(), len, D2D) };
+    check(a, rc, "cudaMemcpy D2D").map_err(|e| GpuError::CopyFailed(e.to_string()))
 }
 
 /// Fill `len` bytes at `dst` with `byte`.

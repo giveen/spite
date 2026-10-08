@@ -250,6 +250,37 @@ impl DeviceBuffer {
         }
     }
 
+    /// Copy `src` into this buffer (device → device), up to the smaller size.
+    ///
+    /// CUDA copies run on `self`'s device; both buffers must live there. On a
+    /// host-accessible backend (`Cpu` or a unified-memory backend) this is a
+    /// `memcpy`.
+    ///
+    /// # Errors
+    /// A backend pair with no direct copy path (for example CUDA → HIP).
+    pub fn copy_from(&mut self, src: &DeviceBuffer) -> Result<(), GpuError> {
+        let len = src.size.min(self.size);
+        if self.backend == GpuBackend::Cuda && src.backend == GpuBackend::Cuda {
+            return cuda::with_device(self.device, || cuda::copy_device(self.ptr, src.ptr, len));
+        }
+        if self.host_accessible() && src.host_accessible() {
+            // SAFETY: both `ptr`s are host-accessible allocations of at least
+            // `len` bytes, owned by buffers that outlive the copy and never
+            // overlap (each `DeviceBuffer` owns its own allocation).
+            unsafe { std::ptr::copy_nonoverlapping(src.ptr, self.ptr, len) };
+            return Ok(());
+        }
+        Err(GpuError::CopyFailed(format!(
+            "device-to-device copy from {:?} to {:?} is unsupported",
+            src.backend, self.backend
+        )))
+    }
+
+    /// True when the buffer's memory is directly readable by the host.
+    fn host_accessible(&self) -> bool {
+        self.backend == GpuBackend::Cpu || self.backend.is_unified_memory()
+    }
+
     /// Raw pointer to the buffer: a device pointer, or host memory for `Cpu`.
     pub fn as_ptr(&self) -> *mut u8 {
         self.ptr

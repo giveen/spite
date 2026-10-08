@@ -157,7 +157,23 @@ pub struct SpecStats {
     pub drafted: usize,
     /// Draft tokens that the trunk accepted.
     pub accepted: usize,
+    /// Verified positions whose draft-vs-trunk distribution divergence was
+    /// sampled (bounded, see [`DIVERGENCE_SAMPLES`]).
+    pub compared: usize,
+    /// Total variation distance `0.5 * sum |p_draft - p_trunk|` summed over
+    /// the sampled positions.
+    ///
+    /// Near zero means the draft is reproducing the trunk's own next-token
+    /// distribution -- a head that is not doing independent work, which a high
+    /// acceptance rate alone cannot distinguish from a good head. Well above
+    /// zero means the head carries real draft information.
+    pub draft_trunk_tv_sum: f64,
 }
+
+/// How many verified positions contribute to
+/// [`SpecStats::draft_trunk_tv_sum`]. A handful is enough to tell a copying
+/// head from a working one, and keeps the softmax off the hot path.
+pub const DIVERGENCE_SAMPLES: usize = 8;
 
 /// Sampling parameters for [`Executor::generate_speculative`].
 #[derive(Debug, Clone, Copy)]
@@ -440,13 +456,135 @@ impl Executor {
             }
             stats.drafted += drafts.len();
 
-            // Advance the trunk with the verified token; `logits` now predicts
-            // the position the first draft targets.
+            // Batched verify: one trunk pass over [tok, d0..dK-1] (m = K+1)
+            // instead of one decode per accepted draft, which is what makes
+            // MTP faster than plain decode. Falls back to the per-token loop
+            // when the kernel cannot batch or the batch would run off the
+            // end of the context.
+            let can_batch = self.model.as_ref().is_some_and(|m| m.can_verify_batch());
+            if can_batch && self.n_ctx_used + drafts.len() < self.cfg.ctx_len {
+                let batch: Vec<u32> = std::iter::once(tok)
+                    .chain(drafts.iter().map(|(d, _)| *d))
+                    .collect();
+                let vocab = logits.len();
+                let mut batch_logits = vec![0f32; batch.len() * vocab];
+                let mut step = ctx;
+                step.pos = self.n_ctx_used as c_int;
+                step.n_batch = batch.len() as c_int;
+                {
+                    let Some(model) = &self.model else {
+                        return Err(ExecutorError::NotInitialized);
+                    };
+                    model
+                        .verify_batch(&batch, &step, &mut batch_logits)
+                        .map_err(|e| ExecutorError::Model(e.to_string()))?;
+                }
+
+                // Accept the longest draft prefix the trunk agrees with.
+                // `batch_logits[k]` predicts position `n_ctx_used + k + 1`,
+                // which is exactly the position draft `k` targets.
+                ids.truncate(base_len);
+                let mut accepted = 0usize;
+                let mut correction: Option<u32> = None;
+                for (k, (d, q)) in drafts.iter().enumerate() {
+                    let p = &batch_logits[k * vocab..(k + 1) * vocab];
+                    // Discriminator: is the draft any different from the trunk's
+                    // own distribution at this position? Sampled a few times only.
+                    if stats.compared < DIVERGENCE_SAMPLES {
+                        let (ps, qs) = (softmax(p), softmax(q));
+                        let tv: f32 =
+                            ps.iter().zip(&qs).map(|(a, b)| (a - b).abs()).sum::<f32>() * 0.5;
+                        stats.draft_trunk_tv_sum += f64::from(tv);
+                        stats.compared += 1;
+                    }
+                    let mut pp = p.to_vec();
+                    let ok = if greedy {
+                        sample(&mut pp, &ids, &cfg, &mut rng)
+                            .map_err(|e| ExecutorError::Sampling(e.to_string()))?
+                            == *d
+                    } else {
+                        apply_processors(&mut pp, &ids, &cfg);
+                        let mut qq = q.clone();
+                        apply_processors(&mut qq, &ids, &cfg);
+                        let ps = softmax(&pp);
+                        let qs = softmax(&qq);
+                        let qx = qs.get(*d as usize).copied().unwrap_or(0.0);
+                        let px = ps.get(*d as usize).copied().unwrap_or(0.0);
+                        if qx <= 0.0 || uniform(&mut rng) >= (px / qx).min(1.0) {
+                            // Rejected: draw the correction from (p - q)_+.
+                            let residual: Vec<f32> =
+                                ps.iter().zip(&qs).map(|(a, b)| (a - b).max(0.0)).collect();
+                            correction = Some(
+                                sample_probs(&residual, &mut rng)
+                                    .map_err(|e| ExecutorError::Sampling(e.to_string()))?,
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    };
+                    if !ok {
+                        break;
+                    }
+                    ids.push(*d);
+                    accepted += 1;
+                }
+                stats.accepted += accepted;
+
+                // Undo the trunk positions past the accepted prefix (a no-op
+                // when everything was accepted) and keep the position counter
+                // in step with the model's state.
+                let rejected = drafts.len() - accepted;
+                {
+                    let Some(model) = &self.model else {
+                        return Err(ExecutorError::NotInitialized);
+                    };
+                    model
+                        .rollback_drafts(rejected)
+                        .map_err(|e| ExecutorError::Model(e.to_string()))?;
+                }
+                self.n_ctx_used += 1 + accepted;
+                logits = batch_logits[accepted * vocab..(accepted + 1) * vocab].to_vec();
+
+                for (d, _) in drafts.iter().take(accepted) {
+                    produced += 1;
+                    if tokenizer.is_eog(*d) {
+                        return Ok((out, stats));
+                    }
+                    out.push((*d, tokenizer.decode_one(*d).into_owned()));
+                    if produced >= max_tokens {
+                        break;
+                    }
+                }
+                if produced >= max_tokens {
+                    break;
+                }
+                if let Some(y) = correction {
+                    produced += 1;
+                    ids.push(y);
+                    if tokenizer.is_eog(y) {
+                        return Ok((out, stats));
+                    }
+                    out.push((y, tokenizer.decode_one(y).into_owned()));
+                    logits = self.decode_step(y, &ctx)?;
+                }
+                continue;
+            }
+
+            // Sequential fallback: advance the trunk with the verified token,
+            // then decode one accepted draft at a time.
             logits = self.decode_step(tok, &ctx)?;
             for (k, (d, mut q)) in drafts.into_iter().enumerate() {
                 // Verify d_k against the context of its own position:
                 // [prompt, tok, accepted drafts].
                 ids.truncate(base_len + k);
+                // Discriminator: see the batched path above.
+                if stats.compared < DIVERGENCE_SAMPLES {
+                    let (ps, qs) = (softmax(&logits), softmax(&q));
+                    let tv: f32 = ps.iter().zip(&qs).map(|(a, b)| (a - b).abs()).sum::<f32>() * 0.5;
+                    stats.draft_trunk_tv_sum += f64::from(tv);
+                    stats.compared += 1;
+                }
                 if greedy {
                     let mut p = logits.clone();
                     let expected = sample(&mut p, &ids, &cfg, &mut rng)

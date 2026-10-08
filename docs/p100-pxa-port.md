@@ -155,6 +155,67 @@ host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
   - **MTP prompt prefill**: a prefill now fills the draft block's own KV cache
     over the prompt (one draft pass per prompt token, ~1–2% of prefill) instead
     of leaving those rows unwritten; see `HybridDecoder::forward`.
+  - **MTP prompt prefill is batched**: the per-token draft pass it used to run
+    (a measured −6.6% on the 512-token prefill column) is gone. The stem, the
+    NextN block and `matmul` were already `SPITE_CAP_BATCH`, so
+    `HybridDecoder::mtp_prefill_batch` runs the whole prompt through the NextN
+    block in one causal pass and skips the shared head (its logits are
+    discarded). `prefill_fills_the_mtp_kv` pins it to the per-token path.
+- **Batched MTP speculative verify: done.** The old loop ran one trunk
+  `decode_step` per accepted draft, so MTP cost a full trunk pass per emitted
+  token *plus* the NextN head — slower than plain decode at any K. The verify
+  is now one batched trunk pass over `[tok, d0..dK-1]` (m = K+1) through
+  `ModelArch::verify_batch`, followed by `rollback_drafts`.
+  - The GDN conv/delta state has no positional index, so it is snapshotted
+    before the pass (`DeviceBuffer::copy_from`, a device-to-device copy) and
+    restored when a draft tail is rejected; the KV cache needs no snapshot
+    (rows are position-indexed and overwritten). `rollback_drafts` also
+    reselects the accepted column's final-normed hidden, which the next
+    `mtp_step` consumes; `forward_batch` stashes all columns for that.
+  - `rollback_undoes_the_rejected_tail` (CPU) runs a verify whose tail is then
+    dropped and checks the following token against a prefix-only reference.
+  - Still owed: the P100 before/after. The verify is one pass instead of K+1,
+    so it should finally beat plain decode, but that is unmeasured here.
+- **Batched GEMV: chunk widened 4 → 8 (measured), the shared-memory rewrite
+  rejected.** `gemv_batch_kernel` decodes a weight row `m/kBatchChunk` times, so
+  `kBatchChunk` 4 → 8 halves the redundant dequant with the *same* per-column
+  accumulation order (bit-identical to the m=1 row kernel; `verify_batch_cuda.py`
+  stays at 0.0e+00). Measured on the 27B FFN-gate shape (rows 17408, cols 5120,
+  Q6_K): **19.45 → 16.00 ms**, 1.22×. 16 regressed (register pressure), so 8 is
+  the default; `SPITE_GEMV_BATCH_CHUNK` overrides it for A/B.
+  - The reviewer's suggested fix — dequantize once per tile into shared memory
+    and reuse across columns — was implemented and **measured 16× slower**
+    (304 vs 19.4 ms at m=512). Each thread read its column's activations with a
+    `cols` stride between columns, i.e. uncoalesced; the FMA loop was starved on
+    activation traffic rather than helped by the removed decode. A reusable
+    version needs activation staging too (a real tiled GEMM with both operands
+    in shared memory, register-blocked accumulators), which is arch-specific and
+    must be tuned on the P100. The negative result is kept in the log: the
+    dequant is not the only cost, and per-thread column ownership is the trap.
+  - Both measurements are on the host RTX 5090 through PTX JIT of the sm_60
+    build, not the P100s; re-measure there before trusting the factor.
+- **MTP hidden-state input confirmed (reviewer lead closed).** The suspicion was
+  that `mtp_step` double-normalizes by feeding the `output_norm`'d hidden into
+  `hnorm`. llama.cpp's `src/models/qwen35.cpp` stores exactly that
+  (`t_h_nextn = build_norm(cur, model.output_norm)`) and its MTP graph applies
+  `hnorm` to it, so the current input is correct; the pre-final-norm residual
+  would be wrong. The remaining question — why acceptance is ~100% against
+  llama.cpp's 84% — is not the hidden state, so a discriminator was added:
+  `SpecStats::draft_trunk_tv_sum` (mean total-variation distance between the
+  draft and trunk distributions over the first few verified positions). Near
+  zero means the head reproduces the trunk's own prediction (a high acceptance
+  rate cannot tell that apart from a good head); `spite-bench --mtp` prints it
+  as `draft-vs-trunk TV`. On the tiny fixture it is 0.11, i.e. the head does
+  real work there; the 27B number will say whether the real head does.
+- **CPU "before" gate row: still missing, and its cause is upstream of the
+  P100 box.** `DenseWeights::load` dequantizes every tensor to F32, so a 27B
+  needs ~108 GB of RAM just to *load* on the CPU and the generic-fallback row
+  cannot be produced on the tester's 15 GiB box. Options, cheapest first: emit
+  the row on a smaller qwen35 model (different model, must be labelled), or
+  give the CPU reference an on-demand dequant path that keeps packed bytes and
+  expands per matvec (a real memory win for every CPU user, but it touches
+  `Weight` and every arch impl). Until one lands the PR cannot satisfy the
+  AGENTS.md gate on a machine like the tester's.
 - **PXQ4 = MXFP4: done.** PXQ4 is pxa's repack of MXFP4 (ggml type 39): 32-element
   blocks, E8M0 scale, e2m1 codes, 4.25 bpw — the tier that fits a 27B on one
   16 GB P100. Inference already worked in spite (CPU `dq_mxfp4`, the CUDA

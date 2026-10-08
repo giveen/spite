@@ -121,7 +121,17 @@ __global__ void __launch_bounds__(kRowThreads)
  * prefill/verify win: the weight stream is the bandwidth wall, extra columns
  * are near-free. x is [cols, m] and y is [rows, m], both token-major.
  */
-constexpr int kBatchChunk = 4;
+/// Columns a decoded weight block is reused for. The row is decoded
+/// m/kBatchChunk times, so raising this cuts the redundant decode at the cost
+/// of kBatchChunk accumulator registers; Q6_K is the register-bound instance
+/// (99 regs/thread at 4), so this trades decode against occupancy. The
+/// per-column accumulation order is unchanged, so the result stays bit-identical
+/// to the m=1 row kernel.
+/// `SPITE_GEMV_BATCH_CHUNK` overrides it for A/B measurement.
+#ifndef SPITE_GEMV_BATCH_CHUNK
+#define SPITE_GEMV_BATCH_CHUNK 8
+#endif
+constexpr int kBatchChunk = SPITE_GEMV_BATCH_CHUNK;
 
 template <class Q>
 __global__ void __launch_bounds__(kRowThreads)

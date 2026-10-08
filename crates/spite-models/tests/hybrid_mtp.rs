@@ -310,6 +310,49 @@ fn prefill_fills_the_mtp_kv() {
     let _ = std::fs::remove_dir_all(kdir_ref);
 }
 
+/// Dropping a rejected draft tail must leave the recurrent state exactly as if
+/// the tail had never run. `verify_batch` processes the whole `[prefix, tail]`
+/// batch (so the GDN conv/delta state advances past the tail), then
+/// `rollback_drafts` must undo it so a following token sees the prefix state.
+#[test]
+fn rollback_undoes_the_rejected_tail() {
+    let (model, vocab, kdir) = load("tiny-qwen35-mtp-full-f16.gguf", "rollback");
+    let prefix = [1u32, 2, 3];
+    let tail = [4u32, 5];
+
+    // Reference: process only the prefix, then probe with one token.
+    model.reset_cache();
+    let mut pre = vec![0f32; prefix.len() * vocab];
+    model.forward(&prefix, &mut pre, &ctx(0)).expect("prefix");
+    let mut want = vec![0f32; vocab];
+    model
+        .forward(&[9], &mut want, &ctx(prefix.len()))
+        .expect("probe");
+
+    // Batched verify over prefix + tail, then drop the tail and probe again.
+    model.reset_cache();
+    let all: Vec<u32> = prefix.iter().copied().chain(tail).collect();
+    let mut batch = vec![0f32; all.len() * vocab];
+    model
+        .verify_batch(&all, &ctx(0), &mut batch)
+        .expect("verify_batch");
+    model.rollback_drafts(tail.len()).expect("rollback");
+    let mut got = vec![0f32; vocab];
+    model
+        .forward(&[9], &mut got, &ctx(prefix.len()))
+        .expect("probe");
+
+    let d = got
+        .iter()
+        .zip(&want)
+        .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+    assert!(
+        d <= TOL,
+        "rollback left the GDN recurrent state wrong: probe logits differ by {d:e}"
+    );
+    let _ = std::fs::remove_dir_all(kdir);
+}
+
 /// Batched prefill must work across a pipeline split too: the whole `[d, m]`
 /// block crosses the stage boundary through host memory, so the split's logits
 /// must be identical to both the unsplit batched run and the per-token run.
