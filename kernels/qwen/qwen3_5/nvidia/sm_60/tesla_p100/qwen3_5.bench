@@ -24,7 +24,11 @@
 #   - the speculative verify is now one batched trunk pass over [tok, d0..dK-1]
 #     with a GDN state rollback, so `--mtp` should finally beat plain decode;
 #   - `kBatchChunk` 4 -> 8 (1.22x on the FFN-gate shape, measured on an RTX 5090
-#     through PTX JIT, not on these P100s).
+#     through PTX JIT, not on these P100s);
+#   - the batched GEMV now tiles output rows (`kRowTile` 4) and reuses the
+#     activation across them, which is the measured 75% of that kernel: 1.42-1.52x
+#     on the prefill projections, 1.08-1.26x at the verify width, again measured
+#     on the RTX 5090 through PTX JIT. Every row below predates it.
 # `spite-bench --mtp` now also prints `draft-vs-trunk TV`, the draft/trunk
 # distribution divergence, so a 100% acceptance column can be told apart from a
 # head that merely copies the trunk.

@@ -115,11 +115,20 @@ __global__ void __launch_bounds__(kRowThreads)
 
 /*
  * Batched (multi-column) GEMV: y[r, t] (+)= sum_c W[r, c] * x[c, t] for m
- * columns (tokens). One block per output row, as above, but the weight row is
- * decoded once per chunk of kBatchChunk columns and FMA'd against all of them,
- * so the weight is read m/kBatchChunk times instead of m times. This is the
- * prefill/verify win: the weight stream is the bandwidth wall, extra columns
- * are near-free. x is [cols, m] and y is [rows, m], both token-major.
+ * columns (tokens). One block per kRowTile output rows, as above, but the weight
+ * row is decoded once per chunk of kRowWideChunk columns and FMA'd against all of
+ * them, so the weight is read m/kRowWideChunk times instead of m times. This is
+ * the prefill/verify win. x is [cols, m] and y is [rows, m], both token-major.
+ *
+ * The wall on Pascal is not the weight stream, it is the *activation* stream:
+ * every one of the `rows` blocks reads the whole [cols, m] activation, so those
+ * bytes are `rows`-fold amplified -- 182.5 GB against 4.68 GB of weights at the
+ * 27B FFN-gate shape (rows 17408, cols 5120, Q6_K, m 512). Replacing the
+ * activation loads with a constant takes that kernel from 16.7 ms to 4.1 ms
+ * (75%, host RTX 5090 through PTX JIT of this sm_60 build), while sweeping
+ * kBatchChunk 2/4/8/16 over the same shape gives 18.2/19.8/16.8/19.3 ms -- the
+ * weight stream is a register-pressure tradeoff, not the wall. kRowTile is the
+ * only lever that moves the activation bytes.
  */
 /// Columns a decoded weight block is reused for. The row is decoded
 /// m/kBatchChunk times, so raising this cuts the redundant decode at the cost
@@ -133,41 +142,130 @@ __global__ void __launch_bounds__(kRowThreads)
 #endif
 constexpr int kBatchChunk = SPITE_GEMV_BATCH_CHUNK;
 
-template <class Q>
+/// Output rows one block owns. Every activation float4 a thread loads feeds
+/// exactly one FMA per owned row, so a block owning `kRowTile` rows reuses each
+/// activation load `kRowTile` times and divides the activation traffic by the
+/// same factor. That traffic is what binds this kernel (each of the `rows`
+/// blocks streams the whole [cols, m] activation: 39x the weight bytes at the
+/// FFN-gate shape), and it is the *only* thing that moves those bytes --
+/// staging them in shared memory does not, because it changes where the load
+/// comes from rather than how many times the value is used, leaving the FMA
+/// loop starved either way (the 16x-slower prefill attempt in
+/// docs/p100-pxa-port.md is exactly that; Kaden's mmvq agrees -- his
+/// block-wide activation stage and his 1-warp-x-4-rows geometry both lost,
+/// while `split_rows`, where rows *share* one activation image, won).
+///
+/// Costs `kRowTile * Q::NV` registers for the decoded weights plus
+/// `kRowTile * kBatchChunk` accumulators, which is what caps it -- and *that* is
+/// the real constraint: at kBatchChunk 8 sm_60 ptxas wants 254 registers for
+/// kRowTile 2 (one 256-thread block per SM, 0.6x as fast as the tile below) but
+/// only 162 for kRowTile 4. Register pressure is not monotone in the tile, so
+/// every value here has to be read off `ptxas -arch=sm_60 -v`, not guessed.
+/// `SPITE_GEMV_ROW_TILE` overrides it for A/B measurement.
+#ifndef SPITE_GEMV_ROW_TILE
+#define SPITE_GEMV_ROW_TILE 4
+#endif
+constexpr int kRowTile = SPITE_GEMV_ROW_TILE;
+
+/// Fewest row-groups the tiled kernel is worth launching for; below it the
+/// one-row-per-block form runs instead. Under this many blocks the card is not
+/// filled, the per-block serial walk the wider tile lengthens stops being
+/// hidden, and the activation saving loses to it: on the host RTX 5090 (PTX JIT
+/// of this sm_60 build, cols 5120, m 512) the crossover sits between 160 and 192
+/// groups -- at 48 rows (12 groups) the tiled form is 0.78x while one row per
+/// block is 1.27x, and 192 groups up it is 1.14-1.61x. 256 is the conservative
+/// side of that, and it is a *host* measurement: re-measure on the P100s (56
+/// SMs, 2 blocks/SM at 128 registers = 112 resident) before trusting it there.
+/// `SPITE_GEMV_ROW_TILE_MIN_BLOCKS` overrides it for A/B measurement.
+#ifndef SPITE_GEMV_ROW_TILE_MIN_BLOCKS
+#define SPITE_GEMV_ROW_TILE_MIN_BLOCKS 256
+#endif
+constexpr int kRowTileMinBlocks = SPITE_GEMV_ROW_TILE_MIN_BLOCKS;
+
+/// Columns per chunk in the tiled form. The chunk trades redundant weight
+/// decode (m/kBatchChunk re-reads) against register pressure, and the right
+/// answer moves with the tile: sm_60 ptxas spends 79 registers on
+/// (kRowTile 1, kBatchChunk 8) and 162 on (4, 8) -- one 256-thread block per SM
+/// -- but 128 on (4, 4), which is two blocks per SM. Measured on the host RTX
+/// 5090, cols 5120, m 512: at kRowTile 1 raising the chunk 4 -> 8 is worth
+/// 1.19x (0.601 -> 0.509 ms), at kRowTile 4 lowering it 8 -> 4 is worth 1.20x
+/// (12.47 -> 10.42 ms at rows 17408), so the two forms want different chunks and
+/// each gets its own. `SPITE_GEMV_ROW_WIDE_CHUNK` overrides the tiled form's.
+#ifndef SPITE_GEMV_ROW_WIDE_CHUNK
+#define SPITE_GEMV_ROW_WIDE_CHUNK 4
+#endif
+constexpr int kRowWideChunk = SPITE_GEMV_ROW_WIDE_CHUNK;
+
+static_assert(kRowTile * kRowWideChunk <= kRowThreads &&
+                  kBatchChunk <= kRowThreads,
+              "write-back needs one thread per (row, column)");
+
+/// `RT` = output rows this block owns, `CHUNK` = columns per chunk. Two forms
+/// are instantiated: (kRowTile, kRowWideChunk) for the shapes with the blocks to
+/// fill the card, and (1, kBatchChunk) for the rest (see kRowTileMinBlocks).
+/// `RT` must divide nothing in particular -- rows need not be a multiple of it,
+/// the surplus group is masked (and never addressed).
+template <class Q, int RT, int CHUNK>
 __global__ void __launch_bounds__(kRowThreads)
     gemv_batch_kernel(const uint8_t *__restrict__ w, float *__restrict__ y,
                       const float *__restrict__ x, int cols, int rows, int m,
                       size_t row_bytes, int x_aligned16, int accumulate) {
-  __shared__ float red[kWarps];
-  const int row = blockIdx.x;
+  static_assert(RT * CHUNK <= kRowThreads,
+                "write-back needs one thread per (row, column)");
+  __shared__ float red[kWarps][RT * CHUNK];
+  const int row0 = blockIdx.x * RT;
   const int tid = threadIdx.x;
-  const uint8_t *wr = w + static_cast<size_t>(row) * row_bytes;
 
-  for (int t0 = 0; t0 < m; t0 += kBatchChunk) {
-    const int tn = min(kBatchChunk, m - t0);
-    float acc[kBatchChunk];
+  for (int t0 = 0; t0 < m; t0 += CHUNK) {
+    const int tn = min(CHUNK, m - t0);
+    float acc[RT][CHUNK];
 #pragma unroll
-    for (int j = 0; j < kBatchChunk; ++j)
-      acc[j] = 0.0f;
+    for (int r = 0; r < RT; ++r)
+#pragma unroll
+      for (int j = 0; j < CHUNK; ++j)
+        acc[r][j] = 0.0f;
 
     if constexpr (Q::DENSE) {
       for (int c = tid; c < cols; c += kRowThreads) {
-        const float wv = Q::load(wr, c);
+        float wv[RT];
 #pragma unroll
-        for (int j = 0; j < kBatchChunk; ++j)
-          if (j < tn)
-            acc[j] = fmaf(wv, __ldg(x + static_cast<size_t>(t0 + j) * cols + c),
-                          acc[j]);
+        for (int r = 0; r < RT; ++r)
+          wv[r] = (row0 + r < rows)
+                      ? Q::load(w + static_cast<size_t>(row0 + r) * row_bytes, c)
+                      : 0.0f;
+#pragma unroll
+        for (int j = 0; j < CHUNK; ++j) {
+          if (j >= tn)
+            continue;
+          const float xv = __ldg(x + static_cast<size_t>(t0 + j) * cols + c);
+#pragma unroll
+          for (int r = 0; r < RT; ++r)
+            acc[r][j] = fmaf(wv[r], xv, acc[r][j]);
+        }
       }
     } else {
       constexpr int NS = Q::NS, BPS = kRowThreads / NS;
       const int slot = tid % NS, sub = tid / NS;
       const int nb = cols / Q::QK;
       for (int b = sub; b < nb; b += BPS) {
-        float v[Q::NV];
-        Q::decode(wr + static_cast<size_t>(b) * Q::BYTES, slot, v);
+        /* One decode per owned row, then one activation float4 per (column,
+         * group) shared by all of them: the FMA count per activation load
+         * goes 1 -> RT with the per-column order untouched. */
+        float v[RT][Q::NV];
 #pragma unroll
-        for (int j = 0; j < kBatchChunk; ++j) {
+        for (int r = 0; r < RT; ++r) {
+          const int row = row0 + r;
+          if (row < rows)
+            Q::decode(w + static_cast<size_t>(row) * row_bytes +
+                          static_cast<size_t>(b) * Q::BYTES,
+                      slot, v[r]);
+          else /* surplus row: never read, but keep v[] defined */
+#pragma unroll
+            for (int k = 0; k < Q::NV; ++k)
+              v[r][k] = 0.0f;
+        }
+#pragma unroll
+        for (int j = 0; j < CHUNK; ++j) {
           if (j >= tn)
             continue;
           const float *xb =
@@ -181,32 +279,54 @@ __global__ void __launch_bounds__(kRowThreads)
             else
               xv = make_float4(__ldg(xp), __ldg(xp + 1), __ldg(xp + 2),
                                __ldg(xp + 3));
-            acc[j] = fmaf(v[4 * g + 0], xv.x, acc[j]);
-            acc[j] = fmaf(v[4 * g + 1], xv.y, acc[j]);
-            acc[j] = fmaf(v[4 * g + 2], xv.z, acc[j]);
-            acc[j] = fmaf(v[4 * g + 3], xv.w, acc[j]);
+#pragma unroll
+            for (int r = 0; r < RT; ++r) {
+              acc[r][j] = fmaf(v[r][4 * g + 0], xv.x, acc[r][j]);
+              acc[r][j] = fmaf(v[r][4 * g + 1], xv.y, acc[r][j]);
+              acc[r][j] = fmaf(v[r][4 * g + 2], xv.z, acc[r][j]);
+              acc[r][j] = fmaf(v[r][4 * g + 3], xv.w, acc[r][j]);
+            }
           }
         }
       }
     }
 
+    /* Cross-warp reduction, all RT * tn outputs at once. Doing it one
+     * column at a time (a barrier pair each, with thread 0 walking the warps)
+     * serialised the whole block CHUNK times per chunk. Every guard
+     * here is block-uniform, so the shuffles stay convergent. */
+    __syncthreads(); /* red may still be read by the previous chunk */
 #pragma unroll
-    for (int j = 0; j < kBatchChunk; ++j) {
-      if (j >= tn)
+    for (int r = 0; r < RT; ++r) {
+      if (row0 + r >= rows)
         continue;
-      const float a = q35_warp_sum(acc[j]);
-      if ((tid & 31) == 0)
-        red[tid >> 5] = a;
-      __syncthreads();
-      if (tid == 0) {
+#pragma unroll
+      for (int j = 0; j < CHUNK; ++j) {
+        const float a = (j < tn) ? q35_warp_sum(acc[r][j]) : 0.0f;
+        if ((tid & 31) == 0)
+          red[tid >> 5][r * CHUNK + j] = a;
+      }
+    }
+    __syncthreads();
+    /* Write-back, one thread per (row, column). Deliberately keyed on
+     * `tid < RT * tn` with a runtime divisor rather than the equally correct
+     * `tid / CHUNK` and `% CHUNK`: the compile-time-divisor form measured
+     * 1.4-2.4x SLOWER over a 384-768 row band (rows 640: 0.593 -> 1.266 ms,
+     * reproduced across builds and interleaved runs) for what should be fewer
+     * instructions, so it is a scheduling cliff and not work. This branch is
+     * cold -- at most RT * CHUNK threads, once per chunk, never per element --
+     * so the division is not worth chasing. Re-measure both forms on the P100s. */
+    if (tid < RT * tn) {
+      const int rr = tid / tn, j = tid - rr * tn;
+      const int row = row0 + rr;
+      if (row < rows) {
         float t = 0.0f;
 #pragma unroll
         for (int i = 0; i < kWarps; ++i)
-          t += red[i];
+          t += red[i][rr * CHUNK + j];
         float *yp = y + static_cast<size_t>(t0 + j) * rows + row;
         *yp = accumulate ? *yp + t : t;
       }
-      __syncthreads();
     }
   }
 }
@@ -254,6 +374,17 @@ int launch(const Q35GemvJob *jobs, int n, const float *x, bool accumulate,
   });
 }
 
+/* Launch one batched kernel with RT output rows per block. */
+template <class Q, int RT, int CHUNK>
+void launch_batch_rows(const SpiteTensor *w, const float *x, float *y, int m,
+                       int cols, int rows, size_t row_bytes, int x_aligned16,
+                       int accumulate, cudaStream_t s) {
+  gemv_batch_kernel<Q, RT, CHUNK>
+      <<<static_cast<unsigned>((rows + RT - 1) / RT), kRowThreads, 0, s>>>(
+          static_cast<const uint8_t *>(w->data), y, x, cols, rows, m, row_bytes,
+          x_aligned16, accumulate);
+}
+
 /* One batched launch for a single weight, m columns. */
 int launch_batch(const SpiteTensor *w, const float *x, float *y, int m,
                  bool accumulate, cudaStream_t s) {
@@ -272,9 +403,17 @@ int launch_batch(const SpiteTensor *w, const float *x, float *y, int m,
         return -1;
       row_bytes = static_cast<size_t>(cols / Q::QK) * Q::BYTES;
     }
-    gemv_batch_kernel<Q><<<static_cast<unsigned>(rows), kRowThreads, 0, s>>>(
-        static_cast<const uint8_t *>(w->data), y, x, cols, rows, m, row_bytes,
-        x_aligned16, accumulate ? 1 : 0);
+    const int acc = accumulate ? 1 : 0;
+    /* Tile rows only where there are enough blocks to fill the card
+     * (kRowTileMinBlocks); both arms are compile-time, so a build only carries
+     * the instantiations it can reach. */
+    if (kRowTile > 1 && rows / kRowTile >= kRowTileMinBlocks)
+      launch_batch_rows<Q, kRowTile, kRowWideChunk>(w, x, y, m, cols, rows,
+                                                    row_bytes, x_aligned16, acc,
+                                                    s);
+    else
+      launch_batch_rows<Q, 1, kBatchChunk>(w, x, y, m, cols, rows, row_bytes,
+                                           x_aligned16, acc, s);
     return 0;
   });
 }

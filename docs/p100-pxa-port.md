@@ -194,6 +194,57 @@ host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
     dequant is not the only cost, and per-thread column ownership is the trap.
   - Both measurements are on the host RTX 5090 through PTX JIT of the sm_60
     build, not the P100s; re-measure there before trusting the factor.
+- **The activation stream is the real wall, and row-tiling is what moves it.**
+  The chunk above was tuning the wrong operand. A probe that replaces the
+  activation loads with a constant takes the FFN-gate shape from **16.7 → 4.1 ms
+  (75% of the kernel)**, while sweeping `kBatchChunk` 2/4/8/16 over the same
+  shape gives 18.2/19.8/16.8/19.3 ms — U-shaped, i.e. a register-pressure
+  tradeoff, not a bandwidth one. The reason is structural: every one of the
+  `rows` blocks reads the **whole** `[cols, m]` activation, so those bytes are
+  `rows`-fold amplified — 182.5 GB against 4.68 GB of weights (39×) at this
+  shape. Each activation float4 a thread loads feeds exactly one FMA, so there
+  is no reuse to recover; staging the activation in shared memory does not help,
+  because it changes *where* the load comes from, not *how often* the value is
+  used. (That is the rejected smem rewrite above seen from the other end, and it
+  is what `Kmic-68/llama.cpp`'s `OPTLOG.md` reports for `mul_mat_vec_q` on
+  sm_60: attempts 43 and 47-51, every block-wide or reduced-activation-traffic
+  variant, lost on occupancy — "what binds is warps resident per SM" — while
+  `split_rows`, where rows *share* one activation image, won.)
+  - Fix: `kRowTile` output rows per block, the activation kept in registers and
+    reused across them. Two instantiations are launched: `(kRowTile 4,
+    kRowWideChunk 4)` when `rows/4 >= 256` blocks, `(1, kBatchChunk 8)`
+    otherwise. The chunk has to follow the tile, because the two forms want
+    opposite answers (sm_60 ptxas: 79 registers at (1, 8) = 3 blocks/SM, 162 at
+    (4, 8) = **1** block/SM, 128 at (4, 4) = 2 blocks/SM; register pressure is
+    not monotone in the tile, so these have to be read off `ptxas -arch=sm_60
+    -v`). Per-column accumulation order is untouched, so the result is still
+    bit-identical to the m=1 row kernel — `verify_batch_cuda.py` stays at
+    0.0e+00, and a sha256 of `y` over five shapes (surplus rows and
+    `accumulate` included, tiled form forced) matches the unmodified kernel.
+  - Measured on the host RTX 5090 through PTX JIT of this sm_60 build (harness
+    in `/tmp`, cols 5120, m 512 and the verify width m 5):
+
+    | projection | rows | m=512 before → after | m=5 before → after |
+    |---|---|---|---|
+    | FFN gate/up | 17408 | 15.94 → 10.09 ms (**1.58×**) | 0.164 → 0.133 ms (1.23×) |
+    | FFN down | 5120 | 12.29 → 8.65 ms (1.42×) | 0.125 → 0.102 ms (1.23×) |
+    | attention q | 12288 | 10.89 → 7.42 ms (1.47×) | 0.117 → 0.098 ms (1.19×) |
+    | attention o | 6144 | 5.63 → 3.85 ms (1.46×) | 0.063 → 0.053 ms (1.19×) |
+    | attention k/v | 1024 | 1.18 → 0.83 ms (1.41×) | 0.017 → 0.014 ms (1.21×) |
+    | GDN qkv | 2560 | 2.38 → 1.59 ms (1.50×) | 0.028 → 0.024 ms (1.17×) |
+    | GDN gate/out | 2048 | 2.24 → 1.57 ms (1.43×) | 0.027 → 0.024 ms (1.12×) |
+    | GDN beta/alpha | 32 | 0.539 → 0.426 ms (1.27×) | 0.008 ms (1.00×) |
+
+    A `rows` sweep 16 → 17408 found no band where the change loses (worst 1.04×
+    at 640 rows, and 1.43×-1.64× from 1024 up). The 256-block threshold is
+    deliberately on the safe side of a crossover measured between 160 and 192.
+    `verify.py`: 93 OK / 12 SKIP / 0 FAIL, same as before.
+  - Still owed: the P100 before/after. The threshold and the chunk/tile pair are
+    *host* measurements — 170 SMs and 96 MB of L2 against the P100's 56 and
+    4 MB, so the crossover can move. Also unmeasured here: the same `rows`-fold
+    amplification in the m=1 `gemv_row_kernel` (356 MB of activation against
+    73 MB of weights at this shape), which is the decode path and takes the same
+    fix.
 - **MTP hidden-state input confirmed (reviewer lead closed).** The suspicion was
   that `mtp_step` double-normalizes by feeding the `output_norm`'d hidden into
   `hnorm`. llama.cpp's `src/models/qwen35.cpp` stores exactly that
@@ -225,5 +276,8 @@ host JITs. `verify.py` passed on the current vendor kernel this way (ABI v7,
   the tiny fixture quantized/reloaded/decoded on CPU, and MXFP4 matmul exercised
   by `verify.py` on the sm_60 kernel. 1-D parameters (GDN dt/a/norm, conv and
   RMS norm weights) stay F32, as the ops require.
-- **sm_60 attention/GEMV tuning**: not started; it is measurement-driven and
-  needs the P100s (see the section above).
+- **sm_60 GEMV tuning**: started on the batched GEMV — the activation stream is
+  the wall and row-tiling moves it (the entry above carries the numbers). What is
+  left is measurement-driven and needs the P100s: the 256-block threshold, the
+  `(kRowTile 4, kRowWideChunk 4)` pair, and the same tiling for the m=1
+  `gemv_row_kernel`. sm_60 attention tuning is not started.
